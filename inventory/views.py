@@ -90,6 +90,7 @@ def grid(request):
         rows.append({"index": row, "cells": cells})
     return render(request, "inventory/grid.html", {
         "rows": rows, "columns": COLUMNS, "count": len(hosts),
+        "sites": Site.objects.order_by("id"),
     })
 
 
