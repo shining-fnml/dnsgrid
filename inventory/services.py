@@ -1,3 +1,5 @@
+import copy
+
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import F
@@ -96,6 +98,42 @@ def delete_host(host_id, expected_revision):
             raise ValidationError("This host no longer exists.") from error
         _claim_revision(expected_revision)
         host.delete()
+
+
+def _plan_host_move(host_id, direction):
+    if direction not in ("up", "down"):
+        raise ValidationError("Choose Move up or Move down.")
+    try:
+        host = Host.objects.select_related("site").get(pk=host_id)
+    except Host.DoesNotExist as error:
+        raise ValidationError("This host no longer exists.") from error
+    target = host.x + (-1 if direction == "up" else 1)
+    column, row = divmod(target, 16)
+    _validate_position(row, column)
+    if Host.objects.filter(row=row, column=column).exists():
+        raise ValidationError("The destination cell is occupied. Quick moves never shift other hosts.")
+    candidate = copy.copy(host)
+    candidate.row, candidate.column = row, column
+    return host, candidate
+
+
+def preview_host_move(host_id, direction, expected_revision):
+    with transaction.atomic():
+        _claim_revision(expected_revision, changed=False)
+        host, candidate = _plan_host_move(host_id, direction)
+        return host, candidate, Configuration.load()
+
+
+def move_host(host_id, direction, expected_revision):
+    try:
+        with transaction.atomic():
+            _claim_revision(expected_revision, changed=False)
+            _, candidate = _plan_host_move(host_id, direction)
+            _claim_revision(expected_revision)
+            candidate.save(update_fields=["row", "column"])
+            return candidate
+    except IntegrityError as error:
+        raise ValidationError("The destination conflicts with another inventory entry.") from error
 
 
 CONFIG_FIELDS = (

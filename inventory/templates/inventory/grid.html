@@ -6,7 +6,7 @@
 <p class="grid-legend">
   Site ink:
   {% for site in sites %}<span class="site-{{ site.id }}">{{ site.id }} · {{ site.name }}</span>{% if not forloop.last %} / {% endif %}{% endfor %}
-  · <strong>VPN names: bold</strong> · Unconfirmed: light gray cell · Decommissioned: [name].
+  · <strong>VPN names: bold</strong> · Unconfirmed: light gray cell · Decommissioned: (name).
 </p>
 <div class="grid-scroll">
 <table class="grid">
@@ -24,7 +24,7 @@
         {% elif cell.host %}
         <a class="cell" href="{% url 'host-edit' cell.host.pk %}">
           <small>x={{ cell.x }} · {{ cell.host.site.name }}</small>
-          <span class="host-name{% if cell.host.vpn %} vpn-name{% endif %}">{% if cell.host.status == 'decommissioned' %}[{% endif %}{{ cell.host.name }}{% if cell.host.status == 'decommissioned' %}]{% endif %}</span>
+          <span class="host-name{% if cell.host.vpn %} vpn-name{% endif %}">{% if cell.host.status == 'decommissioned' %}({% endif %}{{ cell.host.name }}{% if cell.host.status == 'decommissioned' %}){% endif %}</span>
           <span>{{ cell.lan }}</span>
           {% if cell.vpn %}<span>VPN {{ cell.vpn }}</span>{% endif %}
           <small>{{ cell.host.get_status_display }}{% if cell.host.public_export %} · Public export{% endif %}</small>

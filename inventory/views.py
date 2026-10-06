@@ -13,9 +13,11 @@ from django.views.decorators.cache import never_cache
 from django.views.decorators.http import require_POST
 
 from .exporters import build_exports
-from .forms import ConfigurationForm, HostForm
+from .forms import ConfigurationForm, HostForm, HostMoveForm
 from .models import Configuration, Host, Site
-from .services import delete_host, plan_placement, save_host, update_settings
+from .services import (
+    delete_host, move_host, plan_placement, preview_host_move, save_host, update_settings,
+)
 
 COLUMNS = (
     "Networking", "Peripherals", "Bare metal", "Virtual servers",
@@ -140,9 +142,39 @@ def host_edit(request, host_id=None):
             return _pending(request, "host", payload, config.revision, changes, "Confirm host and grid changes")
         except ValidationError as error:
             form.add_error(None, _errors(error))
+    moves = []
+    if host:
+        for direction, label, target in (
+            ("up", "Move up", host.x - 1), ("down", "Move down", host.x + 1),
+        ):
+            if 1 <= target <= 127 and not Host.objects.filter(
+                column=target // 16, row=target % 16,
+            ).exists():
+                moves.append({"direction": direction, "label": label, "target": target})
     return render(request, "inventory/form.html", {
         "form": form, "title": "Edit host" if host else "Insert host", "host": host,
+        "moves": moves, "revision": config.revision,
     })
+
+
+@operator
+@require_POST
+def host_move(request, host_id):
+    form = HostMoveForm(request.POST)
+    if not form.is_valid():
+        messages.error(request, "Choose Move up or Move down and provide a valid inventory revision.")
+        return redirect("host-edit", host_id=host_id)
+    data = form.cleaned_data
+    try:
+        host, candidate, config = preview_host_move(host_id, data["direction"], data["revision"])
+    except (ValidationError, IntegrityError, OperationalError) as error:
+        messages.error(request, _errors(error))
+        return redirect("host-edit", host_id=host_id)
+    return _pending(request, "move", {"id": host.pk, "direction": data["direction"]},
+                    config.revision, [{
+                        "label": host.name, "before": _address_summary(host, config),
+                        "after": _address_summary(candidate, config),
+                    }], "Confirm saved host move (no other hosts move)")
 
 
 @operator
@@ -225,6 +257,8 @@ def confirm(request):
         revision = pending["revision"]
         if pending["kind"] == "host":
             save_host(_host_from_payload(payload), expected_revision=revision)
+        elif pending["kind"] == "move":
+            move_host(payload["id"], payload["direction"], expected_revision=revision)
         elif pending["kind"] == "delete":
             delete_host(payload["id"], expected_revision=revision)
         elif pending["kind"] == "settings":

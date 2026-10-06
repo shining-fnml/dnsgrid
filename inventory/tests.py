@@ -6,7 +6,9 @@ from django.db.models.deletion import ProtectedError
 from django.test import TestCase
 
 from .models import MAX_SERIAL, Configuration, GandiRecord, Host, Site, normalize_mac
-from .services import delete_host, plan_placement, save_host, update_settings
+from .services import (
+    delete_host, move_host, plan_placement, preview_host_move, save_host, update_settings,
+)
 
 
 class InventoryTestCase(TestCase):
@@ -325,6 +327,97 @@ class PlacementTests(InventoryTestCase):
         with self.assertRaises(ValidationError):
             save_host(self.host(), MAX_SERIAL)
         self.assertEqual(before, self.snapshot())
+
+
+class QuickMoveTests(InventoryTestCase):
+    def test_adjacent_moves_preserve_identity_metadata_and_other_hosts(self):
+        for start, direction, target in (
+            (2, "up", 1), (2, "down", 3), (16, "up", 15), (15, "down", 16),
+        ):
+            with self.subTest(start=start, direction=direction):
+                host = self.insert(
+                    row=start % 16, column=start // 16, category="Hardware",
+                    status=Host.Status.DECOMMISSIONED, vpn=True, public_export=True,
+                    mac="02:00:00:00:00:01", notes="Keep these notes",
+                )
+                host.site_id = 4
+                save_host(host, Configuration.load().revision)
+                other = self.insert(name="other", row=14, column=7)
+                before = Host.objects.values().get(pk=host.pk)
+                other_before = Host.objects.values().get(pk=other.pk)
+                snapshot = self.snapshot()
+                revision = Configuration.load().revision
+                old, candidate, config = preview_host_move(host.pk, direction, revision)
+                self.assertEqual((old.x, candidate.x, config.revision), (start, target, revision))
+                self.assertEqual(self.snapshot(), snapshot)
+                moved = move_host(host.pk, direction, revision)
+                self.assertEqual(moved.pk, host.pk)
+                before.update(row=target % 16, column=target // 16)
+                self.assertEqual(Host.objects.values().get(pk=host.pk), before)
+                self.assertEqual(Host.objects.values().get(pk=other.pk), other_before)
+                self.assertFalse(Host.objects.filter(row=start % 16, column=start // 16).exists())
+                self.assertEqual(Configuration.load().revision, revision + 1)
+                Host.objects.all().delete()
+
+    def test_invalid_direction_bounds_occupancy_and_stale_revision_are_atomic(self):
+        host = self.insert()
+        self.insert(name="blocking", row=2)
+        for service in (preview_host_move, move_host):
+            for direction, revision in (
+                ("up", Configuration.load().revision),
+                ("down", Configuration.load().revision),
+                ("sideways", Configuration.load().revision),
+                (None, Configuration.load().revision),
+                ("down", 1),
+            ):
+                with self.subTest(service=service.__name__, direction=direction, revision=revision):
+                    before = self.snapshot()
+                    with self.assertRaises(ValidationError):
+                        service(host.pk, direction, revision)
+                    self.assertEqual(self.snapshot(), before)
+        Host.objects.filter(pk=host.pk).update(row=15, column=7)
+        for service in (preview_host_move, move_host):
+            before = self.snapshot()
+            with self.assertRaises(ValidationError):
+                service(host.pk, "down", Configuration.load().revision)
+            self.assertEqual(self.snapshot(), before)
+
+    def test_deleted_host_and_serial_limit_do_not_change_revision(self):
+        host = self.insert()
+        for service in (preview_host_move, move_host):
+            before = self.snapshot()
+            with self.assertRaisesMessage(ValidationError, "no longer exists"):
+                service(host.pk + 1, "down", Configuration.load().revision)
+            self.assertEqual(self.snapshot(), before)
+        Configuration.objects.filter(pk=1).update(revision=MAX_SERIAL)
+        before = self.snapshot()
+        preview_host_move(host.pk, "down", MAX_SERIAL)
+        with self.assertRaisesMessage(ValidationError, "maximum"):
+            move_host(host.pk, "down", MAX_SERIAL)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_database_error_rolls_back_position_and_revision(self):
+        host = self.insert()
+        before = self.snapshot()
+        with patch.object(Host, "save", side_effect=IntegrityError("conflict")):
+            with self.assertRaises(ValidationError):
+                move_host(host.pk, "down", Configuration.load().revision)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_revision_is_claimed_before_loading_host_or_destination(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        host = self.insert()
+        for service in (preview_host_move, move_host):
+            with CaptureQueriesContext(connection) as queries:
+                service(host.pk, "down", Configuration.load().revision)
+            sql = [query["sql"] for query in queries]
+            claim = next(index for index, query in enumerate(sql) if query.startswith("UPDATE"))
+            host_read = next(index for index, query in enumerate(sql) if (
+                query.startswith("SELECT") and 'FROM "inventory_host"' in query
+            ))
+            self.assertIn('"inventory_configuration"', sql[claim])
+            self.assertLess(claim, host_read)
 
 
 class SettingsTests(InventoryTestCase):

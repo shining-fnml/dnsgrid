@@ -17,6 +17,11 @@ class HostForm(forms.Form):
     revision = forms.IntegerField(widget=forms.HiddenInput)
 
 
+class HostMoveForm(forms.Form):
+    direction = forms.ChoiceField(choices=(("up", "Move up"), ("down", "Move down")))
+    revision = forms.IntegerField(widget=forms.HiddenInput)
+
+
 class ConfigurationForm(forms.Form):
     lan_domain = forms.CharField(max_length=253, label="LAN domain base")
     vpn_domain = forms.CharField(max_length=253, label="VPN domain base")
