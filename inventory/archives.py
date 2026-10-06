@@ -23,7 +23,7 @@ HOST_FIELDS = (
     "id", "name", "site_id", "row", "column", "category", "status",
     "vpn", "public_export", "mac", "notes",
 )
-SITE_FIELDS = ("id", "name", "g")
+SITE_FIELDS = ("id", "name", "g", "dsm_ifname")
 LEDGER_FIELDS = ("id", "zone", "name", "record_type", "values", "ttl")
 WARNINGS = (
     "This replaces all target settings, sites, hosts, and ownership records, not merges them.",
@@ -121,6 +121,8 @@ def validate(data):
     config.clean_for_hosts([])
     sites = []
     for raw in data["sites"]:
+        if type(raw) is dict and set(raw) == {"id", "name", "g"}:
+            raw = {**raw, "dsm_ifname": ""}
         _object(raw, SITE_FIELDS, integer=("id", "g"))
         site = Site(**raw)
         site.clean()
@@ -238,7 +240,9 @@ def restore(data, expected_revision, expected_fingerprint=None):
     Host.objects.all().delete()
     GandiRecord.objects.all().delete()
     for raw in data["sites"]:
-        Site.objects.update_or_create(pk=raw["id"], defaults={"name": raw["name"], "g": raw["g"]})
+        Site.objects.update_or_create(pk=raw["id"], defaults={
+            "name": raw["name"], "g": raw["g"], "dsm_ifname": raw["dsm_ifname"],
+        })
     for field in CONFIG_FIELDS:
         if field != "id":
             setattr(current, field, data["configuration"][field])

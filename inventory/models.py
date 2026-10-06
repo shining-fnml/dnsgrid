@@ -1,7 +1,7 @@
 import re
 
 from django.core.exceptions import ValidationError
-from django.core.validators import MaxLengthValidator, MaxValueValidator, MinValueValidator
+from django.core.validators import MaxLengthValidator, MaxValueValidator, MinValueValidator, RegexValidator
 from django.db import connections, models, router, transaction
 from django.db.models import F, Q
 
@@ -180,6 +180,12 @@ class Site(models.Model):
     name = models.CharField(max_length=80)
     g = models.PositiveSmallIntegerField(
         validators=[MinValueValidator(0), MaxValueValidator(255)]
+    )
+    dsm_ifname = models.CharField(
+        max_length=15, blank=True, default="",
+        validators=[RegexValidator(
+            r"\A[A-Za-z0-9_.-]+\Z", "Enter a DSM interface name such as ovs_eth0.",
+        )],
     )
 
     class Meta:

@@ -57,3 +57,9 @@ class ConfigurationForm(forms.Form):
             self.fields[f"site_{site.pk}_g"] = forms.IntegerField(
                 min_value=0, max_value=255, label=f"Site {site.pk} octet g", initial=site.g,
             )
+            self.fields[f"site_{site.pk}_dsm_ifname"] = forms.CharField(
+                max_length=15, required=False, label=f"Site {site.pk} DSM DHCP interface",
+                initial=site.dsm_ifname,
+                validators=Site._meta.get_field("dsm_ifname").validators,
+                help_text="Optional; enables reservation API exports for this site's DSM server.",
+            )

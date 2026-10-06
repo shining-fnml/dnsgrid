@@ -90,6 +90,9 @@ Global settings
 The Settings page configures LAN/VPN domains, two-octet IPv4 prefixes,
 the four site names and distinct third octets, TTL, authoritative NS
 and SOA mailbox names, the Gandi zone, and an optional Gandi token.
+Each site also has an optional DSM DHCP interface name (for example
+``ovs_eth0``). Set it to the interface serving that site's LAN subnet
+on its DSM server; leaving it blank disables that site's DSM API exports.
 The SOA mailbox is a DNS name such as ``hostmaster.example.tld``, not
 an email address. Defaults derive ``192.168.g.x`` and ``172.28.g.x``.
 
@@ -125,10 +128,24 @@ the preview if inventory changes instead of mixing different revisions.
     reservations for MAC-bearing hosts. Reservations use LAN FQDNs, not
     IP literals. Site-only moves leave reservations unchanged.
 ``dhcpd-dsm.conf``
-    Synology DSM's dnsmasq-style ``dhcp-host=MAC,name,LAN-IP,86400``
-    reservations for MAC-bearing hosts. Addresses follow each host's
-    configured site. This is a dnsmasq configuration file, not an ISC
-    DHCP file or an include; it contains dnsgrid-owned reservations only.
+    Legacy dnsmasq-style reservation listing, retained for audit only.
+    Do not copy it into DSM system files; use the reservation API exports.
+``dsm-reservations-site-<id>.json``
+    For each site with a configured DSM interface, the reservation-only
+    payload: ``ifname`` and ``reservationData`` containing ``mac``, ``ip``,
+    and ``hostname``. MACs are lowercase colon-separated, IPs are the
+    site's LAN addresses, and hostnames are dnsgrid's short host names.
+    Only MAC-bearing hosts in that site are included, in grid address
+    order. Invalid nonempty MACs abort export rather than silently omitting
+    reservations.
+``dsm-request-site-<id>.form``
+    Exact URL-encoded form body for an authenticated POST to that site's
+    DSM server at ``/webapi/entry.cgi`` using content type
+    ``application/x-www-form-urlencoded``. The inner call is
+    ``SYNO.Network.DHCPServer.Reservation.set`` version 2, wrapped in
+    ``SYNO.Entry.Request`` version 1 with ``mode="sequential"`` and
+    ``stop_when_error=false``. Credentials/session handling must be supplied
+    separately by the caller; dnsgrid does not authenticate or apply to DSM.
 ``vpn.hosts``
     VPN addresses, VPN FQDNs, and short aliases for all VPN members,
     including those not publicly exported.
@@ -143,13 +160,23 @@ existing user-managed zones with downloads. For a mixed deployment merge
 explicitly reviewed records or use separate delegated zones. Include or
 merge DHCP and hosts artifacts into configurations you own; the app does
 not manage unrelated stanzas, leases, options, routers, or dynamic pools.
-DSM may regenerate ``/etc/dhcpd/dhcpd.conf`` and overwrite manual edits
-after updates. Re-apply the DSM reservations to that file after an update
-if that is your workflow. Preserve the DSM-managed interface, pool, DNS
-options, and lease settings when applying dnsgrid's reservations: those
-settings are not represented in the application. Revalidate the resulting
-configuration and account for active DHCP leases; downloads never modify
-DSM files or package services.
+DSM uses ``SYNO.Network.DHCPServer.Reservation.set`` for reservations.
+User testing confirmed the UI/API updates both
+``/etc/dhcpd/dhcpd-<ifname>-static.conf`` and ``/etc/dhcpd/dhcpd.conf``.
+Send reservation data through DSM rather than editing these system files
+or modifying package binaries, service units, or scripts. These exports
+do not contain DHCP pools, gateway, DNS options, or lease settings.
+
+Review the preview and back up the destination interface's reservations
+before applying. Each site's artifact contains its complete reservation
+set, including an empty list when no hosts have MACs. Treat ``set`` as
+replacing the entire interface list: merge any unrelated reservations
+explicitly before sending it. Target the correct site's DSM server and
+interface; do not apply separate site lists to the same server/interface.
+Check both the outer ``success`` and inner result's ``success``, and ensure
+``data.has_fail`` is false. Verify the resulting reservations in DSM's UI.
+Downloads never modify DSM files or package services, and active leases
+do not change automatically.
 
 Output ordering is deterministic. BIND serials use the persisted inventory
 revision, not the clock: unchanged inventory yields identical exports,
@@ -222,7 +249,9 @@ The deterministic UTF-8 JSON schema has exactly these top-level keys:
 * ``configuration``: ``id`` (always 1), ``lan_domain``, ``vpn_domain``,
   ``lan_prefix``, ``vpn_prefix``, ``gandi_zone``, ``ttl``, ``soa_ns``,
   ``soa_mailbox``, and ``revision``.
-* ``sites``: exactly four objects with ``id`` (1–4), ``name``, and ``g``.
+* ``sites``: exactly four objects with ``id`` (1–4), ``name``, ``g``, and
+  ``dsm_ifname``. Older v1 archives without ``dsm_ifname`` are accepted
+  with an empty mapping; new exports include it.
 * ``hosts``: objects with ``id``, ``name``, ``site_id``, ``row``, ``column``,
   ``category``, ``status``, ``vpn``, ``public_export``, ``mac``, and ``notes``.
   Every status is included, with IDs and positions preserved.

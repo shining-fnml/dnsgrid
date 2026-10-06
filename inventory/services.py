@@ -162,24 +162,30 @@ def update_settings(config_data, site_data, expected_revision):
             candidate.full_clean(validate_unique=False)
             if (
                 len(site_data) != 4
-                or any(set(data) != {"id", "name", "g"} for data in site_data)
+                or any(set(data) not in (
+                    {"id", "name", "g"}, {"id", "name", "g", "dsm_ifname"},
+                ) for data in site_data)
                 or any(type(data["id"]) is not int for data in site_data)
                 or {data["id"] for data in site_data} != {1, 2, 3, 4}
                 or set(Site.objects.values_list("id", flat=True)) != {1, 2, 3, 4}
             ):
                 raise ValidationError("Settings must contain exactly the four fixed sites.")
-            sites = [Site(**data) for data in site_data]
+            originals = {site.pk: site for site in Site.objects.all()}
+            sites = [Site(**{
+                **data, "dsm_ifname": data.get("dsm_ifname", originals[data["id"]].dsm_ifname),
+            }) for data in site_data]
             for site in sites:
                 site.full_clean(validate_unique=False, validate_constraints=False)
             if len({site.name.casefold() for site in sites}) != 4:
                 raise ValidationError("Site names must be unique.")
             if len({site.g for site in sites}) != 4:
                 raise ValidationError("Site octets must be unique.")
-            originals = {site.pk: site for site in Site.objects.all()}
             changed = any(
                 getattr(candidate, field) != getattr(current, field) for field in CONFIG_FIELDS
             ) or any(
-                (site.name, site.g) != (originals[site.pk].name, originals[site.pk].g)
+                (site.name, site.g, site.dsm_ifname) != (
+                    originals[site.pk].name, originals[site.pk].g, originals[site.pk].dsm_ifname,
+                )
                 for site in sites
             )
             if changed:
@@ -187,7 +193,7 @@ def update_settings(config_data, site_data, expected_revision):
                 candidate.revision = expected_revision + 1
                 candidate.save(force_update=True, update_fields=CONFIG_FIELDS)
                 for site in sites:
-                    site.save(update_fields=["name", "g"])
+                    site.save(update_fields=["name", "g", "dsm_ifname"])
             return candidate
     except IntegrityError as error:
         raise ValidationError("The settings conflict with existing inventory data.") from error
