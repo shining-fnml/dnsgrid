@@ -1,0 +1,35 @@
+{% extends 'inventory/base.html' %}
+{% block content %}
+<h1>Host inventory <small>{{ count }} / 127 positions</small></h1>
+<p>One global grid · x = 16 × column + row · sites change networks, not positions.</p>
+<p>Click a cell to insert or edit. Inserting in an occupied cell shifts hosts downward in that column only, with a preview before confirmation.</p>
+<div class="grid-scroll">
+<table class="grid">
+  <caption>16 rows × 8 columns. Cell zero is reserved. Headless hosts: columns 0–3; display hosts: columns 4–7.</caption>
+  <thead>
+    <tr><th rowspan="2" scope="col">Row</th><th colspan="2">Headless / Other</th><th colspan="2">Headless / Server</th><th colspan="2">Display / Desktop</th><th colspan="2">Display / Mobile</th></tr>
+    <tr>{% for column in columns %}<th scope="col">{{ forloop.counter0 }} · {{ column }}</th>{% endfor %}</tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr><th scope="row">{{ row.index }}</th>
+    {% for cell in row.cells %}
+      <td class="{% if cell.x == 0 %}reserved{% elif cell.host %}occupied {{ cell.host.status }}{% else %}empty{% endif %}">
+        {% if cell.x == 0 %}<span>0 · Reserved</span>
+        {% elif cell.host %}
+        <a class="cell" href="{% url 'host-edit' cell.host.pk %}">
+          <small>x={{ cell.x }} · {{ cell.host.site.name }}</small>
+          <strong>{{ cell.host.name }}</strong>
+          <span>{{ cell.lan }}</span>
+          {% if cell.vpn %}<span>VPN {{ cell.vpn }}</span>{% endif %}
+          <small>{{ cell.host.get_status_display }}{% if cell.host.public_export %} · Public export{% endif %}</small>
+        </a>
+        {% else %}<a class="cell" href="{% url 'host-create' %}?row={{ cell.row }}&amp;column={{ cell.column }}"><small>x={{ cell.x }}</small><span>+ Insert</span></a>{% endif %}
+      </td>
+    {% endfor %}
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

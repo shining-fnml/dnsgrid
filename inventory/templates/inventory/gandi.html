@@ -1,0 +1,7 @@
+{% extends 'inventory/base.html' %}
+{% block content %}
+<h1>Gandi sync blocked</h1>
+<p>No records were changed. Resolve ownership conflicts explicitly with your DNS administrator, then regenerate the preview. dnsgrid never adopts unmanaged records automatically.</p>
+<ul>{% for conflict in plan.conflicts %}<li>{{ conflict }}</li>{% endfor %}</ul>
+<a href="{% url 'exports' %}">Back to exports</a>
+{% endblock %}

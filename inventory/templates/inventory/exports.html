@@ -1,0 +1,12 @@
+{% extends 'inventory/base.html' %}
+{% block content %}
+<h1>Export previews</h1>
+<p>Inventory revision {{ revision }}. Downloads from this preview are rejected if inventory changes.</p>
+<p>Generated from current inventory, including every status. Files are dedicated dnsgrid-owned artifacts: do not replace user-managed zones or configurations with them. Downloads do not deploy anything.</p>
+<p class="warning">Use these zones only for networks/domains delegated to dnsgrid. Validate with BIND and dhcpd before deployment; merge or include reservations into your operational DHCP configuration. DNS caching and existing DHCP leases can delay moves.</p>
+<form method="post" action="{% url 'gandi-preview' %}">{% csrf_token %}<button>Fetch Gandi preview / diff</button></form>
+<p>Gandi sync only creates new records or updates/deletes records tracked as owned by this installation. Unmanaged collisions and externally modified owned records block sync.</p>
+{% for filename, content in artifacts.items %}
+<details><summary>{{ filename }} · <a href="{% url 'download' filename %}?revision={{ revision }}">Download</a></summary><pre>{{ content }}</pre></details>
+{% endfor %}
+{% endblock %}

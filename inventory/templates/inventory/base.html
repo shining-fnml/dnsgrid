@@ -1,0 +1,23 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}dnsgrid{% endblock %}</title>
+  <link rel="stylesheet" href="{% static 'inventory/style.css' %}">
+</head>
+<body>
+<header>
+  <a class="brand" href="{% url 'grid' %}">dnsgrid</a>
+  {% if user.is_authenticated %}
+  <nav aria-label="Main"><a href="{% url 'grid' %}">Grid</a><a href="{% url 'host-create' %}">Insert host</a><a href="{% url 'configuration' %}">Settings</a><a href="{% url 'exports' %}">Export previews</a></nav>
+  <form action="{% url 'logout' %}" method="post">{% csrf_token %}<button>Sign out</button></form>
+  {% endif %}
+</header>
+<main>
+  {% for message in messages %}<p role="status" class="message {{ message.tags }}">{{ message }}</p>{% endfor %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>
