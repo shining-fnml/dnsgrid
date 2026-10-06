@@ -1,0 +1,14 @@
+{% extends 'inventory/base.html' %}
+{% block content %}
+<h1>{{ title }}</h1>
+{% if settings_page %}
+<p>These settings affect every export. Site mappings must remain distinct. Saved Gandi token: {% if token_saved %}yes{% else %}no{% endif %}; the token is never displayed.</p>
+{% else %}
+<p>Status is informational only. Decommissioned hosts remain in all eligible exports until manually deleted.</p>
+{% endif %}
+<form method="post" class="editor">{% csrf_token %}{{ form.as_p }}<button>Preview changes</button> <a href="{% url 'grid' %}">Cancel</a></form>
+{% if host %}
+<p><a href="{% url 'host-create' %}?row={{ host.row }}&amp;column={{ host.column }}">Insert a new host here (shift this column)</a></p>
+<form method="post" action="{% url 'host-delete' host.pk %}">{% csrf_token %}<button class="danger">Preview deletion</button></form>
+{% endif %}
+{% endblock %}

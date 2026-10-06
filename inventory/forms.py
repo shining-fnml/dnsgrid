@@ -1,0 +1,44 @@
+from django import forms
+
+from .models import Host, Site
+
+
+class HostForm(forms.Form):
+    name = forms.CharField(max_length=63)
+    site = forms.ModelChoiceField(queryset=Site.objects.order_by("id"))
+    row = forms.IntegerField(min_value=0, max_value=15)
+    column = forms.IntegerField(min_value=0, max_value=7)
+    category = forms.CharField(max_length=80, required=False)
+    status = forms.ChoiceField(choices=Host.Status.choices)
+    vpn = forms.BooleanField(required=False, label="VPN member")
+    public_export = forms.BooleanField(required=False, label="Publish on Gandi (VPN only)")
+    mac = forms.CharField(max_length=32, required=False, label="MAC address")
+    notes = forms.CharField(max_length=4000, required=False, widget=forms.Textarea(attrs={"rows": 3}))
+    revision = forms.IntegerField(widget=forms.HiddenInput)
+
+
+class ConfigurationForm(forms.Form):
+    lan_domain = forms.CharField(max_length=253, label="LAN domain base")
+    vpn_domain = forms.CharField(max_length=253, label="VPN domain base")
+    lan_prefix = forms.CharField(max_length=7)
+    vpn_prefix = forms.CharField(max_length=7)
+    gandi_zone = forms.CharField(max_length=253, label="Gandi managed zone")
+    gandi_token = forms.CharField(
+        required=False, max_length=512, widget=forms.PasswordInput,
+        help_text="Leave blank to keep the saved token. DNSGRID_GANDI_TOKEN overrides it.",
+    )
+    clear_token = forms.BooleanField(required=False, label="Remove saved Gandi token")
+    ttl = forms.IntegerField(min_value=60, max_value=86400, label="DNS TTL (seconds)")
+    soa_ns = forms.CharField(max_length=253, label="Authoritative nameserver FQDN")
+    soa_mailbox = forms.CharField(max_length=253, label="SOA mailbox (DNS name, not email)")
+    revision = forms.IntegerField(widget=forms.HiddenInput)
+
+    def __init__(self, *args, sites, **kwargs):
+        super().__init__(*args, **kwargs)
+        for site in sites:
+            self.fields[f"site_{site.pk}_name"] = forms.CharField(
+                max_length=80, label=f"Site {site.pk} name", initial=site.name,
+            )
+            self.fields[f"site_{site.pk}_g"] = forms.IntegerField(
+                min_value=0, max_value=255, label=f"Site {site.pk} octet g", initial=site.g,
+            )

@@ -1,0 +1,11 @@
+{% extends 'inventory/base.html' %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p>Review the diff before applying. If inventory or Gandi records change after this preview, the operation is rejected.</p>
+<table class="diff"><thead><tr><th>Item</th><th>Before</th><th>After</th></tr></thead><tbody>
+{% for change in changes %}<tr><th>{{ change.label }}</th><td>{{ change.before|default_if_none:"—" }}</td><td>{{ change.after|default_if_none:"—" }}</td></tr>
+{% empty %}<tr><td colspan="3">No changes needed.</td></tr>{% endfor %}
+</tbody></table>
+<p class="warning">DNS moves require publishing forward and reverse zones together. Allow the previous TTL to expire and ensure dhcpd can resolve the LAN FQDN before renewing leases. Existing leases do not move automatically.</p>
+<form method="post" action="{% url 'confirm' %}">{% csrf_token %}<input type="hidden" name="nonce" value="{{ nonce }}"><button>Confirm and apply</button> <a href="{% url 'grid' %}">Cancel</a></form>
+{% endblock %}

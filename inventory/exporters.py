@@ -1,0 +1,103 @@
+"""Deterministic downloads; these files never overwrite external configuration."""
+
+import json
+
+from django.db import transaction
+from django.db.models import F
+
+from .models import Configuration, Host, Site, normalize_mac
+
+
+@transaction.atomic
+def _inputs(config, hosts):
+    # Match inventory services' write lock before reading the serial and hosts.
+    # An atomic read alone is not a repeatable snapshot on every database.
+    Configuration.objects.filter(pk=1).update(revision=F("revision"))
+    config = config if config is not None else Configuration.load()
+    hosts = list(hosts if hosts is not None else Host.objects.select_related("site"))
+    hosts.sort(key=lambda host: (host.x, host.name, host.site_id))
+    return config, hosts
+
+
+def _group(host):
+    return host.site.g
+
+
+def _header(config, origin):
+    return [
+        "; DNSGrid application-owned export; do not replace unrelated configuration.",
+        f"$ORIGIN {origin}.",
+        f"$TTL {config.ttl}",
+        f"@ IN SOA {config.soa_ns}. {config.soa_mailbox}. (",
+        f"    {config.revision} 3600 900 1209600 {min(config.ttl, 300)} )",
+        f"@ IN NS {config.soa_ns}.",
+    ]
+
+
+def desired_gandi(config=None, hosts=None):
+    config, hosts = _inputs(config, hosts)
+    zone = config.gandi_zone.rstrip(".").lower()
+    records = []
+    for host in hosts:
+        if not (host.vpn and host.public_export):
+            continue
+        fqdn = host.vpn_fqdn(config).rstrip(".").lower()
+        if fqdn == zone:
+            name = "@"
+        elif fqdn.endswith("." + zone):
+            name = fqdn[: -(len(zone) + 1)]
+        else:
+            raise ValueError("The VPN hostname must be inside the configured Gandi zone.")
+        records.append({
+            "rrset_name": name,
+            "rrset_type": "A",
+            "rrset_ttl": config.ttl,
+            "rrset_values": [host.vpn_address(config)],
+        })
+    return records
+
+
+@transaction.atomic
+def build_exports(config=None, hosts=None):
+    config, hosts = _inputs(config, hosts)
+    forward = _header(config, config.lan_domain)
+    forward.extend(f"{host.name} IN A {host.lan_address(config)}" for host in hosts)
+    result = {"forward.zone": "\n".join(forward) + "\n"}
+    prefix = config.lan_prefix.split(".")
+    dhcp = [
+        "# DNSGrid application-owned export; do not replace unrelated configuration.",
+    ]
+    groups = sorted(set(Site.objects.values_list("g", flat=True)) | {_group(host) for host in hosts})
+    for group in groups:
+        reverse = _header(config, f"{group}.{prefix[1]}.{prefix[0]}.in-addr.arpa")
+        members = [host for host in hosts if _group(host) == group]
+        reverse.extend(
+            f"{host.x} IN PTR {host.lan_fqdn(config)}." for host in members
+        )
+        result[f"reverse-{group}.zone"] = "\n".join(reverse) + "\n"
+        dhcp.append(f"subnet {config.lan_prefix}.{group}.0 netmask 255.255.255.0 {{")
+        dhcp.append("}")
+    seen_macs = set()
+    for host in hosts:
+        mac = normalize_mac(host.mac)
+        if mac:
+            if mac in seen_macs:
+                raise ValueError("DHCP reservations must have unique MAC addresses.")
+            seen_macs.add(mac)
+            dhcp.extend([
+                f"host {host.name} {{",
+                f"  hardware ethernet {mac};",
+                f"  fixed-address {host.lan_fqdn(config)};",
+                "}",
+            ])
+    result["dhcpd.conf"] = "\n".join(dhcp) + "\n"
+    vpn = [
+        "# DNSGrid application-owned export; do not replace unrelated configuration.",
+    ]
+    vpn.extend(
+        f"{host.vpn_address(config)} {host.vpn_fqdn(config)} {host.name}"
+        for host in hosts if host.vpn
+    )
+    result["vpn.hosts"] = "\n".join(vpn) + "\n"
+    result["gandi.json"] = json.dumps(desired_gandi(config, hosts), indent=2) + "\n"
+    return result
