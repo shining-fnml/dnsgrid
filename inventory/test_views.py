@@ -276,6 +276,7 @@ class OperatorViewsTests(TestCase):
         for site in Site.objects.all():
             data[f"site_{site.pk}_name"] = site.name
             data[f"site_{site.pk}_g"] = site.g
+            data[f"site_{site.pk}_dsm_ifname"] = site.dsm_ifname
         data.update(updates)
         return data
 
@@ -304,6 +305,44 @@ class OperatorViewsTests(TestCase):
         self.assertTrue(response.context["form"].errors)
         self.assertEqual(Site.objects.get(pk=1).g, 1)
 
+    def test_dsm_interface_settings_preview_confirm_and_validation(self):
+        response = self.client.get(reverse("configuration"))
+        self.assertContains(response, "Site 1 DSM DHCP interface")
+        response = self.client.post(reverse("configuration"), self.settings_data(
+            site_1_dsm_ifname="ovs_eth0",
+        ))
+        self.assertTemplateUsed(response, "inventory/confirm.html")
+        self.assertContains(response, "ovs_eth0")
+        self.assertEqual(Site.objects.get(pk=1).dsm_ifname, "")
+        self.apply_pending()
+        self.assertEqual(Site.objects.get(pk=1).dsm_ifname, "ovs_eth0")
+        response = self.client.post(reverse("configuration"), self.settings_data(
+            site_1_dsm_ifname="../invalid",
+        ))
+        self.assertTrue(response.context["form"].errors)
+        self.assertEqual(Site.objects.get(pk=1).dsm_ifname, "ovs_eth0")
+
+    def test_dsm_api_artifact_preview_download_and_stale_revision(self):
+        self.create_host()
+        Site.objects.filter(pk=1).update(dsm_ifname="ovs_eth0")
+        response = self.client.get(reverse("exports"))
+        self.assertContains(response, "DSM DHCP reservations (API)")
+        self.assertContains(response, "dsm-reservations-site-1.json")
+        self.assertContains(response, "dsm-request-site-1.form")
+        revision = response.context["revision"]
+        for filename in ("dsm-reservations-site-1.json", "dsm-request-site-1.form"):
+            url = reverse("download", args=[filename]) + f"?revision={revision}"
+            download = self.client.get(url)
+            self.assertEqual(download.status_code, 200)
+            self.assertEqual(download.content.decode(), response.context["artifacts"][filename])
+        config = Configuration.load()
+        config.revision += 1
+        config.save(update_fields=["revision"])
+        self.assertEqual(self.client.get(url).status_code, 409)
+        self.assertEqual(self.client.get(reverse("download", args=[
+            "dsm-reservations-site-2.json",
+        ])).status_code, 404)
+
     def test_notes_are_escaped_and_exports_hide_status_and_notes(self):
         host = self.create_host(notes="<script>alert(1)</script>", status="decommissioned")
         response = self.client.get(reverse("host-edit", args=[host.pk]))
@@ -318,8 +357,8 @@ class OperatorViewsTests(TestCase):
         self.assertIn("attachment;", download["Content-Disposition"])
         export_page = self.client.get(reverse("exports"))
         self.assertContains(export_page, "dhcpd-dsm.conf")
-        self.assertContains(export_page, "targets Synology DSM's dnsmasq-based DHCP service")
-        self.assertContains(export_page, "Re-apply the DSM reservations after an update")
+        self.assertContains(export_page, "SYNO.Network.DHCPServer.Reservation.set")
+        self.assertContains(export_page, "Do not edit DSM system files or package services")
         dsm_download = self.client.get(reverse("download", args=["dhcpd-dsm.conf"]))
         self.assertEqual(dsm_download.status_code, 200)
         self.assertIn("dhcp-host=", dsm_download.content.decode())

@@ -207,6 +207,7 @@ def configuration(request):
             setattr(candidate, key, value)
         site_data = [{
             "id": site.pk, "name": data[f"site_{site.pk}_name"], "g": data[f"site_{site.pk}_g"],
+            "dsm_ifname": data[f"site_{site.pk}_dsm_ifname"],
         } for site in sites]
         try:
             if data["revision"] != config.revision:
@@ -226,6 +227,12 @@ def configuration(request):
                     changes.append({
                         "label": f"Site {site.pk}", "before": f"{site.name} (g={site.g})",
                         "after": f"{new['name']} (g={new['g']})",
+                    })
+                if site.dsm_ifname != new["dsm_ifname"]:
+                    changes.append({
+                        "label": f"Site {site.pk} DSM DHCP interface",
+                        "before": site.dsm_ifname or "Not configured",
+                        "after": new["dsm_ifname"] or "Not configured",
                     })
             for host in Host.objects.select_related("site"):
                 moved = copy.copy(host)
