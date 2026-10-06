@@ -10,6 +10,7 @@
 <p>Archives include all hosts, sites, nonsecret settings, revision, and trusted Gandi ownership history; not users, sessions, tokens, or deployment secrets. They are portable application data, not byte-for-byte backups. Stop the source Gandi writer before migration.</p>
 <p>Generated from current inventory, including every status. Files are dedicated dnsgrid-owned artifacts: do not replace user-managed zones or configurations with them. Downloads do not deploy anything.</p>
 <p class="warning">Use these zones only for networks/domains delegated to dnsgrid. Validate with BIND and dhcpd before deployment; merge or include reservations into your operational DHCP configuration. DNS caching and existing DHCP leases can delay moves.</p>
+<p><code>dhcpd.conf</code> targets ISC DHCP; <code>dhcpd-dsm.conf</code> targets Synology DSM's dnsmasq-based DHCP service. DSM may regenerate <code>/etc/dhcpd/dhcpd.conf</code> and overwrite manual edits after updates. Re-apply the DSM reservations after an update, retaining DSM-managed interfaces, pools, options, and lease settings; downloads do not modify DSM.</p>
 <form method="post" action="{% url 'gandi-preview' %}">{% csrf_token %}<button>Fetch Gandi preview / diff</button></form>
 <p>Gandi sync only creates new records or updates/deletes records tracked as owned by this installation. Unmanaged collisions and externally modified owned records block sync.</p>
 {% for filename, content in artifacts.items %}

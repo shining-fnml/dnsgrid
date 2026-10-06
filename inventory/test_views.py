@@ -316,6 +316,13 @@ class OperatorViewsTests(TestCase):
         download = self.client.get(reverse("download", args=["dhcpd.conf"]))
         self.assertEqual(download.status_code, 200)
         self.assertIn("attachment;", download["Content-Disposition"])
+        export_page = self.client.get(reverse("exports"))
+        self.assertContains(export_page, "dhcpd-dsm.conf")
+        self.assertContains(export_page, "targets Synology DSM's dnsmasq-based DHCP service")
+        self.assertContains(export_page, "Re-apply the DSM reservations after an update")
+        dsm_download = self.client.get(reverse("download", args=["dhcpd-dsm.conf"]))
+        self.assertEqual(dsm_download.status_code, 200)
+        self.assertIn("dhcp-host=", dsm_download.content.decode())
         self.assertEqual(self.client.get(reverse("download", args=["not-an-artifact"])).status_code, 404)
 
     def test_download_rejects_stale_preview_revision(self):

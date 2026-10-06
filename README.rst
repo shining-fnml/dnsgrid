@@ -124,6 +124,11 @@ the preview if inventory changes instead of mixing different revisions.
     One ISC DHCP configuration with all four subnet declarations and
     reservations for MAC-bearing hosts. Reservations use LAN FQDNs, not
     IP literals. Site-only moves leave reservations unchanged.
+``dhcpd-dsm.conf``
+    Synology DSM's dnsmasq-style ``dhcp-host=MAC,name,LAN-IP,86400``
+    reservations for MAC-bearing hosts. Addresses follow each host's
+    configured site. This is a dnsmasq configuration file, not an ISC
+    DHCP file or an include; it contains dnsgrid-owned reservations only.
 ``vpn.hosts``
     VPN addresses, VPN FQDNs, and short aliases for all VPN members,
     including those not publicly exported.
@@ -138,6 +143,13 @@ existing user-managed zones with downloads. For a mixed deployment merge
 explicitly reviewed records or use separate delegated zones. Include or
 merge DHCP and hosts artifacts into configurations you own; the app does
 not manage unrelated stanzas, leases, options, routers, or dynamic pools.
+DSM may regenerate ``/etc/dhcpd/dhcpd.conf`` and overwrite manual edits
+after updates. Re-apply the DSM reservations to that file after an update
+if that is your workflow. Preserve the DSM-managed interface, pool, DNS
+options, and lease settings when applying dnsgrid's reservations: those
+settings are not represented in the application. Revalidate the resulting
+configuration and account for active DHCP leases; downloads never modify
+DSM files or package services.
 
 Output ordering is deterministic. BIND serials use the persisted inventory
 revision, not the clock: unchanged inventory yields identical exports,
