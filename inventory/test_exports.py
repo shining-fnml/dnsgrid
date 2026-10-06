@@ -39,6 +39,7 @@ class ExportTests(TestCase):
         self.assertNotIn(self.host.status, "".join(output.values()))
 
     def test_every_status_is_exported(self):
+        original = build_exports(self.config, [self.host])
         for status, _ in Host._meta.get_field("status").choices:
             self.host.status = status
             output = build_exports(self.config, [self.host])
@@ -47,6 +48,9 @@ class ExportTests(TestCase):
             self.assertIn("host alpha", output["dhcpd.conf"])
             self.assertEqual(len(json.loads(output["gandi.json"])), 1)
             self.assertNotIn(status, "".join(output.values()))
+            self.assertEqual(output, original)
+            self.assertEqual(self.host.name, "alpha")
+            self.assertNotIn("[alpha]", "".join(output.values()))
 
     def test_vpn_public_flags_and_optional_mac(self):
         for vpn in (False, True):

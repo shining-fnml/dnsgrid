@@ -1,11 +1,95 @@
+from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.contrib.staticfiles import finders
 from django.test import Client, TestCase
 from django.urls import reverse
 
+from .exporters import build_exports
 from .models import Configuration, Host, Site
 from .services import save_host
+
+
+class GridRenderingTests(TestCase):
+    def setUp(self):
+        user = get_user_model().objects.create_user(username="operator", is_staff=True)
+        self.client.force_login(user)
+        self.config = Configuration.load()
+
+    def test_site_vpn_and_status_styles_compose_without_changing_data(self):
+        hosts = []
+        for site in Site.objects.all():
+            for index, status in enumerate(Host.Status.values):
+                for vpn in (False, True):
+                    hosts.append(Host.objects.create(
+                        name=f"host-{site.pk}-{status}-{int(vpn)}",
+                        site=site, row=2 * index + int(vpn) + 1, column=site.pk - 1,
+                        status=status, vpn=vpn, public_export=vpn,
+                        category="Descriptive metadata",
+                    ))
+        before = build_exports()
+        response = self.client.get(reverse("grid"))
+        for host in hosts:
+            with self.subTest(site=host.site_id, status=host.status, vpn=host.vpn):
+                name = f"[{host.name}]" if host.status == Host.Status.DECOMMISSIONED else host.name
+                name_class = "host-name vpn-name" if host.vpn else "host-name"
+                vpn_line = f"<span>VPN {host.vpn_address(self.config)}</span>" if host.vpn else ""
+                public_label = " · Public export" if host.public_export else ""
+                self.assertContains(response, f"""
+                    <td class="occupied {host.status} site-{host.site_id}">
+                      <a class="cell" href="{reverse('host-edit', args=[host.pk])}">
+                        <small>x={host.x} · {host.site.name}</small>
+                        <span class="{name_class}">{name}</span>
+                        <span>{host.lan_address(self.config)}</span>
+                        {vpn_line}
+                        <small>{host.get_status_display()}{public_label}</small>
+                      </a>
+                    </td>
+                """, html=True)
+                host.refresh_from_db()
+                self.assertEqual(host.name, f"host-{host.site_id}-{host.status}-{int(host.vpn)}")
+                self.assertEqual(host.category, "Descriptive metadata")
+                self.assertEqual(host.lan_fqdn(self.config), f"{host.name}.intranet.example.tld")
+                self.assertEqual(host.vpn_fqdn(self.config), f"{host.name}.vpn.example.tld")
+                self.assertNotContains(response, f"<strong>{name}</strong>", html=True)
+        self.assertEqual(build_exports(), before)
+
+    def test_site_colors_and_legend_follow_ids_not_names_or_octets(self):
+        for site in Site.objects.all():
+            Host.objects.create(name=f"site-{site.pk}", site=site, row=site.pk, column=0)
+        before = self.client.get(reverse("grid"))
+        for site in Site.objects.all():
+            self.assertContains(before, f'class="occupied running site-{site.pk}"', count=1)
+            Site.objects.filter(pk=site.pk).update(name=f"Renamed & site {site.pk}", g=25 - site.pk)
+        response = self.client.get(reverse("grid"))
+        for site in Site.objects.all():
+            with self.subTest(site=site.pk):
+                self.assertContains(response, f'class="occupied running site-{site.pk}"', count=1)
+                self.assertContains(response, f'<span class="site-{site.pk}">{site.pk} · Renamed &amp; site {site.pk}</span>', html=True)
+                self.assertContains(response, f"x={site.pk} · Renamed &amp; site {site.pk}")
+                self.assertContains(response, f"192.168.{site.g}.{site.pk}")
+        for text in ("VPN names: bold", "Unconfirmed: light gray cell", "Decommissioned: [name]"):
+            self.assertContains(response, text)
+
+    def test_empty_grid_legend_includes_all_configured_sites(self):
+        response = self.client.get(reverse("grid"))
+        for site in Site.objects.all():
+            self.assertContains(response, f'<span class="site-{site.pk}">{site.pk} · {site.name}</span>', html=True)
+        self.assertContains(response, '<td class="reserved">', count=1)
+        self.assertContains(response, '<td class="empty">', count=127)
+
+    def test_grid_css_defines_dark_ink_light_surfaces_and_name_weights(self):
+        css = Path(finders.find("inventory/style.css")).read_text()
+        for site_id, color in enumerate(("#153e75", "#205c32", "#8b2424", "#806000"), 1):
+            self.assertIn(f".grid .site-{site_id}, .grid-legend .site-{site_id} {{ color: {color}; }}", css)
+        self.assertIn(".grid .occupied, .grid-legend { background: #fff; color: #222; color-scheme: light; }", css)
+        self.assertIn(".grid .occupied .cell { color: inherit; }", css)
+        self.assertIn(".grid .occupied.unconfirmed { background: #e5e7eb; }", css)
+        self.assertIn(".grid .occupied .cell:hover, .grid .occupied .cell:focus-visible { background: #e8eef6; }", css)
+        self.assertIn("outline: 2px solid var(--accent);", css)
+        self.assertIn(".grid .host-name { font-weight: normal; }", css)
+        self.assertIn(".grid .host-name.vpn-name { font-weight: bold; }", css)
 
 
 class OperatorViewsTests(TestCase):

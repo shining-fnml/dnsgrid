@@ -3,6 +3,11 @@
 <h1>Host inventory <small>{{ count }} / 127 positions</small></h1>
 <p>One global grid · x = 16 × column + row · sites change networks, not positions.</p>
 <p>Click a cell to insert or edit. Inserting in an occupied cell shifts hosts downward in that column only, with a preview before confirmation.</p>
+<p class="grid-legend">
+  Site ink:
+  {% for site in sites %}<span class="site-{{ site.id }}">{{ site.id }} · {{ site.name }}</span>{% if not forloop.last %} / {% endif %}{% endfor %}
+  · <strong>VPN names: bold</strong> · Unconfirmed: light gray cell · Decommissioned: [name].
+</p>
 <div class="grid-scroll">
 <table class="grid">
   <caption>16 rows × 8 columns. Cell zero is reserved. Headless hosts: columns 0–3; display hosts: columns 4–7.</caption>
@@ -14,12 +19,12 @@
   {% for row in rows %}
     <tr><th scope="row">{{ row.index }}</th>
     {% for cell in row.cells %}
-      <td class="{% if cell.x == 0 %}reserved{% elif cell.host %}occupied {{ cell.host.status }}{% else %}empty{% endif %}">
+      <td class="{% if cell.x == 0 %}reserved{% elif cell.host %}occupied {{ cell.host.status }} site-{{ cell.host.site_id }}{% else %}empty{% endif %}">
         {% if cell.x == 0 %}<span>0 · Reserved</span>
         {% elif cell.host %}
         <a class="cell" href="{% url 'host-edit' cell.host.pk %}">
           <small>x={{ cell.x }} · {{ cell.host.site.name }}</small>
-          <strong>{{ cell.host.name }}</strong>
+          <span class="host-name{% if cell.host.vpn %} vpn-name{% endif %}">{% if cell.host.status == 'decommissioned' %}[{% endif %}{{ cell.host.name }}{% if cell.host.status == 'decommissioned' %}]{% endif %}</span>
           <span>{{ cell.lan }}</span>
           {% if cell.vpn %}<span>VPN {{ cell.vpn }}</span>{% endif %}
           <small>{{ cell.host.get_status_display }}{% if cell.host.public_export %} · Public export{% endif %}</small>

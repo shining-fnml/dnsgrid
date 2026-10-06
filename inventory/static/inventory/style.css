@@ -19,6 +19,17 @@ thead { background: light-dark(#e8eef6, #243449); }
 .grid .reserved { background: light-dark(#ddd, #333); padding: .6rem; }
 .grid .decommissioned { border-left: 4px solid #b27725; }
 .grid .unconfirmed { border-left: 4px solid #9773b9; }
+.grid .occupied, .grid-legend { background: #fff; color: #222; color-scheme: light; }
+.grid .site-1, .grid-legend .site-1 { color: #153e75; }
+.grid .site-2, .grid-legend .site-2 { color: #205c32; }
+.grid .site-3, .grid-legend .site-3 { color: #8b2424; }
+.grid .site-4, .grid-legend .site-4 { color: #806000; }
+.grid .occupied .cell { color: inherit; }
+.grid .occupied .cell:hover, .grid .occupied .cell:focus-visible { background: #e8eef6; }
+.grid .occupied.unconfirmed { background: #e5e7eb; }
+.grid .host-name { font-weight: normal; }
+.grid .host-name.vpn-name { font-weight: bold; }
+.grid-legend { padding: .6rem; border: 1px solid var(--line); font-size: .85rem; }
 .editor { max-width: 650px; }
 .editor p { display: flex; flex-direction: column; gap: .3rem; }
 input, select, textarea, button { font: inherit; padding: .5rem; }

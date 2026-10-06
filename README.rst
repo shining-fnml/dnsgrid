@@ -54,12 +54,21 @@ Inventory and confirmations
   reject stale forms and stale confirmations; refresh and preview again.
 * ``running``, ``decommissioned``, and ``unconfirmed`` are informational.
   Nothing expires automatically and statuses never enter exports.
+* Occupied grid cells use dark ink by stable site ID: 1 blue, 2 green,
+  3 red, 4 gold, independent of site names or subnet octets. Their surfaces
+  stay light even in dark mode; the rest of the application retains its
+  theme. VPN names alone are bold, unconfirmed cells are light gray, and
+  decommissioned names appear as ``[name]`` only in the grid. Stored names,
+  FQDNs, and exports are unchanged. The legend uses configured site names.
 * Names are unique DNS labels. MACs accept colon, hyphen, dotted, or
   compact hexadecimal formats and normalize to lowercase colon form.
   Invalid, multicast, zero, or duplicate nonempty MACs are rejected.
 * Column headings describe networking, peripherals, bare-metal and
   virtual servers, console/TV desktops, laptops, and phones. Hardware
-  category remains editable metadata; it does not filter exports.
+  category remains independent, optional free-text descriptive metadata;
+  it does not filter exports. The column already supplies the grid category.
+  Removing this potentially redundant field is a separate follow-up, not
+  a change to existing data or forms.
 
 Global settings
 ---------------
