@@ -20,40 +20,49 @@ class GridRenderingTests(TestCase):
     def test_site_vpn_and_status_styles_compose_without_changing_data(self):
         hosts = []
         for site in Site.objects.all():
-            for index, status in enumerate(Host.Status.values):
+            for status in Host.Status.values:
                 for vpn in (False, True):
-                    hosts.append(Host.objects.create(
-                        name=f"host-{site.pk}-{status}-{int(vpn)}",
-                        site=site, row=2 * index + int(vpn) + 1, column=site.pk - 1,
-                        status=status, vpn=vpn, public_export=vpn,
-                        category="Descriptive metadata",
-                    ))
+                    for public in (False, True):
+                        for mac in (False, True):
+                            x = len(hosts) + 1
+                            hosts.append(Host.objects.create(
+                                name=f"host-{site.pk}-{status}-{int(vpn)}-{int(public)}-{int(mac)}",
+                                site=site, row=x % 16, column=x // 16,
+                                status=status, vpn=vpn, public_export=public,
+                                mac=f"02:00:00:00:00:{x:02x}" if mac else "",
+                                category="Descriptive metadata",
+                            ))
         before = build_exports()
         response = self.client.get(reverse("grid"))
         for host in hosts:
             with self.subTest(site=host.site_id, status=host.status, vpn=host.vpn):
                 name = f"({host.name})" if host.status == Host.Status.DECOMMISSIONED else host.name
                 name_class = "host-name vpn-name" if host.vpn else "host-name"
-                vpn_line = f"<span>VPN {host.vpn_address(self.config)}</span>" if host.vpn else ""
-                public_label = " · Public export" if host.public_export else ""
+                vpn_class = "vpn-address published-address" if host.public_export else "vpn-address"
+                vpn_line = f'<span class="{vpn_class}">VPN {host.vpn_address(self.config)}</span>' if host.vpn else ""
+                mac_line = f'<small class="mac-address">{host.mac}</small>' if host.mac else ""
                 self.assertContains(response, f"""
                     <td class="occupied {host.status} site-{host.site_id}">
-                      <a class="cell" href="{reverse('host-edit', args=[host.pk])}">
+                      <a class="cell" href="{reverse('host-edit', args=[host.pk])}" aria-describedby="status-{host.pk}">
                         <small>x={host.x} · {host.site.name}</small>
                         <span class="{name_class}">{name}</span>
                         <span>{host.lan_address(self.config)}</span>
                         {vpn_line}
-                        <small>{host.get_status_display()}{public_label}</small>
+                        {mac_line}
+                        <span class="visually-hidden" id="status-{host.pk}">{host.get_status_display()}</span>
                       </a>
                     </td>
                 """, html=True)
+                original_name = host.name
                 host.refresh_from_db()
-                self.assertEqual(host.name, f"host-{host.site_id}-{host.status}-{int(host.vpn)}")
+                self.assertEqual(host.name, original_name)
                 self.assertEqual(host.category, "Descriptive metadata")
                 self.assertEqual(host.lan_fqdn(self.config), f"{host.name}.intranet.example.tld")
                 self.assertEqual(host.vpn_fqdn(self.config), f"{host.name}.vpn.example.tld")
                 self.assertNotContains(response, f"<strong>{name}</strong>", html=True)
         self.assertEqual(build_exports(), before)
+        self.assertNotContains(response, "Public export")
+        self.assertNotContains(response, "<small>Running", html=False)
 
     def test_site_colors_and_legend_follow_ids_not_names_or_octets(self):
         for site in Site.objects.all():
@@ -69,7 +78,7 @@ class GridRenderingTests(TestCase):
                 self.assertContains(response, f'<span class="site-{site.pk}">{site.pk} · Renamed &amp; site {site.pk}</span>', html=True)
                 self.assertContains(response, f"x={site.pk} · Renamed &amp; site {site.pk}")
                 self.assertContains(response, f"192.168.{site.g}.{site.pk}")
-        for text in ("VPN names: bold", "Unconfirmed: light gray cell", "Decommissioned: (name)"):
+        for text in ("VPN names: bold", "Bold VPN address: public publication", "Unconfirmed: light gray cell", "Decommissioned: (name)"):
             self.assertContains(response, text)
 
     def test_empty_grid_legend_includes_all_configured_sites(self):
@@ -90,6 +99,22 @@ class GridRenderingTests(TestCase):
         self.assertIn("outline: 2px solid var(--accent);", css)
         self.assertIn(".grid .host-name { font-weight: normal; }", css)
         self.assertIn(".grid .host-name.vpn-name { font-weight: bold; }", css)
+        self.assertIn(".grid .vpn-address { font-weight: normal; }", css)
+        self.assertIn(".grid .vpn-address.published-address { font-weight: bold; }", css)
+
+    def test_heading_enhancement_keeps_one_original_two_row_thead(self):
+        response = self.client.get(reverse("grid"))
+        self.assertContains(response, "<thead>", count=1)
+        self.assertContains(response, '<th rowspan="2" scope="col">Row</th>', html=True)
+        self.assertContains(response, "/static/inventory/grid.js")
+        css = Path(finders.find("inventory/style.css")).read_text()
+        script = Path(finders.find("inventory/grid.js")).read_text()
+        self.assertIn(".grid-scroll { position: relative; overflow-x: auto; }", css)
+        self.assertIn("z-index: 2; transform: translateY(", css)
+        self.assertIn(".grid thead th { background:", css)
+        self.assertIn('document.querySelector(".grid-scroll .grid")', script)
+        self.assertIn("ResizeObserver", script)
+        self.assertNotIn("cloneNode", script)
 
 
 class OperatorViewsTests(TestCase):
@@ -121,6 +146,22 @@ class OperatorViewsTests(TestCase):
         self.assertTemplateUsed(response, "inventory/confirm.html")
         self.assertEqual(self.apply_pending().status_code, 302)
         return Host.objects.get(name=updates.get("name", "router"))
+
+    def test_terminal_semicolon_is_stored_canonically_and_duplicates_rejected(self):
+        host = self.create_host(mac=" \t00:11:22:33:44:55 ; \n")
+        self.assertEqual(host.mac, "00:11:22:33:44:55")
+        response = self.client.post(reverse("host-create"), self.host_data(
+            name="duplicate", row=2, mac="0011.2233.4455;",
+        ))
+        self.assertTemplateUsed(response, "inventory/form.html")
+        self.assertEqual(Host.objects.count(), 1)
+        for raw in (";", "00:11:22:33:44:55;;", "00:11;22:33:44:55"):
+            with self.subTest(raw=raw):
+                response = self.client.post(reverse("host-create"), self.host_data(
+                    name="bad", row=3, mac=raw,
+                ))
+                self.assertTemplateUsed(response, "inventory/form.html")
+                self.assertEqual(Host.objects.count(), 1)
 
     def test_requires_login_and_operator_privilege(self):
         anonymous = Client()

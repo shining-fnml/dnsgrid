@@ -9,8 +9,11 @@ urlpatterns = [
     path("hosts/<int:host_id>/move/", views.host_move, name="host-move"),
     path("hosts/<int:host_id>/delete/", views.host_delete, name="host-delete"),
     path("confirm/", views.confirm, name="confirm"),
+    path("confirm/cancel/", views.cancel, name="cancel"),
     path("settings/", views.configuration, name="configuration"),
     path("exports/", views.exports, name="exports"),
+    path("archive/download/", views.archive_download, name="archive-download"),
+    path("archive/upload/", views.archive_upload, name="archive-upload"),
     path("exports/download/<str:filename>/", views.download, name="download"),
     path("gandi/preview/", views.gandi_preview, name="gandi-preview"),
 ]

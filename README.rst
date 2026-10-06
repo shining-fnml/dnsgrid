@@ -63,11 +63,19 @@ Inventory and confirmations
 * Occupied grid cells use dark ink by stable site ID: 1 blue, 2 green,
   3 red, 4 gold, independent of site names or subnet octets. Their surfaces
   stay light even in dark mode; the rest of the application retains its
-  theme. VPN names alone are bold, unconfirmed cells are light gray, and
+  theme. VPN names are bold, and the VPN address is bold only when that
+  host is also publicly exported. Unconfirmed cells are light gray, and
   decommissioned names appear as ``(name)`` only in the grid. Stored names,
   FQDNs, and exports are unchanged. The legend uses configured site names.
+  Cells show no visible status/Public export row; a nonempty MAC appears
+  as an optional final line.
+* A small grid-only script translates the original table header as one
+  unit to keep it visible during viewport vertical scrolling, preserving
+  column alignment and the grid's native horizontal scrolling.
 * Names are unique DNS labels. MACs accept colon, hyphen, dotted, or
   compact hexadecimal formats and normalize to lowercase colon form.
+  A single terminal semicolon is accepted, with surrounding whitespace,
+  for pasted DHCP-style values; it is removed before validation.
   Invalid, multicast, zero, or duplicate nonempty MACs are rejected.
 * Column headings describe networking, peripherals, bare-metal and
   virtual servers, console/TV desktops, laptops, and phones. Hardware
@@ -182,6 +190,91 @@ cannot eliminate a concurrent external-edit race. Do not edit dnsgrid-owned
 records concurrently from other tools. The app never replaces a whole
 Gandi zone. Real sync requires configured credentials and connectivity;
 tests use a fake provider and never contact Gandi.
+
+Application-data portability
+----------------------------
+
+Export previews offers ``dnsgrid-archive-v1.json``. Settings includes an
+explicit application-archive file upload section and preview button; a
+standalone upload/restore form is also linked from Export previews.
+Only authenticated staff can use them. Downloads are read-only,
+noncacheable, and bound to the preview revision. Upload previews make no
+inventory writes; the existing nonce-based POST confirmation is required
+to apply a replacement, with separate acknowledgments for target conflicts
+and trusted same-scope Gandi ownership.
+
+The deterministic UTF-8 JSON schema has exactly these top-level keys:
+
+* ``format``: exact string ``"dnsgrid.application-data"``.
+* ``schema_version``: integer ``1``.
+* ``configuration``: ``id`` (always 1), ``lan_domain``, ``vpn_domain``,
+  ``lan_prefix``, ``vpn_prefix``, ``gandi_zone``, ``ttl``, ``soa_ns``,
+  ``soa_mailbox``, and ``revision``.
+* ``sites``: exactly four objects with ``id`` (1–4), ``name``, and ``g``.
+* ``hosts``: objects with ``id``, ``name``, ``site_id``, ``row``, ``column``,
+  ``category``, ``status``, ``vpn``, ``public_export``, ``mac``, and ``notes``.
+  Every status is included, with IDs and positions preserved.
+* ``gandi_records``: ownership objects with ``id``, ``zone``, ``name``,
+  ``record_type`` (``A``), ``values``, and ``ttl``.
+
+Lists are ordered by IDs; ownership values and JSON keys are sorted.
+Unknown/missing fields, duplicate JSON keys, wrong types (including booleans
+for integers), invalid references, duplicates, and violated model invariants
+are rejected. Uploads and pending archive data are bounded to 8 MiB, 127
+hosts, 1,024 ownership records, and 1–16 IPv4 values per owned record.
+The byte bound accommodates the complete grid with maximum-length Unicode
+notes and categories, including supplementary characters serialized as
+JSON escape pairs.
+Host and ownership IDs must be integers from 1 through ``2**53 - 1``
+(9,007,199,254,740,991). This JSON-safe range leaves ample signed-64-bit
+headroom for SQLite's automatic allocations; sequence-exhausting IDs are
+rejected rather than reset or reassigned.
+If an imported ID reaches this portable bound, subsequent new hosts and
+ownership records receive the lowest unused portable ID under the existing
+configuration lock. This remains true after deleting the high-ID record:
+existing IDs and SQLite sequences are never reset, and allocation adds no
+revision increment of its own.
+Incoming settings and hosts are validated together, independent of the
+outgoing inventory. Each ownership record must belong to the incoming
+configured zone and a direct host label beneath its VPN domain.
+Historical owned IPv4 values need not match current desired addresses:
+they are retained so future sync can safely delete obsolete records.
+
+Confirmation replaces settings, fixed-site mappings, hosts, and the ledger
+atomically with foreign-key-safe ordering. It preserves destination users
+and the saved token. The resulting revision is
+``max(destination revision, archive revision) + 1``; serial overflow,
+stale inventory, or changed target ownership rejects the replacement.
+Neither preview nor restore calls Gandi. Subsequent provider previews
+still refuse unmanaged collisions and remotely modified owned records.
+There is no automatic DNS/DHCP/Gandi deployment.
+
+Migration checklist:
+
+1. Stop source inventory changes and Gandi synchronization. Never operate
+   source and destination as simultaneous writers for the same scope.
+2. Make an offline, consistent database backup of both installations
+   before replacement (stop processes, including workers; preserve SQLite
+   journal/WAL state correctly or use SQLite's backup facilities).
+3. Download the source application archive. Treat host notes and ownership
+   history as sensitive operational data; transfer it securely.
+4. Install/migrate the destination and run ``python manage.py createsuperuser``.
+   Provision deployment secrets and Gandi credentials separately.
+5. Upload and inspect the settings/site/host/ledger diff and serial. Accept
+   replacement of target conflicts only deliberately. Import ownership
+   only from a trusted archive for the **SAME Gandi domain and control
+   scope**: it grants authority to update/delete matching remote records.
+   Migrate only within that same managed domain/control scope, retaining
+   the source and its offline backup. For a new scope, establish a separate,
+   independently reviewed inventory; do not discard ownership history.
+6. Confirm, verify inventory and generated artifacts, then fetch a fresh
+   provider preview. Resolve conflicts with a DNS administrator rather
+   than bypassing ownership safety. Leave the old writer stopped.
+
+This is **not a byte-for-byte database backup**. Authentication users,
+passwords, sessions, pending confirmations, tokens, environment/deployment secrets, and unrelated
+database state are excluded. Keep an offline database backup for recovery;
+restore archives only through the reviewed application workflow.
 
 Development checks
 ------------------
