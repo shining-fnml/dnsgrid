@@ -13,7 +13,7 @@ from django.views.decorators.cache import never_cache
 from django.views.decorators.http import require_POST
 
 from .exporters import build_exports
-from .forms import ConfigurationForm, HostForm, HostMoveForm
+from .forms import ArchiveUploadForm, ConfigurationForm, HostForm, HostMoveForm
 from .models import Configuration, Host, Site
 from .services import (
     delete_host, move_host, plan_placement, preview_host_move, save_host, update_settings,
@@ -47,13 +47,13 @@ def _errors(error):
     return "The operation could not complete. Reload and retry; no inventory changes were saved."
 
 
-def _pending(request, kind, payload, revision, changes, title):
+def _pending(request, kind, payload, revision, changes, title, **context):
     nonce = uuid.uuid4().hex
     request.session["pending"] = {
         "nonce": nonce, "kind": kind, "payload": payload, "revision": revision,
     }
     return render(request, "inventory/confirm.html", {
-        "nonce": nonce, "title": title, "changes": changes,
+        "nonce": nonce, "title": title, "changes": changes, **context,
     })
 
 
@@ -190,6 +190,7 @@ def host_delete(request, host_id):
 
 @operator
 def configuration(request):
+    from .archives import WARNINGS
     config = Configuration.load()
     sites = list(Site.objects.order_by("id"))
     initial = {key: getattr(config, key) for key in CONFIG_FIELDS}
@@ -242,6 +243,8 @@ def configuration(request):
     return render(request, "inventory/form.html", {
         "form": form, "title": "Global settings", "settings_page": True,
         "token_saved": bool(config.gandi_token),
+        "archive_form": ArchiveUploadForm(initial={"revision": config.revision}, auto_id="archive_%s"),
+        "archive_warnings": WARNINGS,
     })
 
 
@@ -250,6 +253,8 @@ def configuration(request):
 def confirm(request):
     pending = request.session.get("pending")
     if not pending or request.POST.get("nonce") != pending["nonce"]:
+        if pending and pending["kind"] == "archive":
+            request.session.pop("pending", None)
         messages.error(request, "This confirmation expired. Generate a new preview.")
         return redirect("grid")
     try:
@@ -266,6 +271,12 @@ def confirm(request):
         elif pending["kind"] == "gandi":
             from .gandi import sync
             sync(expected_fingerprint=payload["fingerprint"])
+        elif pending["kind"] == "archive":
+            from .archives import restore
+            if request.POST.get("replace_ack") != "yes" or request.POST.get("ledger_ack") != "yes":
+                raise ValidationError("Replacement and trusted same-scope ownership acknowledgments are required.")
+            restore(payload["data"], expected_revision=revision,
+                    expected_fingerprint=payload["target_fingerprint"])
         else:
             raise ValidationError("Unknown confirmation.")
     except (ValidationError, IntegrityError, OperationalError) as error:
@@ -276,6 +287,61 @@ def confirm(request):
         messages.success(request, "Changes applied.")
     request.session.pop("pending", None)
     return redirect("exports" if pending["kind"] == "gandi" else "grid")
+
+
+@operator
+@require_POST
+def cancel(request):
+    request.session.pop("pending", None)
+    messages.info(request, "Preview canceled. No changes applied.")
+    return redirect("grid")
+
+
+@operator
+def archive_download(request):
+    from .archives import dumps, snapshot
+    revision = request.GET.get("revision", "")
+    if not revision.isascii() or not revision.isdecimal() or len(revision) > 10:
+        return HttpResponse("Provide the export preview revision.", status=400)
+    try:
+        data = snapshot(expected_revision=int(revision))
+    except ValidationError:
+        return HttpResponse("Inventory changed. Reload export previews before downloading.", status=409)
+    response = HttpResponse(dumps(data), content_type="application/json; charset=utf-8")
+    response["Content-Disposition"] = 'attachment; filename="dnsgrid-archive-v1.json"'
+    return response
+
+
+@operator
+def archive_upload(request):
+    from .archives import MAX_BYTES, MAX_SERIAL, WARNINGS, diff, fingerprint, loads, snapshot
+    current = snapshot()
+    revision = current["configuration"]["revision"]
+    form = ArchiveUploadForm(request.POST or None, request.FILES or None, initial={"revision": revision})
+    if request.method == "POST":
+        request.session.pop("pending", None)
+        if form.is_valid():
+            try:
+                if form.cleaned_data["revision"] != revision:
+                    raise ValidationError("Inventory changed. Reload before previewing the archive.")
+                upload = form.cleaned_data["archive"]
+                if upload.size > MAX_BYTES:
+                    raise ValidationError("Archive exceeds the 8 MiB upload limit.")
+                candidate = loads(upload.read(MAX_BYTES + 1))
+                next_revision = max(revision, candidate["configuration"]["revision"]) + 1
+                if next_revision > MAX_SERIAL:
+                    raise ValidationError("Restoring would exceed the maximum SOA serial.")
+                changes = diff(current, candidate)
+                changes.append({"label": "Resulting SOA serial", "before": revision, "after": next_revision})
+                payload = {"data": candidate, "target_fingerprint": fingerprint(current)}
+                return _pending(request, "archive", payload, revision, changes,
+                                "Confirm application-data replacement", archive=True, warnings=WARNINGS)
+            except ValidationError as error:
+                form.add_error(None, _errors(error))
+    return render(request, "inventory/form.html", {
+        "form": form, "title": "Restore application archive", "archive_page": True,
+        "warnings": WARNINGS,
+    })
 
 
 @operator

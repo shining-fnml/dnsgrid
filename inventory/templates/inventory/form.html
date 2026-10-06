@@ -1,12 +1,28 @@
 {% extends 'inventory/base.html' %}
 {% block content %}
 <h1>{{ title }}</h1>
-{% if settings_page %}
+{% if archive_page %}
+<p>Preview validates the incoming dataset without changing inventory. Confirmation replaces the target atomically, preserves destination users and secrets, and advances the SOA serial.</p>
+{% for warning in warnings %}<p class="warning">{{ warning }}</p>{% endfor %}
+{% elif settings_page %}
 <p>These settings affect every export. Site mappings must remain distinct. Saved Gandi token: {% if token_saved %}yes{% else %}no{% endif %}; the token is never displayed.</p>
+<p><a href="{% url 'archive-upload' %}">Preview application archive restore</a> · <a href="{% url 'exports' %}">Download application archive from Export previews</a></p>
 {% else %}
 <p>Status is informational only. Decommissioned hosts remain in all eligible exports until manually deleted.</p>
 {% endif %}
-<form method="post" class="editor">{% csrf_token %}{{ form.as_p }}<button>Preview changes</button> <a href="{% url 'grid' %}">Cancel</a></form>
+<form method="post" enctype="multipart/form-data" class="editor">{% csrf_token %}{{ form.as_p }}<button>Preview changes</button></form>
+<form method="post" action="{% url 'cancel' %}">{% csrf_token %}<button>Cancel</button></form>
+{% if settings_page %}
+<section aria-labelledby="archive-import-heading">
+<h2 id="archive-import-heading">Import application-data archive</h2>
+<p class="warning">Destructive replacement: preview first, then explicitly confirm replacement of target application data. This portable JSON archive is not a SQLite database backup.</p>
+{% for warning in archive_warnings %}<p class="warning">{{ warning }}</p>{% endfor %}
+<form method="post" enctype="multipart/form-data" action="{% url 'archive-upload' %}" class="editor">
+{% csrf_token %}{{ archive_form.as_p }}
+<button>Preview archive replacement</button>
+</form>
+</section>
+{% endif %}
 {% if host %}
 <p>Quick moves act on the saved entry, not unsaved edits. They change x by exactly 1, including across column boundaries (15 ↔ 16), only into a free cell in 1–127. No other hosts move.</p>
 {% for move in moves %}

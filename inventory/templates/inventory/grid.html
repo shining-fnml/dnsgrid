@@ -1,4 +1,5 @@
 {% extends 'inventory/base.html' %}
+{% load static %}
 {% block content %}
 <h1>Host inventory <small>{{ count }} / 127 positions</small></h1>
 <p>One global grid · x = 16 × column + row · sites change networks, not positions.</p>
@@ -6,7 +7,7 @@
 <p class="grid-legend">
   Site ink:
   {% for site in sites %}<span class="site-{{ site.id }}">{{ site.id }} · {{ site.name }}</span>{% if not forloop.last %} / {% endif %}{% endfor %}
-  · <strong>VPN names: bold</strong> · Unconfirmed: light gray cell · Decommissioned: (name).
+  · <strong>VPN names: bold</strong> · Bold VPN address: public publication · Unconfirmed: light gray cell · Decommissioned: (name).
 </p>
 <div class="grid-scroll">
 <table class="grid">
@@ -22,12 +23,13 @@
       <td class="{% if cell.x == 0 %}reserved{% elif cell.host %}occupied {{ cell.host.status }} site-{{ cell.host.site_id }}{% else %}empty{% endif %}">
         {% if cell.x == 0 %}<span>0 · Reserved</span>
         {% elif cell.host %}
-        <a class="cell" href="{% url 'host-edit' cell.host.pk %}">
+        <a class="cell" href="{% url 'host-edit' cell.host.pk %}" aria-describedby="status-{{ cell.host.pk }}">
           <small>x={{ cell.x }} · {{ cell.host.site.name }}</small>
           <span class="host-name{% if cell.host.vpn %} vpn-name{% endif %}">{% if cell.host.status == 'decommissioned' %}({% endif %}{{ cell.host.name }}{% if cell.host.status == 'decommissioned' %}){% endif %}</span>
           <span>{{ cell.lan }}</span>
-          {% if cell.vpn %}<span>VPN {{ cell.vpn }}</span>{% endif %}
-          <small>{{ cell.host.get_status_display }}{% if cell.host.public_export %} · Public export{% endif %}</small>
+          {% if cell.vpn %}<span class="vpn-address{% if cell.host.public_export %} published-address{% endif %}">VPN {{ cell.vpn }}</span>{% endif %}
+          {% if cell.host.mac %}<small class="mac-address">{{ cell.host.mac }}</small>{% endif %}
+          <span class="visually-hidden" id="status-{{ cell.host.pk }}">{{ cell.host.get_status_display }}</span>
         </a>
         {% else %}<a class="cell" href="{% url 'host-create' %}?row={{ cell.row }}&amp;column={{ cell.column }}"><small>x={{ cell.x }}</small><span>+ Insert</span></a>{% endif %}
       </td>
@@ -37,4 +39,5 @@
   </tbody>
 </table>
 </div>
+<script src="{% static 'inventory/grid.js' %}" defer></script>
 {% endblock %}

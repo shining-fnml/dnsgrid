@@ -42,6 +42,8 @@ def normalize_mac(value):
     value = value.strip().lower()
     if not value:
         return ""
+    if value.endswith(";"):
+        value = value[:-1].strip()
     patterns = (
         r"[0-9a-f]{12}",
         r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}",
@@ -95,6 +97,9 @@ class Configuration(models.Model):
         return self.revision
 
     def clean(self):
+        self.clean_for_hosts(Host.objects.all())
+
+    def clean_for_hosts(self, hosts):
         errors = {}
         for field in ("lan_domain", "vpn_domain", "gandi_zone", "soa_ns", "soa_mailbox"):
             try:
@@ -112,7 +117,7 @@ class Configuration(models.Model):
         ):
             errors["vpn_domain"] = "The VPN domain must belong to the Gandi zone."
         longest_name = max(
-            (len(name) for name in Host.objects.values_list("name", flat=True)),
+            (len(host.name) for host in hosts),
             default=0,
         )
         if longest_name:
@@ -188,12 +193,23 @@ class Host(models.Model):
             ),
         ]
 
+    def clean_fields(self, exclude=None):
+        if not exclude or "mac" not in exclude:
+            try:
+                self.mac = normalize_mac(self.mac)
+            except ValidationError as error:
+                raise ValidationError({"mac": error.messages}) from error
+        super().clean_fields(exclude=exclude)
+
     def clean(self):
+        config = Configuration.objects.filter(pk=1).first() or Configuration()
+        self.clean_for_inventory(config, Host.objects.exclude(pk=self.pk))
+
+    def clean_for_inventory(self, config, hosts):
         errors = {}
         self.name = self.name.strip().lower() if isinstance(self.name, str) else ""
         if not DNS_LABEL.fullmatch(self.name):
             errors["name"] = "Enter a DNS label (letters, digits, and interior hyphens)."
-        config = Configuration.objects.filter(pk=1).first() or Configuration()
         if any(
             len(self.name) + 1 + len(domain) > 253
             for domain in (config.lan_domain, config.vpn_domain)
@@ -205,7 +221,7 @@ class Host(models.Model):
             errors["mac"] = error.messages
         if self.row == 0 and self.column == 0:
             errors["row"] = "Position (0, 0) is reserved."
-        if self.mac and Host.objects.filter(mac=self.mac).exclude(pk=self.pk).exists():
+        if self.mac and any(host.mac == self.mac for host in hosts):
             errors["mac"] = "This MAC address is already in use."
         if errors:
             raise ValidationError(errors)

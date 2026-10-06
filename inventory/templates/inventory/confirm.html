@@ -2,10 +2,17 @@
 {% block content %}
 <h1>{{ title }}</h1>
 <p>Review the diff before applying. If inventory or Gandi records change after this preview, the operation is rejected.</p>
+{% for warning in warnings %}<p class="warning">{{ warning }}</p>{% endfor %}
 <table class="diff"><thead><tr><th>Item</th><th>Before</th><th>After</th></tr></thead><tbody>
 {% for change in changes %}<tr><th>{{ change.label }}</th><td>{{ change.before|default_if_none:"—" }}</td><td>{{ change.after|default_if_none:"—" }}</td></tr>
 {% empty %}<tr><td colspan="3">No changes needed.</td></tr>{% endfor %}
 </tbody></table>
 <p class="warning">DNS moves require publishing forward and reverse zones together. Allow the previous TTL to expire and ensure dhcpd can resolve the LAN FQDN before renewing leases. Existing leases do not move automatically.</p>
-<form method="post" action="{% url 'confirm' %}">{% csrf_token %}<input type="hidden" name="nonce" value="{{ nonce }}"><button>Confirm and apply</button> <a href="{% url 'grid' %}">Cancel</a></form>
+<form method="post" action="{% url 'confirm' %}">{% csrf_token %}<input type="hidden" name="nonce" value="{{ nonce }}">
+{% if archive %}
+<p><label><input type="checkbox" name="replace_ack" value="yes" required> I acknowledge replacement of all conflicting target application data, not a merge.</label></p>
+<p><label><input type="checkbox" name="ledger_ack" value="yes" required> I trust this ownership ledger for the SAME Gandi domain/scope, accept its update/delete authority, and have stopped the source writer.</label></p>
+{% endif %}
+<button>Confirm and apply</button></form>
+<form method="post" action="{% url 'cancel' %}">{% csrf_token %}<button>Cancel</button></form>
 {% endblock %}

@@ -118,16 +118,22 @@ class ModelTests(InventoryTestCase):
             self.host(name="j" * 63, row=2).full_clean()
 
     def test_mac_normalization_and_uniqueness(self):
-        for raw in ("02:AB:CD:EF:01:23", "02-ab-cd-ef-01-23", "02ab.cdef.0123", "02abcdef0123"):
+        for raw in ("02:AB:CD:EF:01:23", "02-ab-cd-ef-01-23", "02ab.cdef.0123", "02abcdef0123",
+                    " 02:AB:CD:EF:01:23; ", "\t02-ab-cd-ef-01-23 ;\n",
+                    "02ab.cdef.0123;", "02abcdef0123;"):
             with self.subTest(raw=raw):
                 self.assertEqual(normalize_mac(raw), "02:ab:cd:ef:01:23")
         for raw in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff", "01:00:5e:01:02:03",
-                    "02:zz:00:00:00:00", "02-ab:cd-ef:01-23", "02abc", "02abcdef0123\nbad"):
+                    "02:zz:00:00:00:00", "02-ab:cd-ef:01-23", "02abc", "02abcdef0123\nbad",
+                    ";", " ; ", "02abcdef0123;;", "02abcdef0123; ;", "02ab; cdef0123",
+                    "00:00:00:00:00:00;", "ff:ff:ff:ff:ff:ff;", "01:00:5e:01:02:03;"):
             with self.subTest(raw=raw), self.assertRaises(ValidationError):
                 normalize_mac(raw)
-        self.insert(name="one", mac="02abcdef0123")
+        host = self.insert(name="one", mac=" 02:AB:CD:EF:01:23 ; ")
+        host.refresh_from_db()
+        self.assertEqual(host.mac, "02:ab:cd:ef:01:23")
         with self.assertRaises(ValidationError):
-            self.insert(name="two", row=2, mac="02-ab-cd-ef-01-23")
+            self.insert(name="two", row=2, mac="02-ab-cd-ef-01-23;")
         self.insert(name="empty-one", row=3)
         self.insert(name="empty-two", row=4)
         self.assertEqual(Host.objects.filter(mac="").count(), 2)

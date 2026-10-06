@@ -1,6 +1,11 @@
 from django import forms
 
-from .models import Host, Site
+from .models import MAX_SERIAL, Host, Site, normalize_mac
+
+
+class MACAddressField(forms.CharField):
+    def to_python(self, value):
+        return normalize_mac(super().to_python(value))
 
 
 class HostForm(forms.Form):
@@ -12,7 +17,7 @@ class HostForm(forms.Form):
     status = forms.ChoiceField(choices=Host.Status.choices)
     vpn = forms.BooleanField(required=False, label="VPN member")
     public_export = forms.BooleanField(required=False, label="Publish on Gandi (VPN only)")
-    mac = forms.CharField(max_length=32, required=False, label="MAC address")
+    mac = MACAddressField(max_length=32, required=False, label="MAC address")
     notes = forms.CharField(max_length=4000, required=False, widget=forms.Textarea(attrs={"rows": 3}))
     revision = forms.IntegerField(widget=forms.HiddenInput)
 
@@ -20,6 +25,11 @@ class HostForm(forms.Form):
 class HostMoveForm(forms.Form):
     direction = forms.ChoiceField(choices=(("up", "Move up"), ("down", "Move down")))
     revision = forms.IntegerField(widget=forms.HiddenInput)
+
+
+class ArchiveUploadForm(forms.Form):
+    archive = forms.FileField(label="Application archive (UTF-8 JSON, at most 8 MiB)")
+    revision = forms.IntegerField(min_value=1, max_value=MAX_SERIAL, widget=forms.HiddenInput)
 
 
 class ConfigurationForm(forms.Form):
