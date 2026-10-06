@@ -229,6 +229,11 @@ Host and ownership IDs must be integers from 1 through ``2**53 - 1``
 (9,007,199,254,740,991). This JSON-safe range leaves ample signed-64-bit
 headroom for SQLite's automatic allocations; sequence-exhausting IDs are
 rejected rather than reset or reassigned.
+If an imported ID reaches this portable bound, subsequent new hosts and
+ownership records receive the lowest unused portable ID under the existing
+configuration lock. This remains true after deleting the high-ID record:
+existing IDs and SQLite sequences are never reset, and allocation adds no
+revision increment of its own.
 Incoming settings and hosts are validated together, independent of the
 outgoing inventory. Each ownership record must belong to the incoming
 configured zone and a direct host label beneath its VPN domain.

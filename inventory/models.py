@@ -2,12 +2,56 @@ import re
 
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxLengthValidator, MaxValueValidator, MinValueValidator
-from django.db import models
-from django.db.models import Q
+from django.db import connections, models, router, transaction
+from django.db.models import F, Q
 
 
 MAX_SERIAL = 2**32 - 1
+MAX_PORTABLE_ID = 2**53 - 1
 DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+
+
+def _save_portable_identity(instance, save, *args, **kwargs):
+    using = kwargs.get("using") or (args[2] if len(args) > 2 else None)
+    using = using or router.db_for_write(type(instance), instance=instance)
+    connection = connections[using]
+    if instance.pk is not None or connection.vendor != "sqlite":
+        return save(*args, **kwargs)
+    # Keep the sequence read and normal insertion in the same SQLite snapshot:
+    # a competing boundary insertion fails safely instead of overflowing it.
+    with transaction.atomic(using=using):
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT seq FROM sqlite_sequence WHERE name = %s", [instance._meta.db_table])
+            sequence = cursor.fetchone()
+        if sequence is None or sequence[0] < MAX_PORTABLE_ID:
+            return save(*args, **kwargs)
+        force_update = kwargs.get("force_update", args[1] if len(args) > 1 else False)
+        update_fields = kwargs.get("update_fields", args[3] if len(args) > 3 else None)
+        if force_update or update_fields is not None:
+            return save(*args, **kwargs)
+        # An imported high ID permanently raises AUTOINCREMENT, even if deleted.
+        # Serialize gap allocation with the existing singleton, without bumping
+        # its revision or modifying either existing IDs or sqlite_sequence.
+        if not Configuration.objects.using(using).filter(pk=1).update(revision=F("revision")):
+            raise ValidationError("A configuration is required to allocate a portable identity.")
+        candidate = 1
+        for pk in type(instance).objects.using(using).order_by("pk").values_list("pk", flat=True):
+            if pk == candidate:
+                candidate += 1
+            elif pk > candidate:
+                break
+        if candidate > MAX_PORTABLE_ID:
+            raise ValidationError("No portable identities remain available.")
+        instance.pk = candidate
+        if args:
+            args = (True, *args[1:])
+        else:
+            kwargs["force_insert"] = True
+        try:
+            return save(*args, **kwargs)
+        except Exception:
+            instance.pk = None
+            raise
 
 
 def normalize_domain(value):
@@ -201,6 +245,9 @@ class Host(models.Model):
                 raise ValidationError({"mac": error.messages}) from error
         super().clean_fields(exclude=exclude)
 
+    def save(self, *args, **kwargs):
+        return _save_portable_identity(self, super().save, *args, **kwargs)
+
     def clean(self):
         config = Configuration.objects.filter(pk=1).first() or Configuration()
         self.clean_for_inventory(config, Host.objects.exclude(pk=self.pk))
@@ -280,6 +327,9 @@ class GandiRecord(models.Model):
             not isinstance(value, str) for value in self.values
         ):
             raise ValidationError({"values": "Record values must be a list of strings."})
+
+    def save(self, *args, **kwargs):
+        return _save_portable_identity(self, super().save, *args, **kwargs)
 
     def __str__(self):
         return f"{self.name}.{self.zone} {self.record_type}"

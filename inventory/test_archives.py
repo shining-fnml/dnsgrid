@@ -196,8 +196,59 @@ class ArchiveDataTests(TestCase):
         following_record = GandiRecord.objects.create(
             zone="example.tld", name="following.vpn", values=["172.28.1.39"],
         )
-        self.assertEqual(following_host.pk, MAX_ID + 1)
-        self.assertEqual(following_record.pk, MAX_ID + 1)
+        self.assertEqual(following_host.pk, 1)
+        self.assertEqual(following_record.pk, 1)
+        self.assertEqual(Configuration.load().revision, 2)
+        roundtrip = loads(dumps(snapshot()).encode())
+        restore(roundtrip, expected_revision=2)
+        restored = snapshot()
+        restored["configuration"]["revision"] = roundtrip["configuration"]["revision"]
+        self.assertEqual(restored, roundtrip)
+
+    def test_deleting_high_restored_rows_does_not_break_later_portable_allocation(self):
+        candidate = copy.deepcopy(self.data)
+        candidate["hosts"][0]["id"] = MAX_ID
+        candidate["gandi_records"][0]["id"] = MAX_ID
+        restore(candidate, expected_revision=1)
+        Host.objects.filter(pk=MAX_ID).delete()
+        GandiRecord.objects.filter(pk=MAX_ID).delete()
+        following_host = Host.objects.create(name="later", site_id=1, row=7, column=2)
+        following_record = GandiRecord.objects.create(
+            zone="example.tld", name="later.vpn", values=["172.28.1.39"],
+        )
+        self.assertEqual(following_host.pk, 1)
+        self.assertEqual(following_record.pk, 1)
+        self.assertEqual(Configuration.load().revision, 2)
+        portable = snapshot()
+        self.assertEqual(loads(dumps(portable).encode()), portable)
+
+    def test_portable_gap_allocation_skips_existing_low_ids_and_updates_normally(self):
+        candidate = copy.deepcopy(self.data)
+        candidate["hosts"][0]["id"] = MAX_ID
+        candidate["hosts"][1]["id"] = 1
+        candidate["gandi_records"][0]["id"] = MAX_ID
+        restore(candidate, expected_revision=1)
+        GandiRecord.objects.create(id=1, zone="example.tld", name="occupied.vpn", values=["172.28.1.10"])
+        host = Host.objects.create(name="later", site_id=1, row=7, column=2)
+        record = GandiRecord.objects.create(zone="example.tld", name="later.vpn", values=["172.28.1.39"])
+        self.assertEqual(host.pk, 2)
+        self.assertEqual(record.pk, 2)
+        host.notes = "updated without reallocation"
+        host.save(update_fields=["notes"])
+        record.ttl = 600
+        record.save(update_fields=["ttl"])
+        self.assertEqual(Host.objects.get(pk=2).notes, host.notes)
+        self.assertEqual(GandiRecord.objects.get(pk=2).ttl, 600)
+        self.assertEqual(Configuration.load().revision, 2)
+
+    def test_normal_sqlite_autoallocation_retains_monotonic_ids(self):
+        original_host_max = Host.objects.order_by("-pk").first().pk
+        original_ledger_max = GandiRecord.objects.order_by("-pk").first().pk
+        host = Host.objects.create(name="next-host", site_id=1, row=7, column=2)
+        record = GandiRecord.objects.create(zone="example.tld", name="next.vpn", values=["172.28.1.39"])
+        self.assertEqual(host.pk, original_host_max + 1)
+        self.assertEqual(record.pk, original_ledger_max + 1)
+        self.assertEqual(Configuration.load().revision, 1)
 
     def test_fixed_sites_and_distinct_mappings(self):
         cases = [

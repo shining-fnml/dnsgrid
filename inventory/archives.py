@@ -7,14 +7,14 @@ import json
 from django.core.exceptions import ValidationError
 from django.db import transaction
 
-from .models import MAX_SERIAL, Configuration, GandiRecord, Host, Site
+from .models import MAX_PORTABLE_ID, MAX_SERIAL, Configuration, GandiRecord, Host, Site
 from .services import _claim_revision
 
 FORMAT = "dnsgrid.application-data"
 SCHEMA_VERSION = 1
 MAX_BYTES = 8 * 1024 * 1024
 MAX_LEDGER = 1024
-MAX_ID = 2**53 - 1
+MAX_ID = MAX_PORTABLE_ID
 CONFIG_FIELDS = (
     "id", "lan_domain", "vpn_domain", "lan_prefix", "vpn_prefix", "gandi_zone",
     "ttl", "soa_ns", "soa_mailbox", "revision",
