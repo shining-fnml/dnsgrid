@@ -8,6 +8,14 @@
 {% endif %}
 <form method="post" class="editor">{% csrf_token %}{{ form.as_p }}<button>Preview changes</button> <a href="{% url 'grid' %}">Cancel</a></form>
 {% if host %}
+<p>Quick moves act on the saved entry, not unsaved edits. They change x by exactly 1, including across column boundaries (15 ↔ 16), only into a free cell in 1–127. No other hosts move.</p>
+{% for move in moves %}
+<form method="post" action="{% url 'host-move' host.pk %}">{% csrf_token %}
+<input type="hidden" name="revision" value="{{ revision }}">
+<input type="hidden" name="direction" value="{{ move.direction }}">
+<button>{{ move.label }} (x={{ move.target }}) — preview</button>
+</form>
+{% endfor %}
 <p><a href="{% url 'host-create' %}?row={{ host.row }}&amp;column={{ host.column }}">Insert a new host here (shift this column)</a></p>
 <form method="post" action="{% url 'host-delete' host.pk %}">{% csrf_token %}<button class="danger">Preview deletion</button></form>
 {% endif %}

@@ -49,6 +49,12 @@ Inventory and confirmations
   that column. A full tail is rejected atomically, without wraparound.
 * Changing a host's site alone retains its position. Changing its row
   or column uses the same insertion rules. Deleting leaves a hole.
+* The existing host editor offers "Move up" / "Move down" only when
+  the adjacent x is free and within 1–127. These shortcuts act on the
+  saved entry, ignoring unsaved edits, and change x by exactly -1 / +1,
+  including across column boundaries (16 → 15 and 15 → 16). They preview
+  old/new x and LAN/VPN addresses before confirmation, preserve all other
+  host metadata, and never shift, swap, compact, or skip occupied cells.
 * Preview and confirm host changes, deletions, and global settings.
   Diffs show affected addresses and metadata. Inventory revisions
   reject stale forms and stale confirmations; refresh and preview again.
@@ -58,7 +64,7 @@ Inventory and confirmations
   3 red, 4 gold, independent of site names or subnet octets. Their surfaces
   stay light even in dark mode; the rest of the application retains its
   theme. VPN names alone are bold, unconfirmed cells are light gray, and
-  decommissioned names appear as ``[name]`` only in the grid. Stored names,
+  decommissioned names appear as ``(name)`` only in the grid. Stored names,
   FQDNs, and exports are unchanged. The legend uses configured site names.
 * Names are unique DNS labels. MACs accept colon, hyphen, dotted, or
   compact hexadecimal formats and normalize to lowercase colon form.

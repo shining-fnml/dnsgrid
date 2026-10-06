@@ -32,7 +32,7 @@ class GridRenderingTests(TestCase):
         response = self.client.get(reverse("grid"))
         for host in hosts:
             with self.subTest(site=host.site_id, status=host.status, vpn=host.vpn):
-                name = f"[{host.name}]" if host.status == Host.Status.DECOMMISSIONED else host.name
+                name = f"({host.name})" if host.status == Host.Status.DECOMMISSIONED else host.name
                 name_class = "host-name vpn-name" if host.vpn else "host-name"
                 vpn_line = f"<span>VPN {host.vpn_address(self.config)}</span>" if host.vpn else ""
                 public_label = " · Public export" if host.public_export else ""
@@ -69,7 +69,7 @@ class GridRenderingTests(TestCase):
                 self.assertContains(response, f'<span class="site-{site.pk}">{site.pk} · Renamed &amp; site {site.pk}</span>', html=True)
                 self.assertContains(response, f"x={site.pk} · Renamed &amp; site {site.pk}")
                 self.assertContains(response, f"192.168.{site.g}.{site.pk}")
-        for text in ("VPN names: bold", "Unconfirmed: light gray cell", "Decommissioned: [name]"):
+        for text in ("VPN names: bold", "Unconfirmed: light gray cell", "Decommissioned: (name)"):
             self.assertContains(response, text)
 
     def test_empty_grid_legend_includes_all_configured_sites(self):
@@ -313,3 +313,150 @@ class OperatorViewsTests(TestCase):
         response = self.client.post(reverse("gandi-preview"), follow=True)
         self.assertContains(response, "Could not preview Gandi")
         self.assertNotContains(response, "provider-detail-sentinel")
+
+
+class QuickMoveViewsTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(username="operator", is_staff=True)
+        self.client.force_login(self.user)
+        Configuration.load()
+        self.host = Host(name="saved", site_id=3, row=2, column=0, vpn=True,
+                         public_export=True, category="Keep", status=Host.Status.DECOMMISSIONED,
+                         mac="02:00:00:00:00:01", notes="Saved notes")
+        save_host(self.host, Configuration.load().revision)
+        self.url = reverse("host-move", args=[self.host.pk])
+
+    def snapshot(self):
+        return Configuration.load().revision, list(Host.objects.values())
+
+    def preview(self, direction="down", **updates):
+        data = {"direction": direction, "revision": Configuration.load().revision}
+        data.update(updates)
+        return self.client.post(self.url, data)
+
+    def confirm(self, **updates):
+        data = {"nonce": self.client.session["pending"]["nonce"]}
+        data.update(updates)
+        return self.client.post(reverse("confirm"), data, follow=True)
+
+    def test_controls_show_only_free_valid_neighbors_and_never_on_other_pages(self):
+        for x, visible in ((1, ("down",)), (2, ("up", "down")), (15, ("up", "down")),
+                           (16, ("up", "down")), (127, ("up",))):
+            with self.subTest(x=x):
+                Host.objects.filter(pk=self.host.pk).update(row=x % 16, column=x // 16)
+                before = self.snapshot()
+                response = self.client.get(reverse("host-edit", args=[self.host.pk]))
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual([move["direction"] for move in response.context["moves"]], list(visible))
+                for direction in ("up", "down"):
+                    if direction in visible:
+                        target = x + (-1 if direction == "up" else 1)
+                        self.assertContains(response, f'Move {direction} (x={target})')
+                        self.assertContains(response, f'name="direction" value="{direction}"')
+                    else:
+                        self.assertNotContains(response, f'name="direction" value="{direction}"')
+                self.assertContains(response, f'name="revision" value="{Configuration.load().revision}"')
+        Host.objects.filter(pk=self.host.pk).update(row=2, column=0)
+        for row in (1, 3):
+            save_host(Host(name=f"block-{row}", site_id=1, row=row, column=0),
+                      Configuration.load().revision)
+        response = self.client.get(reverse("host-edit", args=[self.host.pk]))
+        self.assertEqual(response.context["moves"], [])
+        self.assertNotContains(response, f'action="{self.url}"')
+        for page in ("host-create", "configuration"):
+            response = self.client.get(reverse(page))
+            self.assertNotContains(response, 'name="direction"')
+            self.assertNotContains(response, "Quick moves")
+
+    def test_preview_and_confirm_use_saved_values_ignore_forged_fields_and_apply_once(self):
+        before = self.snapshot()
+        response = self.preview(target=100, row=4, column=6, name="forged", site=1)
+        self.assertTemplateUsed(response, "inventory/confirm.html")
+        self.assertEqual(self.snapshot(), before)
+        for value in ("x=2", "x=3", "192.168.3.2", "192.168.3.3", "172.28.3.2", "172.28.3.3"):
+            self.assertContains(response, value)
+        pending = self.client.session["pending"]
+        self.assertEqual(pending["kind"], "move")
+        self.assertEqual(pending["payload"], {"id": self.host.pk, "direction": "down"})
+        response = self.confirm(target=127, direction="up", name="forged", site=1)
+        self.assertContains(response, "Changes applied.")
+        expected = before[1][0].copy()
+        expected.update(row=3)
+        self.assertEqual(self.snapshot(), (before[0] + 1, [expected]))
+        self.assertNotIn("pending", self.client.session)
+        response = self.client.post(reverse("confirm"), {"nonce": pending["nonce"]}, follow=True)
+        self.assertContains(response, "confirmation expired")
+        self.assertEqual(self.snapshot(), (before[0] + 1, [expected]))
+
+    def test_invalid_or_stale_preview_and_occupied_target_do_not_mutate(self):
+        for data in ({"direction": "sideways"}, {"direction": "1"}, {"direction": ""},
+                     {"revision": ""}, {"revision": "invalid"}, {"revision": 0}, {"revision": 1}):
+            with self.subTest(data=data):
+                before = self.snapshot()
+                response = self.preview(**data)
+                self.assertEqual(response.status_code, 302)
+                self.assertNotIn("pending", self.client.session)
+                self.assertEqual(self.snapshot(), before)
+        displayed_revision = Configuration.load().revision
+        save_host(Host(name="blocking", site_id=1, row=3, column=0), displayed_revision)
+        for revision in (displayed_revision, Configuration.load().revision):
+            before = self.snapshot()
+            self.preview(revision=revision)
+            self.assertEqual(self.snapshot(), before)
+            self.assertNotIn("pending", self.client.session)
+
+    def test_target_taken_after_preview_rejects_stale_confirmation_without_shifting(self):
+        self.preview()
+        save_host(Host(name="blocking", site_id=1, row=3, column=0),
+                  Configuration.load().revision)
+        before = self.snapshot()
+        response = self.confirm()
+        self.assertContains(response, "Stale")
+        self.assertEqual(self.snapshot(), before)
+        self.assertNotIn("pending", self.client.session)
+
+    def test_occupancy_is_rechecked_even_if_target_added_without_revision_change(self):
+        self.preview()
+        Host.objects.create(name="blocking", site_id=1, row=3, column=0)
+        before = self.snapshot()
+        response = self.confirm()
+        self.assertContains(response, "occupied")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_wrong_nonce_does_not_consume_valid_move_preview(self):
+        self.preview()
+        before = self.snapshot()
+        nonce = self.client.session["pending"]["nonce"]
+        response = self.confirm(nonce="incorrect")
+        self.assertContains(response, "confirmation expired")
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.client.session["pending"]["nonce"], nonce)
+        self.confirm()
+        self.assertEqual(Configuration.load().revision, before[0] + 1)
+
+    def test_post_only_csrf_and_operator_authorization_for_both_stages(self):
+        before = self.snapshot()
+        self.assertEqual(self.client.get(self.url).status_code, 405)
+        self.assertEqual(self.client.get(reverse("confirm")).status_code, 405)
+        csrf_client = Client(enforce_csrf_checks=True)
+        csrf_client.force_login(self.user)
+        self.assertEqual(csrf_client.post(self.url, {
+            "direction": "down", "revision": before[0],
+        }).status_code, 403)
+        response = csrf_client.get(reverse("host-edit", args=[self.host.pk]))
+        self.assertContains(response, 'name="csrfmiddlewaretoken"')
+        token = csrf_client.cookies["csrftoken"].value
+        response = csrf_client.post(self.url, {
+            "direction": "down", "revision": before[0], "csrfmiddlewaretoken": token,
+        })
+        self.assertTemplateUsed(response, "inventory/confirm.html")
+        nonce = csrf_client.session["pending"]["nonce"]
+        self.assertEqual(csrf_client.post(reverse("confirm"), {"nonce": nonce}).status_code, 403)
+        self.assertEqual(self.snapshot(), before)
+        for url in (self.url, reverse("confirm")):
+            self.assertEqual(Client().post(url).status_code, 302)
+        self.user.is_staff = False
+        self.user.save()
+        for url in (self.url, reverse("confirm")):
+            self.assertEqual(self.client.post(url).status_code, 403)
+        self.assertEqual(self.snapshot(), before)

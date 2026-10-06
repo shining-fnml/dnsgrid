@@ -50,7 +50,7 @@ class ExportTests(TestCase):
             self.assertNotIn(status, "".join(output.values()))
             self.assertEqual(output, original)
             self.assertEqual(self.host.name, "alpha")
-            self.assertNotIn("[alpha]", "".join(output.values()))
+            self.assertNotIn("(alpha)", "".join(output.values()))
 
     def test_vpn_public_flags_and_optional_mac(self):
         for vpn in (False, True):

@@ -6,6 +6,7 @@ urlpatterns = [
     path("", views.grid, name="grid"),
     path("hosts/new/", views.host_edit, name="host-create"),
     path("hosts/<int:host_id>/", views.host_edit, name="host-edit"),
+    path("hosts/<int:host_id>/move/", views.host_move, name="host-move"),
     path("hosts/<int:host_id>/delete/", views.host_delete, name="host-delete"),
     path("confirm/", views.confirm, name="confirm"),
     path("settings/", views.configuration, name="configuration"),
