@@ -119,6 +119,27 @@ class OperatorViewsTests(TestCase):
         other.refresh_from_db()
         self.assertEqual(other.row, 2)
 
+    def test_concurrent_move_during_deletion_preview_blocks_confirmation(self):
+        from .views import get_object_or_404
+        host = self.create_host()
+
+        def move_after_read(*args, **kwargs):
+            snapshot = get_object_or_404(*args, **kwargs)
+            moved = Host.objects.get(pk=snapshot.pk)
+            moved.site_id = 2
+            save_host(moved, expected_revision=Configuration.load().revision)
+            return snapshot
+
+        with patch("inventory.views.get_object_or_404", side_effect=move_after_read):
+            response = self.client.post(reverse("host-delete", args=[host.pk]))
+        self.assertContains(response, "192.168.1.1")
+        response = self.client.post(reverse("confirm"), {
+            "nonce": self.client.session["pending"]["nonce"],
+        }, follow=True)
+        self.assertContains(response, "Stale")
+        host.refresh_from_db()
+        self.assertEqual(host.site_id, 2)
+
     def settings_data(self, **updates):
         config = Configuration.load()
         data = {

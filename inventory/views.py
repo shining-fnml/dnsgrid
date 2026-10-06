@@ -147,8 +147,8 @@ def host_edit(request, host_id=None):
 @operator
 @require_POST
 def host_delete(request, host_id):
-    host = get_object_or_404(Host, pk=host_id)
     config = Configuration.load()
+    host = get_object_or_404(Host, pk=host_id)
     return _pending(request, "delete", {"id": host.pk}, config.revision, [{
         "label": host.name, "before": host.lan_address(config),
         "after": "Removed from inventory and exports; other cells are not compacted.",
