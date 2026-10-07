@@ -137,3 +137,7 @@ SECURE_REFERRER_POLICY = 'same-origin'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Read-only VPN alignment report sources on the VPN center (never written).
+DNSGRID_VPN_HOSTS_FILE = os.environ.get("DNSGRID_VPN_HOSTS_FILE", "/etc/hosts")
+DNSGRID_VPN_CCD_DIR = os.environ.get("DNSGRID_VPN_CCD_DIR", "/etc/openvpn/ccd")

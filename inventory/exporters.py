@@ -111,7 +111,7 @@ def build_exports(config=None, hosts=None):
         "# DNSGrid application-owned export; do not replace unrelated configuration.",
     ]
     vpn.extend(
-        f"{host.vpn_address(config)} {host.vpn_fqdn(config)} {host.name}"
+        f"{host.vpn_address(config)} {host.vpn_short_name}"
         for host in hosts if host.vpn
     )
     result["vpn.hosts"] = "\n".join(vpn) + "\n"

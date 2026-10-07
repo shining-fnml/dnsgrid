@@ -32,7 +32,9 @@ class ExportTests(TestCase):
             output["dhcpd-dsm.conf"],
         )
         self.assertIn("/etc/dhcpd/dhcpd.conf", output["dhcpd-dsm.conf"])
-        self.assertIn("172.28.1.50 alpha.vpn.example.tld alpha", output["vpn.hosts"])
+        vpn_lines = output["vpn.hosts"].splitlines()
+        self.assertEqual(vpn_lines[1:], ["172.28.1.50 alpha.vpn"])
+        self.assertNotIn("vpn.example.tld", output["vpn.hosts"])
         for group in range(1, 5):
             self.assertIn(f"subnet 192.168.{group}.0 netmask 255.255.255.0", output["dhcpd.conf"])
             self.assertIn(f"reverse-{group}.zone", output)
@@ -67,7 +69,7 @@ class ExportTests(TestCase):
                 self.host.vpn, self.host.public_export = vpn, public
                 self.host.mac = ""
                 output = build_exports(self.config, [self.host])
-                self.assertEqual("alpha.vpn.example.tld" in output["vpn.hosts"], vpn)
+                self.assertEqual("172.28.1.50 alpha.vpn\n" in output["vpn.hosts"], vpn)
                 self.assertEqual(len(desired_gandi(self.config, [self.host])), int(vpn and public))
                 self.assertNotIn("host alpha", output["dhcpd.conf"])
                 self.assertNotIn("dhcp-host=02:00:00:00:00:01", output["dhcpd-dsm.conf"])
@@ -91,7 +93,8 @@ class ExportTests(TestCase):
         self.assertIn("$ORIGIN 4.24.10.in-addr.arpa.", output["reverse-4.zone"])
         self.assertIn("50 IN PTR alpha.lan.other.test.", output["reverse-4.zone"])
         self.assertNotIn("50 IN PTR", output["reverse-1.zone"])
-        self.assertIn("10.29.4.50 alpha.vpn.other.test alpha", output["vpn.hosts"])
+        self.assertIn("10.29.4.50 alpha.vpn\n", output["vpn.hosts"])
+        self.assertNotIn("vpn.other.test", output["vpn.hosts"])
         self.assertIn(
             "dhcp-host=02:00:00:00:00:01,alpha,10.24.4.50,86400",
             output["dhcpd-dsm.conf"],

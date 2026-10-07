@@ -15,5 +15,6 @@ urlpatterns = [
     path("archive/download/", views.archive_download, name="archive-download"),
     path("archive/upload/", views.archive_upload, name="archive-upload"),
     path("exports/download/<str:filename>/", views.download, name="download"),
+    path("vpn/report/", views.vpn_report, name="vpn-report"),
     path("gandi/preview/", views.gandi_preview, name="gandi-preview"),
 ]
