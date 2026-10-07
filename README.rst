@@ -137,7 +137,8 @@ the preview if inventory changes instead of mixing different revisions.
     site's LAN addresses, and hostnames are dnsgrid's short host names.
     Only MAC-bearing hosts in that site are included, in grid address
     order. Invalid nonempty MACs abort export rather than silently omitting
-    reservations.
+    reservations. The JSON export alone does not apply changes; it is input
+    to the local NAS-side utility described below.
 ``dsm-request-site-<id>.form``
     Exact URL-encoded form body for an authenticated POST to that site's
     DSM server at ``/webapi/entry.cgi`` using content type
@@ -145,7 +146,9 @@ the preview if inventory changes instead of mixing different revisions.
     ``SYNO.Network.DHCPServer.Reservation.set`` version 2, wrapped in
     ``SYNO.Entry.Request`` version 1 with ``mode="sequential"`` and
     ``stop_when_error=false``. Credentials/session handling must be supplied
-    separately by the caller; dnsgrid does not authenticate or apply to DSM.
+    separately by the caller; the web app does not authenticate or apply to
+    DSM. This alternative HTTP path does not provide the local utility's
+    backup, IPv6 guard, confirmation, or verification checks.
 ``vpn.hosts``
     VPN addresses, VPN FQDNs, and short aliases for all VPN members,
     including those not publicly exported.
@@ -161,8 +164,9 @@ explicitly reviewed records or use separate delegated zones. Include or
 merge DHCP and hosts artifacts into configurations you own; the app does
 not manage unrelated stanzas, leases, options, routers, or dynamic pools.
 DSM uses ``SYNO.Network.DHCPServer.Reservation.set`` for reservations.
-User testing confirmed the UI/API updates both
-``/etc/dhcpd/dhcpd-<ifname>-static.conf`` and ``/etc/dhcpd/dhcpd.conf``.
+User testing observed local writes updating
+``/etc/dhcpd/dhcpd-<ifname>-static.conf``, ``/etc/dhcpd/dhcpd.conf``, and
+``/etc/dhcpd/dhcpd.info``.
 Send reservation data through DSM rather than editing these system files
 or modifying package binaries, service units, or scripts. These exports
 do not contain DHCP pools, gateway, DNS options, or lease settings.
@@ -177,6 +181,74 @@ Check both the outer ``success`` and inner result's ``success``, and ensure
 ``data.has_fail`` is false. Verify the resulting reservations in DSM's UI.
 Downloads never modify DSM files or package services, and active leases
 do not change automatically.
+
+Local DSM reservation application
+---------------------------------
+
+Run this operator workflow **on the target NAS with sudo**, not inside the
+web app. The utility uses only Python 3's standard library: no Django,
+inventory database, DSM web login, or remote authentication is needed.
+Install Python 3 on the NAS if necessary. Copy
+``/home/runner/work/dnsgrid/dnsgrid/inventory/dsm_apply.py`` and the downloaded
+``dsm-reservations-site-<id>.json`` onto the NAS, for example into
+``/volume1/dnsgrid``. Review the JSON's ``ifname`` against the site's LAN
+subnet and the target NAS; it comes from site Settings, never a hard-coded
+interface.
+
+Read-only preview (also accepts an explicit ``--dry-run``)::
+
+    sudo python3 /volume1/dnsgrid/dsm_apply.py \
+      /volume1/dnsgrid/dsm-reservations-site-1.json \
+      --backup-dir /volume1/dnsgrid/backups
+
+Apply after reviewing the diff and answering ``y`` to the confirmation::
+
+    sudo python3 /volume1/dnsgrid/dsm_apply.py \
+      /volume1/dnsgrid/dsm-reservations-site-1.json \
+      --backup-dir /volume1/dnsgrid/backups --apply
+
+``--yes`` instead of ``--apply`` explicitly authorizes writing without
+a prompt. Without either flag, no write occurs. **This replaces the full
+reservation list for the interface**, including deleting all reservations
+when the array is empty. Merge unrelated reservations into the JSON
+explicitly if they must be retained. It does not manage pools, DHCP
+options, leases, or the rest of the server configuration.
+
+The utility:
+
+1. Validates the export and reads locally using
+   ``SYNO.Network.DHCPServer.Reservation.get`` **version 3** via
+   ``/usr/syno/bin/synowebapi --exec``.
+2. Converts ``data.reservationList.ipv4[].clid`` to ``mac``, preserving
+   hostname/IP pairs. This feature is **IPv4-only**: it fails before
+   writing if ``ipv6`` is nonempty or malformed, or an IPv4 entry cannot
+   be safely converted. No unsupported entries are silently skipped.
+3. Creates a unique, timestamped private backup directory before any
+   write (also during a dry run). ``response.json`` contains the full
+   parsed DSM response, including any returned metadata;
+   ``reservations.json`` contains the converted, restorable
+   ``ifname`` / ``reservationData`` export. Directories are mode 0700
+   and files 0600. Backup failure prevents writing.
+4. Shows counts and a diff of additions, deletions, and changed mappings,
+   then requires ``--yes`` or ``--apply`` and confirmation. A second read
+   rejects changes since the preview, including newly added IPv6 entries.
+5. Calls ``SYNO.Network.DHCPServer.Reservation.set`` **version 2** with
+   separate JSON-encoded ``ifname`` and ``reservationData`` arguments.
+   **The latter is the raw array of objects with mac, ip, and hostname,
+   not the wrapper object containing ifname and reservationData.**
+6. Re-reads with ``get`` version 3 and verifies all MAC/IP/hostname
+   mappings, independent of list ordering and MAC letter case. API errors
+   or verification mismatches exit nonzero.
+
+To restore, review the saved ``reservations.json`` and pass its absolute
+path to the same utility, previewing first and then using ``--apply``.
+The restoration is itself a full-list replacement with a new backup.
+If writing or verification fails, inspect the reported backup and DSM's
+UI before deciding whether to restore; there is no automatic rollback.
+Avoid concurrent DSM reservation edits: the pre-write recheck detects
+stale previews but DSM provides no atomic compare-and-set here.
+No direct writes to ``/etc/dhcpd`` or package modifications are made.
+Copying/downloading an export alone never applies it.
 
 Output ordering is deterministic. BIND serials use the persisted inventory
 revision, not the clock: unchanged inventory yields identical exports,

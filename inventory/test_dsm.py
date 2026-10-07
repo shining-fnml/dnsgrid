@@ -7,6 +7,7 @@ from django.test import TestCase
 
 from .archives import dumps, loads, restore, snapshot
 from .dsm import reservation_form_body, reservation_payload, reservation_request
+from .dsm_apply import validate_payload
 from .exporters import build_exports
 from .models import Configuration, Host, Site
 from .services import update_settings
@@ -40,6 +41,7 @@ class DSMReservationTests(TestCase):
             ],
         }
         self.assertEqual(reservation_payload(self.config, self.site, self.hosts), expected)
+        self.assertEqual(validate_payload(expected), expected)
         exports = build_exports(self.config, self.hosts)
         self.assertEqual(json.loads(exports["dsm-reservations-site-1.json"]), expected)
         self.assertNotIn("dsm-reservations-site-2.json", exports)
