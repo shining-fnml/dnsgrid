@@ -5,9 +5,10 @@ from urllib.parse import parse_qs
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 
+from synology.dsm_apply import validate_payload
+
 from .archives import dumps, loads, restore, snapshot
 from .dsm import reservation_form_body, reservation_payload, reservation_request
-from .dsm_apply import validate_payload
 from .exporters import build_exports
 from .models import Configuration, Host, Site
 from .services import update_settings

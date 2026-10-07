@@ -3,15 +3,28 @@ from io import StringIO
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 from unittest.mock import patch
 
 from django.test import SimpleTestCase
 
-from . import dsm_apply
+from synology import dsm_apply
 
 
 class DSMLocalApplyTests(SimpleTestCase):
+    def test_copied_script_help_without_site_packages_or_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "dsm_apply.py"
+            script.write_bytes(Path(dsm_apply.__file__).read_bytes())
+            result = subprocess.run(
+                [sys.executable, "-I", "-S", str(script), "--help"],
+                cwd=directory, capture_output=True, text=True, timeout=10,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout)
+        self.assertIn("--dry-run", result.stdout)
+
     def setUp(self):
         self.payload = {
             "ifname": "bond0",
@@ -84,7 +97,7 @@ class DSMLocalApplyTests(SimpleTestCase):
             with self.assertRaisesRegex(ValueError, "IPv6"):
                 dsm_apply.current_payload(self.response, "bond0")
 
-    @patch("inventory.dsm_apply.subprocess.run")
+    @patch("synology.dsm_apply.subprocess.run")
     def test_api_versions_json_arguments_and_direct_array(self, run):
         run.return_value = subprocess.CompletedProcess([], 0, stdout='[Line 295] param={"ifname":"bond0"}\n{"success":true}')
         dsm_apply.call_api("get", "bond0")
@@ -113,13 +126,13 @@ class DSMLocalApplyTests(SimpleTestCase):
             export.write_text(json.dumps(self.payload))
             output, errors = StringIO(), StringIO()
             with (
-                patch("inventory.dsm_apply.call_api", side_effect=responses or [self.response]) as api,
+                patch("synology.dsm_apply.call_api", side_effect=responses or [self.response]) as api,
                 patch("builtins.input", return_value=answer) as prompt,
                 patch("sys.stdout", output),
                 patch("sys.stderr", errors),
             ):
                 if backup_failure:
-                    with patch("inventory.dsm_apply.backup_reservations", side_effect=OSError("disk full")):
+                    with patch("synology.dsm_apply.backup_reservations", side_effect=OSError("disk full")):
                         result = dsm_apply.main([str(export), "--backup-dir", str(root), *args])
                 else:
                     result = dsm_apply.main([str(export), "--backup-dir", str(root), *args])

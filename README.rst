@@ -8,7 +8,7 @@ Python 3.12+ and Django, using SQLite without a separate frontend build.
 Quick start
 -----------
 
-From ``/home/runner/work/dnsgrid/dnsgrid``::
+From the repository root::
 
     python -m venv .venv
     . .venv/bin/activate
@@ -187,11 +187,12 @@ Local DSM reservation application
 
 Run this operator workflow **on the target NAS with sudo**, not inside the
 web app. The utility uses only Python 3's standard library: no Django,
-inventory database, DSM web login, or remote authentication is needed.
-Install Python 3 on the NAS if necessary. Copy
-``/home/runner/work/dnsgrid/dnsgrid/inventory/dsm_apply.py`` and the downloaded
+virtualenv, inventory database, DSM web login, or remote authentication is needed.
+Install Python 3 on the NAS if necessary. Manually copy only the repository's
+``synology/dsm_apply.py`` and the downloaded
 ``dsm-reservations-site-<id>.json`` onto the NAS, for example into
-``/volume1/dnsgrid``. Review the JSON's ``ifname`` against the site's LAN
+``/volume1/dnsgrid``; the rest of the repository is not required.
+Review the JSON's ``ifname`` against the site's LAN
 subnet and the target NAS; it comes from site Settings, never a hard-coded
 interface.
 
