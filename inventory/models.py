@@ -204,6 +204,9 @@ class Site(models.Model):
         return self.name
 
 
+VPN_SHORT_SUFFIX = "vpn"
+
+
 class Host(models.Model):
     class Status(models.TextChoices):
         RUNNING = "running", "Running"
@@ -294,6 +297,10 @@ class Host(models.Model):
 
     def vpn_fqdn(self, config):
         return f"{self.name}.{config.vpn_domain}"
+
+    @property
+    def vpn_short_name(self):
+        return f"{self.name}.{VPN_SHORT_SUFFIX}"
 
     def __str__(self):
         return self.name

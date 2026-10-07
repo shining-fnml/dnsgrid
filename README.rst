@@ -150,8 +150,9 @@ the preview if inventory changes instead of mixing different revisions.
     DSM. This alternative HTTP path does not provide the local utility's
     backup, IPv6 guard, confirmation, or verification checks.
 ``vpn.hosts``
-    VPN addresses, VPN FQDNs, and short aliases for all VPN members,
-    including those not publicly exported.
+    One ``ip name.vpn`` line per VPN member, including those not publicly
+    exported, for example ``172.28.1.50 alpha.vpn``. It contains neither
+    the public VPN FQDN (``alpha.vpn.example.tld``) nor the bare host name.
 ``gandi.json``
     Desired LiveDNS A record sets for hosts with both VPN membership
     and public export enabled. Names are relative to the configured
@@ -273,6 +274,41 @@ previous TTL, publish forward/reverse records together, refresh DHCP,
 and coordinate client renewals and routing. Negative DNS caches can also
 delay new names. VPN hosts-file changes require reloading the relevant
 dnsmasq/resolver configuration on the VPN center.
+
+VPN alignment report
+--------------------
+
+dnsgrid is meant to run on the VPN center. The "VPN report" page compares
+dnsgrid's VPN members with that machine's ``/etc/hosts`` and
+``/etc/openvpn/ccd/`` and lists discrepancies. **It is strictly
+read-only**: it only opens files for reading and lists the directory; it
+never writes, corrects, or deletes ``/etc/hosts``, CCD files, or service
+files and never reloads OpenVPN or resolvers. Fix reported items manually.
+The ``vpn.hosts`` download on Export previews is unchanged and remains the
+way to obtain the expected hosts lines.
+
+For every host with VPN membership (every status) it checks that:
+
+* ``/etc/hosts`` maps ``name.vpn`` to the computed VPN address exactly
+  once (missing, duplicate, invalid, or different addresses are reported);
+* ``/etc/openvpn/ccd/<name>`` exists, is readable, and contains exactly one
+  active ``ifconfig-push <ip> <netmask>`` directive whose IP is the computed
+  VPN address. Missing, multiple, or malformed directives (not two IPv4
+  arguments) are reported. The netmask/peer is shown but not compared,
+  because dnsgrid does not model the OpenVPN topology.
+
+Orphans are also listed: ``*.vpn`` names in ``/etc/hosts`` that are not
+dnsgrid VPN members, and CCD entries that do not match a VPN member's name.
+Only ``*.vpn`` names in ``/etc/hosts`` are in scope; other entries such as
+``localhost`` or LAN names are ignored. OpenVPN's ``DEFAULT`` CCD file is
+ignored. Missing, unreadable, oversized (over 1 MiB), or wrong-type sources
+are reported as not inspected rather than treated as aligned. The report
+checks files only, not connected clients or DNS resolution.
+
+Paths are deployment settings, never user input: override them with the
+``DNSGRID_VPN_HOSTS_FILE`` and ``DNSGRID_VPN_CCD_DIR`` environment variables
+(defaults ``/etc/hosts`` and ``/etc/openvpn/ccd``). Grant the dnsgrid
+service account read access to them only; do not run dnsgrid as root.
 
 Gandi ownership and synchronization
 ----------------------------------

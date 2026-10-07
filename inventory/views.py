@@ -10,7 +10,7 @@ from django.db.models import F
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.cache import never_cache
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_GET, require_POST
 
 from .exporters import build_exports
 from .forms import ArchiveUploadForm, ConfigurationForm, HostForm, HostMoveForm
@@ -376,6 +376,13 @@ def download(request, filename):
     response = HttpResponse(artifacts[filename], content_type="text/plain; charset=utf-8")
     response["Content-Disposition"] = f'attachment; filename="{filename}"'
     return response
+
+
+@operator
+@require_GET
+def vpn_report(request):
+    from .vpn_report import build_vpn_report
+    return render(request, "inventory/vpn_report.html", {"report": build_vpn_report()})
 
 
 @operator

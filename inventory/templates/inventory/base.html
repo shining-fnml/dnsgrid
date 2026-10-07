@@ -11,7 +11,7 @@
 <header>
   <a class="brand" href="{% url 'grid' %}">dnsgrid</a>
   {% if user.is_authenticated %}
-  <nav aria-label="Main"><a href="{% url 'grid' %}">Grid</a><a href="{% url 'host-create' %}">Insert host</a><a href="{% url 'configuration' %}">Settings</a><a href="{% url 'exports' %}">Export previews</a></nav>
+  <nav aria-label="Main"><a href="{% url 'grid' %}">Grid</a><a href="{% url 'host-create' %}">Insert host</a><a href="{% url 'configuration' %}">Settings</a><a href="{% url 'exports' %}">Export previews</a><a href="{% url 'vpn-report' %}">VPN report</a></nav>
   <form action="{% url 'logout' %}" method="post">{% csrf_token %}<button>Sign out</button></form>
   {% endif %}
 </header>
