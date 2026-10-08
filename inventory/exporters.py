@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -89,6 +90,11 @@ def publish_dns_zones(expected_revision):
     for filename, content in zones.values():
         temporary = None
         try:
+            target = Path(directory) / filename
+            try:
+                previous = target.lstat()
+            except FileNotFoundError:
+                previous = None
             with tempfile.NamedTemporaryFile(
                 mode="w", encoding="utf-8", newline="\n", dir=directory,
                 prefix=".dnsgrid-", delete=False,
@@ -96,8 +102,14 @@ def publish_dns_zones(expected_revision):
                 temporary = stream.name
                 stream.write(content)
                 stream.flush()
+                mode = 0o644
+                if previous is not None and stat.S_ISREG(previous.st_mode):
+                    mode = stat.S_IMODE(previous.st_mode) & 0o666
+                    if os.fstat(stream.fileno()).st_gid != previous.st_gid:
+                        os.fchown(stream.fileno(), -1, previous.st_gid)
+                os.fchmod(stream.fileno(), mode)
                 os.fsync(stream.fileno())
-            os.replace(temporary, Path(directory) / filename)
+            os.replace(temporary, target)
             written.append(filename)
         except OSError as error:
             errors.append((filename, str(error)))

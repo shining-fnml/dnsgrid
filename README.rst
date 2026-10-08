@@ -172,7 +172,8 @@ a separate fixed serial; subsequent inventory/settings changes advance it.
 ``dns_export_directory`` is an optional absolute path to an existing directory
 on the dnsgrid host. Blank disables directory publishing. Give the application
 account write permission only to the selected directory; the web app needs no
-root access or SSH integration. This host-specific path is excluded from
+root access or SSH integration. Restrict target directory access to intended
+application/transfer accounts. This host-specific path is excluded from
 application-data archives and preserved on restore.
 
 Configure a real authoritative nameserver before deploying zones.
@@ -245,6 +246,11 @@ octets come from ``lan_prefix``). Download names remain ``forward.zone`` and
 Each zone is written to a temporary file in the destination directory and
 atomically replaced with ``os.replace``. Existing matching files are overwritten
 without a prompt; no backups are made and no unrelated files are deleted.
+Existing regular zone files retain their read/write permission bits and group
+ownership; new zones use mode 0644 (readable DNS data). The application owns the
+newly replaced inode. Symlink destinations are replaced, not followed. If
+preserving an existing group is unauthorized, a per-file error is reported and
+the original file stays unchanged; no root access is needed.
 The entire set is **not atomic**: per-file errors are reported, and some zones
 may already have been replaced when another fails. Review errors and retry
 after correcting permissions or other failures. User testing observed DSM
@@ -445,8 +451,10 @@ The deterministic UTF-8 JSON schema has exactly these top-level keys:
   ``lan_prefix``, ``vpn_prefix``, ``gandi_zone``, ``ttl``, ``soa_ns``,
   ``soa_mailbox``, ``soa_refresh``, ``soa_retry``, ``soa_expire``,
   ``soa_minimum``, ``zone_ns``, and ``revision``. Older v1 archives without
-  these new SOA timing and zone NS fields remain accepted with compatible
-  defaults. ``dns_export_directory`` is host-specific and excluded.
+  these new SOA timing and zone NS fields remain accepted. Legacy migration
+  and archive compatibility retain the old SOA timing values and existing
+  nameserver rather than changing them to new DSM defaults.
+  ``dns_export_directory`` is host-specific and excluded.
 * ``sites``: exactly four objects with ``id`` (1–4), ``name``, ``g``, and
   ``dsm_ifname``. Older v1 archives without ``dsm_ifname`` are accepted
   with an empty mapping; new exports include it.

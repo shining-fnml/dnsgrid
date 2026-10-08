@@ -11,7 +11,7 @@
 <p>Generated from current inventory, including every status. Files are dedicated dnsgrid-owned artifacts: do not replace user-managed zones or configurations with them. Downloads do not deploy anything.</p>
 <p class="warning">Use these zones only for networks/domains delegated to dnsgrid. Validate with BIND before deployment; review DSM reservations before applying them. DNS caching and existing DHCP leases can delay moves.</p>
 <h2>Write DNS zones to directory</h2>
-<p>In Settings, set <code>dns_export_directory</code> to an absolute, existing directory on the dnsgrid host. Blank disables publishing. Grant the application account write permission only to that directory; no root or SSH integration is needed.</p>
+<p>In Settings, set <code>dns_export_directory</code> to an absolute, existing directory on the dnsgrid host. Blank disables publishing. Grant the application account write permission only to that directory and restrict directory access to intended application/transfer accounts; no root or SSH integration is needed.</p>
 {% if dns_export_directory %}
 <p>Configured directory: <code>{{ dns_export_directory }}</code></p>
 <form method="post" action="{% url 'dns-publish' %}">
@@ -24,6 +24,8 @@
 {% endif %}
 <p>Only this explicit action writes zones. Saving inventory or Settings, downloading files, and downloading or restoring archives never publish DNS. Files are named for their zones: the forward <code>lan_domain</code> and reverse <code>&lt;g&gt;.&lt;second&gt;.&lt;first&gt;.in-addr.arpa</code>. Downloads retain <code>forward.zone</code> and <code>reverse-&lt;g&gt;.zone</code>.</p>
 <p>Each file is written to a temporary file in the directory and replaced atomically with <code>os.replace</code>, overwriting without a prompt. No unrelated files are deleted and no backups are made. The entire set is not atomic; review per-file errors and any partial publication. User testing observed DSM automatically reloading these zones, but this is not a guarantee for every installation.</p>
+<p>Existing regular zone files retain read/write permission bits and group ownership; new zones use mode <code>0644</code> (readable DNS data). The application owns the newly replaced inode. Symlink destinations are replaced, not followed. If preserving an existing group is unauthorized, a per-file error is reported and the original stays unchanged. No root access is needed.</p>
+<p>Legacy migration and archive compatibility retain old SOA timing values and the existing nameserver rather than changing them to new DSM defaults.</p>
 <p>Zones start with explicit origin and TTL directives and a multiline SOA. A/PTR records have explicit FQDN owners and TTLs, are ordered alphabetically by hostname, and PTR targets are full LAN names. The final record is the zone-apex NS. Settings configures <code>ttl</code>, <code>soa_ns</code>, <code>soa_mailbox</code>, <code>soa_refresh</code>, <code>soa_retry</code>, <code>soa_expire</code>, <code>soa_minimum</code>, and the separate <code>zone_ns</code>. The serial automatically follows the inventory revision; Settings can seed it upward using <code>soa_serial</code> to exceed an existing DSM serial. Unchanged downloads are identical.</p>
 <h2>DSM DHCP reservations (API)</h2>
 <p>Configure each site's DSM DHCP interface in Settings to generate <code>dsm-reservations-site-ID.json</code>. The JSON contains only <code>ifname</code> and the complete <code>reservationData</code> list for that site.</p>

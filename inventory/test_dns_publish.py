@@ -1,4 +1,6 @@
 import copy
+import os
+import stat
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -38,14 +40,17 @@ class DNSPublicationTests(TestCase):
         artifacts = build_exports()
         forward = self.path / self.config.lan_domain
         forward.write_text("old content")
+        previous_mode = stat.S_IMODE(forward.stat().st_mode)
         unrelated = self.path / "keep.txt"
         unrelated.write_text("unrelated")
         response = self.publish()
         self.assertContains(response, "DNS zone files written:")
         self.assertEqual(forward.read_text(), artifacts["forward.zone"])
+        self.assertEqual(stat.S_IMODE(forward.stat().st_mode), previous_mode)
         for group in range(1, 5):
             filename = f"{group}.168.192.in-addr.arpa"
             self.assertEqual((self.path / filename).read_text(), artifacts[f"reverse-{group}.zone"])
+            self.assertEqual(stat.S_IMODE((self.path / filename).stat().st_mode), 0o644)
             self.assertContains(response, filename)
         self.assertEqual(unrelated.read_text(), "unrelated")
         self.assertEqual(len(list(self.path.iterdir())), 6)
@@ -94,7 +99,6 @@ class DNSPublicationTests(TestCase):
         self.assertEqual(list(self.path.iterdir()), [])
 
     def test_failed_replace_retains_old_file_and_reports_partial_success(self):
-        import os
         reverse_file = self.path / "1.168.192.in-addr.arpa"
         reverse_file.write_text("previous zone")
         replace = os.replace
@@ -111,6 +115,24 @@ class DNSPublicationTests(TestCase):
         self.assertEqual(reverse_file.read_text(), "previous zone")
         self.assertTrue((self.path / self.config.lan_domain).exists())
         self.assertFalse(any(file.name.startswith(".dnsgrid-") for file in self.path.iterdir()))
+
+    def test_existing_zone_permissions_and_group_are_preserved(self):
+        forward = self.path / self.config.lan_domain
+        forward.write_text("previous zone")
+        forward.chmod(0o640)
+        group = forward.stat().st_gid
+        self.publish()
+        self.assertEqual(stat.S_IMODE(forward.stat().st_mode), 0o640)
+        self.assertEqual(forward.stat().st_gid, group)
+
+    def test_failure_preserving_metadata_retains_existing_file(self):
+        forward = self.path / self.config.lan_domain
+        forward.write_text("previous zone")
+        with patch("inventory.exporters.os.fchmod", side_effect=PermissionError("mode denied")):
+            response = self.publish()
+        self.assertContains(response, "mode denied")
+        self.assertEqual(forward.read_text(), "previous zone")
+        self.assertEqual(list(self.path.iterdir()), [forward])
 
     def test_failed_temp_write_never_truncates_target(self):
         forward = self.path / self.config.lan_domain
