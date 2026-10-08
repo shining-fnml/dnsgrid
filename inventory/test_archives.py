@@ -355,7 +355,7 @@ class ArchiveDataTests(TestCase):
             if name != "forward.zone" and not name.startswith("reverse-"):
                 self.assertEqual(build_exports()[name], artifact)
             else:
-                self.assertEqual(build_exports()[name].replace("\n    41 ", "\n    1 "), artifact)
+                self.assertEqual(build_exports()[name].replace("\n        41\n", "\n        1\n"), artifact)
 
     def test_restore_uses_larger_destination_revision(self):
         Configuration.objects.filter(pk=1).update(revision=50)

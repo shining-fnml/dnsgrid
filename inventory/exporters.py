@@ -1,12 +1,16 @@
-"""Deterministic downloads; these files never overwrite external configuration."""
+"""Deterministic downloads and explicit local DNS zone publication."""
 
 import json
+import os
+import tempfile
+from pathlib import Path
 
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import F
 
-from .dsm import reservation_form_body, reservation_payload
-from .models import Configuration, Host, Site, normalize_mac
+from .dsm import reservation_payload
+from .models import Configuration, Host, Site
 
 
 @transaction.atomic
@@ -26,13 +30,86 @@ def _group(host):
 
 def _header(config, origin):
     return [
-        "; DNSGrid application-owned export; do not replace unrelated configuration.",
         f"$ORIGIN {origin}.",
         f"$TTL {config.ttl}",
-        f"@ IN SOA {config.soa_ns}. {config.soa_mailbox}. (",
-        f"    {config.revision} 3600 900 1209600 {min(config.ttl, 300)} )",
-        f"@ IN NS {config.soa_ns}.",
+        f"{origin}. IN SOA {config.soa_ns}. {config.soa_mailbox}. (",
+        f"        {config.revision}",
+        f"        {config.soa_refresh}",
+        f"        {config.soa_retry}",
+        f"        {config.soa_expire}",
+        f"        {config.soa_minimum}",
+        ")",
     ]
+
+
+def _dns_zones(config, hosts):
+    hosts = sorted(hosts, key=lambda host: host.name)
+    origin = config.lan_domain
+    forward = _header(config, origin)
+    forward.extend(
+        f"{host.lan_fqdn(config)}. {config.ttl} A {host.lan_address(config)}" for host in hosts
+    )
+    forward.append(f"{origin}. NS {config.zone_ns}.")
+    # Downloads retain their historical names; directory deposits use zone names.
+    zones = {"forward.zone": (origin, "\n".join(forward) + "\n")}
+    prefix = config.lan_prefix.split(".")
+    groups = sorted(set(Site.objects.values_list("g", flat=True)) | {_group(host) for host in hosts})
+    for group in groups:
+        origin = f"{group}.{prefix[1]}.{prefix[0]}.in-addr.arpa"
+        reverse = _header(config, origin)
+        reverse.extend(
+            f"{host.x}.{origin}. {config.ttl} PTR {host.lan_fqdn(config)}."
+            for host in hosts if _group(host) == group
+        )
+        reverse.append(f"{origin}. NS {config.zone_ns}.")
+        zones[f"reverse-{group}.zone"] = (origin, "\n".join(reverse) + "\n")
+    return zones
+
+
+@transaction.atomic
+def publish_dns_zones(expected_revision):
+    config, hosts = _inputs(None, None)
+    if str(config.revision) != expected_revision:
+        raise ValidationError("Inventory changed. Reload export previews before publishing.")
+    directory = config.dns_export_directory
+    if not directory:
+        raise ValidationError("Configure a DNS export directory in Settings before publishing.")
+    if not Path(directory).is_absolute() or "\x00" in directory:
+        raise ValidationError("The DNS export directory must be an absolute local path.")
+    zones = _dns_zones(config, hosts)
+    filenames = [filename for filename, _ in zones.values()]
+    if len(filenames) != len(set(filenames)):
+        raise ValidationError("Forward and reverse zones must have distinct publication filenames.")
+    if any(
+        Path(filename).name != filename or filename in (".", "..") or "\x00" in filename
+        for filename in filenames
+    ):
+        raise ValidationError("Invalid DNS zone filename.")
+    written, errors = [], []
+    for filename, content in zones.values():
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="\n", dir=directory,
+                prefix=".dnsgrid-", delete=False,
+            ) as stream:
+                temporary = stream.name
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, Path(directory) / filename)
+            written.append(filename)
+        except OSError as error:
+            errors.append((filename, str(error)))
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    errors.append((filename, f"Could not remove temporary file: {error}"))
+    return written, errors
 
 
 def desired_gandi(config=None, hosts=None):
@@ -61,52 +138,12 @@ def desired_gandi(config=None, hosts=None):
 @transaction.atomic
 def build_exports(config=None, hosts=None):
     config, hosts = _inputs(config, hosts)
-    forward = _header(config, config.lan_domain)
-    forward.extend(f"{host.name} IN A {host.lan_address(config)}" for host in hosts)
-    result = {"forward.zone": "\n".join(forward) + "\n"}
-    prefix = config.lan_prefix.split(".")
-    dhcp = [
-        "# DNSGrid application-owned export; do not replace unrelated configuration.",
-    ]
-    dsm_dhcp = [
-        "# Legacy dnsmasq reservation listing for audit only, not DSM deployment.",
-        "# Do not write /etc/dhcpd/dhcpd.conf; use the DSM Reservation API exports.",
-        "# This is not a complete DHCP server configuration.",
-    ]
-    groups = sorted(set(Site.objects.values_list("g", flat=True)) | {_group(host) for host in hosts})
-    for group in groups:
-        reverse = _header(config, f"{group}.{prefix[1]}.{prefix[0]}.in-addr.arpa")
-        members = [host for host in hosts if _group(host) == group]
-        reverse.extend(
-            f"{host.x} IN PTR {host.lan_fqdn(config)}." for host in members
-        )
-        result[f"reverse-{group}.zone"] = "\n".join(reverse) + "\n"
-        dhcp.append(f"subnet {config.lan_prefix}.{group}.0 netmask 255.255.255.0 {{")
-        dhcp.append("}")
-    seen_macs = set()
-    for host in hosts:
-        mac = normalize_mac(host.mac)
-        if mac:
-            if mac in seen_macs:
-                raise ValueError("DHCP reservations must have unique MAC addresses.")
-            seen_macs.add(mac)
-            dhcp.extend([
-                f"host {host.name} {{",
-                f"  hardware ethernet {mac};",
-                f"  fixed-address {host.lan_fqdn(config)};",
-                "}",
-            ])
-            dsm_dhcp.append(
-                f"dhcp-host={mac},{host.name},{host.lan_address(config)},86400"
-            )
-    result["dhcpd.conf"] = "\n".join(dhcp) + "\n"
-    result["dhcpd-dsm.conf"] = "\n".join(dsm_dhcp) + "\n"
+    result = {download: content for download, (_, content) in _dns_zones(config, hosts).items()}
     for site in Site.objects.order_by("id"):
         if site.dsm_ifname:
             result[f"dsm-reservations-site-{site.pk}.json"] = json.dumps(
                 reservation_payload(config, site, hosts), indent=2,
             ) + "\n"
-            result[f"dsm-request-site-{site.pk}.form"] = reservation_form_body(config, site, hosts)
     vpn = [
         "# DNSGrid application-owned export; do not replace unrelated configuration.",
     ]

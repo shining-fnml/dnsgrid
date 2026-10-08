@@ -12,7 +12,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.cache import never_cache
 from django.views.decorators.http import require_GET, require_POST
 
-from .exporters import build_exports
+from .exporters import build_exports, publish_dns_zones
 from .forms import ArchiveUploadForm, ConfigurationForm, HostForm, HostMoveForm
 from .models import Configuration, Host, Site
 from .services import (
@@ -27,6 +27,7 @@ HOST_FIELDS = ("name", "row", "column", "category", "status", "vpn", "public_exp
 CONFIG_FIELDS = (
     "lan_domain", "vpn_domain", "lan_prefix", "vpn_prefix", "gandi_zone",
     "ttl", "soa_ns", "soa_mailbox",
+    "soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns", "dns_export_directory",
 )
 
 
@@ -195,15 +196,19 @@ def configuration(request):
     sites = list(Site.objects.order_by("id"))
     initial = {key: getattr(config, key) for key in CONFIG_FIELDS}
     initial["revision"] = config.revision
+    initial["soa_serial"] = config.revision
     form = ConfigurationForm(request.POST or None, initial=initial, sites=sites)
     if request.method == "POST" and form.is_valid():
         data = form.cleaned_data
         candidate = copy.copy(config)
         config_data = {key: data[key] for key in CONFIG_FIELDS}
+        config_data["soa_serial"] = data["soa_serial"]
         config_data["gandi_token"] = (
             "" if data["clear_token"] else data["gandi_token"] or config.gandi_token
         )
         for key, value in config_data.items():
+            if key == "soa_serial":
+                continue
             setattr(candidate, key, value)
         site_data = [{
             "id": site.pk, "name": data[f"site_{site.pk}_name"], "g": data[f"site_{site.pk}_g"],
@@ -212,6 +217,8 @@ def configuration(request):
         try:
             if data["revision"] != config.revision:
                 raise ValidationError("Inventory changed. Reload this form before previewing.")
+            if data["soa_serial"] < config.revision:
+                raise ValidationError("SOA serial must not decrease.")
             candidate.full_clean()
             if len({site["g"] for site in site_data}) != 4:
                 raise ValidationError("Each of the four sites must have a distinct octet.")
@@ -220,6 +227,8 @@ def configuration(request):
             changes = [{
                 "label": key, "before": getattr(config, key), "after": getattr(candidate, key),
             } for key in CONFIG_FIELDS if getattr(config, key) != getattr(candidate, key)]
+            if data["soa_serial"] != config.revision:
+                changes.append({"label": "SOA serial", "before": config.revision, "after": data["soa_serial"]})
             if config.gandi_token != candidate.gandi_token:
                 changes.append({"label": "Gandi token", "before": "Hidden", "after": "Set" if candidate.gandi_token else "Removed"})
             for site, new in zip(sites, site_data):
@@ -359,7 +368,23 @@ def exports(request):
         artifacts = build_exports(config=config)
     return render(request, "inventory/exports.html", {
         "artifacts": artifacts, "revision": config.revision,
+        "dns_export_directory": config.dns_export_directory,
     })
+
+
+@operator
+@require_POST
+def dns_publish(request):
+    try:
+        written, errors = publish_dns_zones(request.POST.get("revision"))
+    except (ValidationError, IntegrityError, OperationalError) as error:
+        messages.error(request, _errors(error))
+    else:
+        if written:
+            messages.success(request, "DNS zone files written: " + ", ".join(written))
+        for filename, error in errors:
+            messages.error(request, f"DNS zone write failed for {filename}: {error}")
+    return redirect("exports")
 
 
 @operator

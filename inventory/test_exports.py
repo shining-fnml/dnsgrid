@@ -10,33 +10,28 @@ from .models import Configuration, Host, Site
 class ExportTests(TestCase):
     def setUp(self):
         self.config = Configuration.load()
+        Site.objects.update(dsm_ifname="eth0")
         self.host = Host.objects.create(
             name="alpha", site=Site.objects.get(pk=1), row=2, column=3,
             vpn=True, public_export=True, mac="02:00:00:00:00:01",
             notes="PRIVATE-NOTE",
         )
 
-    def test_forward_reverse_dhcp_and_vpn(self):
+    def test_forward_reverse_and_vpn(self):
         output = build_exports()
         self.assertIn("$ORIGIN intranet.example.tld.", output["forward.zone"])
         self.assertIn("$TTL 300", output["forward.zone"])
         self.assertIn("ns.example.tld. hostmaster.intranet.example.tld.", output["forward.zone"])
-        self.assertIn("alpha IN A 192.168.1.50", output["forward.zone"])
+        self.assertIn("alpha.intranet.example.tld. 300 A 192.168.1.50", output["forward.zone"])
         self.assertIn("$ORIGIN 1.168.192.in-addr.arpa.", output["reverse-1.zone"])
-        self.assertIn("50 IN PTR alpha.intranet.example.tld.", output["reverse-1.zone"])
-        self.assertIn("hardware ethernet 02:00:00:00:00:01;", output["dhcpd.conf"])
-        self.assertIn("fixed-address alpha.intranet.example.tld;", output["dhcpd.conf"])
-        self.assertNotIn("fixed-address 192.", output["dhcpd.conf"])
-        self.assertIn(
-            "dhcp-host=02:00:00:00:00:01,alpha,192.168.1.50,86400",
-            output["dhcpd-dsm.conf"],
-        )
-        self.assertIn("/etc/dhcpd/dhcpd.conf", output["dhcpd-dsm.conf"])
+        self.assertIn("50.1.168.192.in-addr.arpa. 300 PTR alpha.intranet.example.tld.", output["reverse-1.zone"])
+        self.assertNotIn("dhcpd.conf", output)
+        self.assertNotIn("dhcpd-dsm.conf", output)
+        self.assertFalse(any(name.endswith(".form") for name in output))
         vpn_lines = output["vpn.hosts"].splitlines()
         self.assertEqual(vpn_lines[1:], ["172.28.1.50 alpha.vpn"])
         self.assertNotIn("vpn.example.tld", output["vpn.hosts"])
         for group in range(1, 5):
-            self.assertIn(f"subnet 192.168.{group}.0 netmask 255.255.255.0", output["dhcpd.conf"])
             self.assertIn(f"reverse-{group}.zone", output)
         self.assertEqual(json.loads(output["gandi.json"]), [{
             "rrset_name": "alpha.vpn", "rrset_type": "A",
@@ -50,13 +45,9 @@ class ExportTests(TestCase):
         for status, _ in Host._meta.get_field("status").choices:
             self.host.status = status
             output = build_exports(self.config, [self.host])
-            self.assertIn("alpha IN A", output["forward.zone"])
-            self.assertIn("50 IN PTR", output["reverse-1.zone"])
-            self.assertIn("host alpha", output["dhcpd.conf"])
-            self.assertIn(
-                "dhcp-host=02:00:00:00:00:01,alpha,192.168.1.50,86400",
-                output["dhcpd-dsm.conf"],
-            )
+            self.assertIn("alpha.intranet.example.tld. 300 A", output["forward.zone"])
+            self.assertIn("50.1.168.192.in-addr.arpa. 300 PTR", output["reverse-1.zone"])
+            self.assertEqual(json.loads(output["dsm-reservations-site-1.json"])["reservationData"][0]["hostname"], "alpha")
             self.assertEqual(len(json.loads(output["gandi.json"])), 1)
             self.assertNotIn(status, "".join(output.values()))
             self.assertEqual(output, original)
@@ -71,9 +62,8 @@ class ExportTests(TestCase):
                 output = build_exports(self.config, [self.host])
                 self.assertEqual("172.28.1.50 alpha.vpn\n" in output["vpn.hosts"], vpn)
                 self.assertEqual(len(desired_gandi(self.config, [self.host])), int(vpn and public))
-                self.assertNotIn("host alpha", output["dhcpd.conf"])
-                self.assertNotIn("dhcp-host=02:00:00:00:00:01", output["dhcpd-dsm.conf"])
-                self.assertIn("alpha IN A", output["forward.zone"])
+                self.assertEqual(json.loads(output["dsm-reservations-site-1.json"])["reservationData"], [])
+                self.assertIn("alpha.intranet.example.tld. 300 A", output["forward.zone"])
 
     def test_move_and_custom_configuration(self):
         self.host.site = Site.objects.get(pk=4)
@@ -86,22 +76,27 @@ class ExportTests(TestCase):
         self.config.revision = 42
         self.config.soa_ns = "ns.lan.other.test"
         self.config.soa_mailbox = "admin.lan.other.test"
+        self.config.zone_ns = "dns.other.test"
+        self.config.soa_refresh = 123
+        self.config.soa_retry = 45
+        self.config.soa_expire = 6789
+        self.config.soa_minimum = 60
         output = build_exports(self.config, [self.host])
-        self.assertIn("alpha IN A 10.24.4.50", output["forward.zone"])
-        self.assertIn("42 3600", output["forward.zone"])
+        self.assertIn("alpha.lan.other.test. 600 A 10.24.4.50", output["forward.zone"])
+        self.assertIn("lan.other.test. IN SOA ns.lan.other.test. admin.lan.other.test. (\n"
+                      "        42\n        123\n        45\n        6789\n        60\n)", output["forward.zone"])
         self.assertIn("$TTL 600", output["forward.zone"])
         self.assertIn("$ORIGIN 4.24.10.in-addr.arpa.", output["reverse-4.zone"])
-        self.assertIn("50 IN PTR alpha.lan.other.test.", output["reverse-4.zone"])
-        self.assertNotIn("50 IN PTR", output["reverse-1.zone"])
+        self.assertIn("50.4.24.10.in-addr.arpa. 600 PTR alpha.lan.other.test.", output["reverse-4.zone"])
+        self.assertNotIn(" PTR ", output["reverse-1.zone"])
+        self.assertTrue(output["forward.zone"].endswith("lan.other.test. NS dns.other.test.\n"))
+        self.assertTrue(output["reverse-4.zone"].endswith("4.24.10.in-addr.arpa. NS dns.other.test.\n"))
         self.assertIn("10.29.4.50 alpha.vpn\n", output["vpn.hosts"])
         self.assertNotIn("vpn.other.test", output["vpn.hosts"])
-        self.assertIn(
-            "dhcp-host=02:00:00:00:00:01,alpha,10.24.4.50,86400",
-            output["dhcpd-dsm.conf"],
-        )
+        self.assertEqual(json.loads(output["dsm-reservations-site-4.json"])["reservationData"][0]["ip"], "10.24.4.50")
         self.assertEqual(desired_gandi(self.config, [self.host])[0]["rrset_values"], ["10.29.4.50"])
 
-    def test_site_move_does_not_change_dhcp_reservations(self):
+    def test_site_move_updates_reservations_and_zones(self):
         beta = Host.objects.create(
             name="beta", site=Site.objects.get(pk=2), row=1, column=1,
             mac="02:00:00:00:00:02",
@@ -109,24 +104,24 @@ class ExportTests(TestCase):
         before = build_exports(self.config, [self.host, beta])
         self.host.site = Site.objects.get(pk=4)
         after = build_exports(self.config, [self.host, beta])
-        self.assertEqual(before["dhcpd.conf"], after["dhcpd.conf"])
-        self.assertNotEqual(before["dhcpd-dsm.conf"], after["dhcpd-dsm.conf"])
+        self.assertNotEqual(before["dsm-reservations-site-1.json"], after["dsm-reservations-site-1.json"])
+        self.assertNotEqual(before["dsm-reservations-site-4.json"], after["dsm-reservations-site-4.json"])
+        self.assertEqual(before["dsm-reservations-site-2.json"], after["dsm-reservations-site-2.json"])
         self.assertNotEqual(before["forward.zone"], after["forward.zone"])
-        self.assertLess(before["dhcpd.conf"].rindex("subnet "), before["dhcpd.conf"].index("host beta"))
 
-    def test_negative_cache_ttl_does_not_exceed_low_configured_ttl(self):
+    def test_negative_cache_ttl_is_explicit(self):
         self.config.ttl = 30
+        self.config.soa_minimum = 12
         output = build_exports(self.config, [])
-        self.assertIn("1209600 30 )", output["forward.zone"])
-        self.assertIn("1209600 30 )", output["reverse-1.zone"])
+        self.assertIn("        1209600\n        12\n)", output["forward.zone"])
+        self.assertIn("        1209600\n        12\n)", output["reverse-1.zone"])
 
     def test_exporter_normalizes_directly_supplied_mac(self):
         for mac in ("020000000001", "02-00-00-00-00-01", "0200.0000.0001"):
             self.host.mac = mac
-            self.assertIn(
-                "hardware ethernet 02:00:00:00:00:01;",
-                build_exports(self.config, [self.host])["dhcpd.conf"],
-            )
+            output = build_exports(self.config, [self.host])
+            self.assertEqual(json.loads(output["dsm-reservations-site-1.json"])["reservationData"][0]["mac"],
+                             "02:00:00:00:00:01")
 
     def test_exporter_rejects_invalid_directly_supplied_mac(self):
         for mac in ("bad-mac", "00:00:00:00:00:00", "01:00:00:00:00:01",
@@ -136,7 +131,7 @@ class ExportTests(TestCase):
                 build_exports(self.config, [self.host])
 
     def test_exporter_rejects_duplicate_normalized_mac(self):
-        beta = Host(name="beta", site=Site.objects.get(pk=2), row=1, column=1,
+        beta = Host(name="beta", site=Site.objects.get(pk=1), row=1, column=1,
                     mac="0200.0000.0001")
         with self.assertRaises(ValueError):
             build_exports(self.config, [self.host, beta])
@@ -160,24 +155,29 @@ class ExportTests(TestCase):
         self.assertLess(config_read, hosts_read)
         self.assertLess(hosts_read, sites_read)
 
-    def test_order_is_stable_and_by_address(self):
+    def test_order_is_stable_and_by_hostname(self):
         beta = Host.objects.create(name="beta", site=Site.objects.get(pk=2), row=1, column=1)
         first = build_exports(self.config, [self.host, beta])
         self.assertEqual(first, build_exports(self.config, [beta, self.host]))
-        self.assertLess(first["forward.zone"].index("beta IN A"), first["forward.zone"].index("alpha IN A"))
+        self.assertLess(first["forward.zone"].index("alpha.intranet"), first["forward.zone"].index("beta.intranet"))
         self.assertEqual(build_exports(), build_exports())
         self.assertEqual(
-            first["dhcpd-dsm.conf"],
-            build_exports(self.config, [beta, self.host])["dhcpd-dsm.conf"],
+            first["dsm-reservations-site-1.json"],
+            build_exports(self.config, [beta, self.host])["dsm-reservations-site-1.json"],
         )
-        self.assertNotIn("PRIVATE-NOTE", first["dhcpd-dsm.conf"])
+        beta.site = self.host.site
+        reverse = build_exports(self.config, [beta, self.host])["reverse-1.zone"]
+        self.assertLess(reverse.index("alpha.intranet"), reverse.index("beta.intranet"))
+        self.assertNotIn("PRIVATE-NOTE", first["dsm-reservations-site-1.json"])
 
     def test_dsm_export_omits_hosts_without_mac_and_normalizes_macs(self):
         beta = Host.objects.create(name="beta", site=Site.objects.get(pk=2), row=1, column=1)
         self.host.mac = "020000000001"
         self.config.gandi_token = "PRIVATE-TOKEN"
-        output = build_exports(self.config, [self.host, beta])["dhcpd-dsm.conf"]
-        self.assertIn("dhcp-host=02:00:00:00:00:01,alpha,192.168.1.50,86400", output)
+        output = build_exports(self.config, [self.host, beta])["dsm-reservations-site-1.json"]
+        self.assertEqual(json.loads(output)["reservationData"], [
+            {"mac": "02:00:00:00:00:01", "hostname": "alpha", "ip": "192.168.1.50"},
+        ])
         self.assertNotIn("beta", output)
         self.assertNotIn("PRIVATE-TOKEN", output)
 
@@ -192,6 +192,11 @@ class ExportTests(TestCase):
         self.assertIn("reverse-17.zone", output)
         self.assertNotIn("reverse-4.zone", output)
         self.assertIn("$ORIGIN 17.168.192.in-addr.arpa.", output["reverse-17.zone"])
-        self.assertIn("subnet 192.168.17.0", output["dhcpd.conf"])
         self.assertEqual(json.loads(output["gandi.json"]), [])
-        self.assertNotIn(" IN A ", output["forward.zone"])
+        self.assertNotIn(" A ", output["forward.zone"])
+        for filename, content in output.items():
+            if filename.endswith(".zone"):
+                lines = content.splitlines()
+                self.assertTrue(lines[0].startswith("$ORIGIN "))
+                origin = lines[0].split()[1]
+                self.assertEqual(lines[-1], f"{origin} NS ns.example.tld.")

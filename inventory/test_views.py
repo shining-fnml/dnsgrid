@@ -271,6 +271,8 @@ class OperatorViewsTests(TestCase):
             field: getattr(config, field) for field in (
                 "lan_domain", "vpn_domain", "lan_prefix", "vpn_prefix",
                 "gandi_zone", "ttl", "soa_ns", "soa_mailbox", "revision",
+                "soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns",
+                "dns_export_directory", "soa_serial",
             )
         }
         for site in Site.objects.all():
@@ -305,6 +307,29 @@ class OperatorViewsTests(TestCase):
         self.assertTrue(response.context["form"].errors)
         self.assertEqual(Site.objects.get(pk=1).g, 1)
 
+    def test_dns_settings_preview_and_confirm(self):
+        response = self.client.post(reverse("configuration"), self.settings_data(
+            soa_refresh=43201, soa_retry=181, soa_expire=1209601, soa_minimum=10801,
+            zone_ns="dns.example.test", soa_serial=2026100803,
+            dns_export_directory="/tmp/dnsgrid-export",
+        ))
+        self.assertTemplateUsed(response, "inventory/confirm.html")
+        self.assertEqual(Configuration.load().dns_export_directory, "")
+        self.assertContains(response, "SOA serial")
+        with patch("inventory.exporters.publish_dns_zones") as publish:
+            self.apply_pending()
+            publish.assert_not_called()
+        config = Configuration.load()
+        self.assertEqual(config.dns_export_directory, "/tmp/dnsgrid-export")
+        self.assertEqual(config.zone_ns, "dns.example.test")
+        self.assertEqual(config.revision, 2026100803)
+        self.assertEqual((config.soa_refresh, config.soa_retry, config.soa_expire, config.soa_minimum),
+                         (43201, 181, 1209601, 10801))
+        for updates in ({"soa_retry": 0}, {"soa_minimum": -1}, {"zone_ns": "bad name"},
+                        {"dns_export_directory": "../relative"}, {"soa_serial": 1}):
+            response = self.client.post(reverse("configuration"), self.settings_data(**updates))
+            self.assertTrue(response.context["form"].errors)
+
     def test_dsm_interface_settings_preview_confirm_and_validation(self):
         response = self.client.get(reverse("configuration"))
         self.assertContains(response, "Site 1 DSM DHCP interface")
@@ -328,9 +353,9 @@ class OperatorViewsTests(TestCase):
         response = self.client.get(reverse("exports"))
         self.assertContains(response, "DSM DHCP reservations (API)")
         self.assertContains(response, "dsm-reservations-site-1.json")
-        self.assertContains(response, "dsm-request-site-1.form")
+        self.assertNotContains(response, "dsm-request-site-1.form")
         revision = response.context["revision"]
-        for filename in ("dsm-reservations-site-1.json", "dsm-request-site-1.form"):
+        for filename in ("dsm-reservations-site-1.json",):
             url = reverse("download", args=[filename]) + f"?revision={revision}"
             download = self.client.get(url)
             self.assertEqual(download.status_code, 200)
@@ -352,11 +377,13 @@ class OperatorViewsTests(TestCase):
         for content in response.context["artifacts"].values():
             self.assertNotIn("decommissioned", content)
             self.assertNotIn("<script>", content)
-        download = self.client.get(reverse("download", args=["dhcpd.conf"]))
+        download = self.client.get(reverse("download", args=["forward.zone"]))
         self.assertEqual(download.status_code, 200)
         self.assertIn("attachment;", download["Content-Disposition"])
         export_page = self.client.get(reverse("exports"))
-        self.assertContains(export_page, "dhcpd-dsm.conf")
+        self.assertNotContains(export_page, "dhcpd-dsm.conf")
+        self.assertNotContains(export_page, "dsm-request-site-")
+        self.assertNotContains(export_page, "<code>dhcpd.conf</code>")
         self.assertContains(export_page, "SYNO.Network.DHCPServer.Reservation.set")
         self.assertContains(export_page, "SYNO.Network.DHCPServer.Reservation.get")
         self.assertContains(export_page, "sudo python3")
@@ -368,9 +395,8 @@ class OperatorViewsTests(TestCase):
         self.assertContains(export_page, "replaces the full reservation list")
         self.assertContains(export_page, "IPv4 only")
         self.assertContains(export_page, "Do not edit DSM system files or package services")
-        dsm_download = self.client.get(reverse("download", args=["dhcpd-dsm.conf"]))
-        self.assertEqual(dsm_download.status_code, 200)
-        self.assertIn("dhcp-host=", dsm_download.content.decode())
+        for obsolete in ("dhcpd.conf", "dhcpd-dsm.conf", "dsm-request-site-1.form"):
+            self.assertEqual(self.client.get(reverse("download", args=[obsolete])).status_code, 404)
         self.assertEqual(self.client.get(reverse("download", args=["not-an-artifact"])).status_code, 404)
 
     def test_download_rejects_stale_preview_revision(self):

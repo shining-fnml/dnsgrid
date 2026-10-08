@@ -1,4 +1,5 @@
 import re
+from pathlib import Path
 
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxLengthValidator, MaxValueValidator, MinValueValidator, RegexValidator
@@ -115,6 +116,20 @@ class Configuration(models.Model):
     )
     soa_ns = models.CharField(max_length=253, default="ns.example.tld")
     soa_mailbox = models.CharField(max_length=253, default="hostmaster.intranet.example.tld")
+    soa_refresh = models.PositiveIntegerField(
+        default=43200, validators=[MinValueValidator(1), MaxValueValidator(MAX_SERIAL)]
+    )
+    soa_retry = models.PositiveIntegerField(
+        default=180, validators=[MinValueValidator(1), MaxValueValidator(MAX_SERIAL)]
+    )
+    soa_expire = models.PositiveIntegerField(
+        default=1209600, validators=[MinValueValidator(1), MaxValueValidator(MAX_SERIAL)]
+    )
+    soa_minimum = models.PositiveIntegerField(
+        default=10800, validators=[MinValueValidator(0), MaxValueValidator(MAX_SERIAL)]
+    )
+    zone_ns = models.CharField(max_length=253, default="ns.example.tld")
+    dns_export_directory = models.CharField(max_length=4096, blank=True, default="")
     revision = models.PositiveBigIntegerField(
         default=1, validators=[MinValueValidator(1), MaxValueValidator(MAX_SERIAL)]
     )
@@ -145,11 +160,15 @@ class Configuration(models.Model):
 
     def clean_for_hosts(self, hosts):
         errors = {}
-        for field in ("lan_domain", "vpn_domain", "gandi_zone", "soa_ns", "soa_mailbox"):
+        for field in ("lan_domain", "vpn_domain", "gandi_zone", "soa_ns", "soa_mailbox", "zone_ns"):
             try:
                 setattr(self, field, normalize_domain(getattr(self, field)))
             except ValidationError as error:
                 errors[field] = error.messages
+        if self.dns_export_directory and (
+            "\x00" in self.dns_export_directory or not Path(self.dns_export_directory).is_absolute()
+        ):
+            errors["dns_export_directory"] = "Enter an absolute directory on the dnsgrid host."
         for field in ("lan_prefix", "vpn_prefix"):
             try:
                 setattr(self, field, normalize_prefix(getattr(self, field)))
