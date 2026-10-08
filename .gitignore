@@ -2,7 +2,25 @@ __pycache__/
 *.py[cod]
 *.sqlite3
 *.sqlite3-*
+*.sqlite
+*.sqlite-*
 .env
+.env.*
+!.env.example
+!.env.sample
 .venv/
 staticfiles/
 .coverage
+
+# Local operational data, not source or test fixtures.
+/backups/
+/exports/
+/dnsgrid-archive-v*.json
+/forward.zone
+/reverse-*.zone
+/dhcpd.conf
+/dhcpd-dsm.conf
+/vpn.hosts
+/gandi.json
+/dsm-reservations-site-*.json
+/dsm-request-site-*.form
