@@ -1,14 +1,68 @@
 dnsgrid
 =======
 
-A dedicated DNS inventory application: one global 16-row, 8-column grid,
-four geographic sites, and deterministic DNS/DHCP exports. Built with
-Python 3.12+ and Django, using SQLite without a separate frontend build.
+dnsgrid is built for my own infrastructure and reflects my grid, addressing
+conventions, and host-management workflows. You are welcome to study it,
+adapt it, or reuse parts of it under the GNU AGPL-3.0 license in ``LICENSE``.
+It is not a universal network-management product.
+
+The application has one global 16-row, 8-column grid, four geographic sites,
+deterministic DNS/DHCP exports, explicit Gandi synchronization, and a
+read-only VPN file report. Built with Python 3.12+ and Django, it uses SQLite
+without a separate frontend build. It models inventory and intended
+configuration, not network discovery or monitoring of connected clients.
+
+How I use it
+------------
+
+This is the workflow the application supports for my conventions, not a
+description of a particular live deployment. All hosts and domains below
+are fictitious examples.
+
+1. Configure the four sites in Settings. Their stable IDs are 1–4; each has
+   a distinct third IPv4 octet ``g`` (initially 1–4). The grid is shared
+   across sites, not four separate grids. Rows and columns are zero-based:
+   ``x = 16 * column + row``, with (0, 0) reserved and x from 1 to 127.
+   With the default prefixes, LAN addresses are ``192.168.g.x`` and VPN
+   addresses are ``172.28.g.x``. For example, fictitious ``demo-node`` at
+   row 2, column 3 in a site with g=1 has x=50, LAN ``192.168.1.50``,
+   and VPN ``172.28.1.50``.
+2. Enter hosts, their VPN membership, optional MACs, and public-export
+   flags. LAN DNS covers all inventory hosts; DHCP reservations require a
+   MAC. Status is descriptive and does not exclude hosts from exports.
+   Review and confirm changes, including any shifted hosts and addresses.
+3. Review Export previews and download the required artifacts for manual
+   validation and deployment. ``vpn.hosts`` supplies local aliases such
+   as ``172.28.1.50 demo-node.vpn`` for every VPN member. Public DNS is
+   separate: only VPN members with public export enabled produce Gandi
+   A records, using the configured VPN domain (for example
+   ``demo-node.vpn.example.tld``) and the computed VPN address. Public DNS
+   publication does not make these private addresses Internet-routable.
+   Neither that FQDN nor the bare name belongs in ``vpn.hosts``: local
+   aliases must not mask whether the public FQDN resolves through DNS.
+   Gandi changes require a separate preview and explicit confirmation.
+4. For Synology reservations, configure the site's DSM interface, download
+   its JSON, and manually copy it and ``synology/dsm_apply.py`` to the
+   target NAS. Preview there before explicitly applying the complete
+   interface reservation list. Only this standalone NAS-side operation
+   uses sudo; the web application does not apply DSM changes.
+5. On the VPN hub, run the web app as an unprivileged service account with
+   read access to ``/etc/hosts`` and ``/etc/openvpn/ccd`` (or the configured
+   paths). Use VPN report to compare ``name.vpn`` and CCD ``<name>`` files
+   against inventory, including orphans and unreadable sources. Correct
+   discrepancies manually; the report neither writes files nor checks
+   live clients or DNS. The ``vpn.hosts`` download remains available for
+   manual use; review and merge it without replacing unrelated hosts entries.
+
+The sections below describe confirmations, exports, and deployment details.
+Before any visibility change, review `PUBLICATION.rst <PUBLICATION.rst>`_:
+this preparation is not authorization to publish.
 
 Quick start
 -----------
 
-From the repository root::
+Run these commands from the repository root as an unprivileged user, not
+root (and do not use sudo for the web app)::
 
     python -m venv .venv
     . .venv/bin/activate
@@ -37,6 +91,18 @@ HTTPS redirects. Run ``python manage.py collectstatic`` and serve
 ``staticfiles/`` at ``/static/`` from that web server. A reverse proxy must
 preserve HTTPS information appropriately; do not trust client-supplied
 forwarded headers. Django's deployment checklist applies.
+
+If the owner later makes the repository public, the VPN hub can clone it
+over HTTPS without repository credentials::
+
+    git clone https://github.com/shining-fnml/dnsgrid.git
+    cd dnsgrid
+    git pull --ff-only
+
+Anonymous HTTPS clone/pull applies only after publication; while private,
+read access still requires authorization. Push always requires write
+authorization, even for a public repository. Public source code does not
+make the running application or its inventory public.
 
 Inventory and confirmations
 ---------------------------
