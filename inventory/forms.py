@@ -53,13 +53,19 @@ class ConfigurationForm(forms.Form):
     zone_ns = forms.CharField(max_length=253, label="Zone NS nameserver FQDN")
     soa_serial = forms.IntegerField(
         min_value=1, max_value=MAX_SERIAL, label="SOA serial",
-        help_text="May only increase. Seed above the existing DNS server serial; changes increment it automatically.",
+        help_text="UTC YYYYMMDDnn (00..99), upward only. DNS content changes advance it; previews and downloads do not.",
     )
     dns_export_directory = forms.CharField(
         max_length=4096, required=False, label="DNS export directory",
         help_text="Absolute existing directory on the dnsgrid host. Blank disables publication. Saving never writes files.",
     )
+    dns_nas_host = forms.CharField(max_length=253, required=False, label="DNS NAS hostname or IP")
+    dns_nas_user = forms.CharField(max_length=64, required=False, label="DNS NAS restricted SSH account")
+    dns_nas_port = forms.IntegerField(min_value=1, max_value=65535, required=False, initial=22, label="DNS NAS SSH port")
     revision = forms.IntegerField(widget=forms.HiddenInput)
+
+    def clean_dns_nas_port(self):
+        return self.cleaned_data["dns_nas_port"] or 22
 
     def __init__(self, *args, sites, **kwargs):
         super().__init__(*args, **kwargs)

@@ -164,17 +164,39 @@ Each site also has an optional DSM DHCP interface name (for example
 on its DSM server; leaving it blank disables that site's DSM API exports.
 The SOA mailbox is a DNS name such as ``hostmaster.example.tld``, not
 an email address. Defaults derive ``192.168.g.x`` and ``172.28.g.x``.
-The SOA serial automatically uses the persisted inventory revision.
-Settings' ``soa_serial`` field can seed that revision upward: choose a value
-exceeding an existing DSM zone serial before replacing its zone. It is not
-a separate fixed serial; subsequent inventory/settings changes advance it.
+The persisted SOA serial is separate from the optimistic inventory revision.
+All zones share a UTC ``YYYYMMDDnn`` serial, with a counter from 00 through 99.
+DNS-changing service mutations compare deterministic zone contents excluding
+the serial: host names/addresses, site subnets, domains, TTL, SOA and NS changes
+advance it, but descriptive metadata, VPN/Gandi-only settings and previews,
+downloads or unchanged republication do not. Today's ``YYYYMMDD00`` is used
+when larger; otherwise the previous date's counter advances. Clock rollback
+and future seeds never lower the date. Counter 99 rejects the entire mutation
+until UTC advances beyond that date; it never invents tomorrow's date.
+Settings' ``soa_serial`` allows an upward-only real-date uint32 seed above
+the installed DSM serial, for example ``2026100802``.
+
+Migration preserves the larger of today's base serial and the old revision.
+Legacy archives without a serial follow the same rule; restore never lowers
+the destination serial. Higher incompatible/non-date legacy values are retained
+by migration but block DNS mutations/publication with explicit guidance.
+Do not fake a date or lower them: an administrator must coordinate a DNS serial
+reset with authoritative/secondary servers before migrating those deployments.
+Back up first; this is not automated by the web app. Archives now include
+``soa_serial`` in JSON v1; older archive shapes remain accepted. Restore may
+advance the serial when DNS content differs, independently of its revision.
 
 ``dns_export_directory`` is an optional absolute path to an existing directory
 on the dnsgrid host. Blank disables directory publishing. Give the application
 account write permission only to the selected directory; the web app needs no
-root access or SSH integration. Restrict target directory access to intended
+root access. Restrict target directory access to intended
 application/transfer accounts. This host-specific path is excluded from
 application-data archives and preserved on restore.
+Optional ``dns_nas_host``, ``dns_nas_user`` and ``dns_nas_port`` enable restricted
+SSH notification. Leave host/user blank for plain local publication. These
+host-local destination settings are also excluded from archives and preserved
+on restore. Private-key and known-hosts paths are deployment environment only,
+never database fields or UI-selected commands.
 
 Configure a real authoritative nameserver before deploying zones.
 The default ``ns.example.tld`` is an illustrative out-of-zone name.
@@ -253,10 +275,140 @@ preserving an existing group is unauthorized, a per-file error is reported and
 the original file stays unchanged; no root access is needed.
 The entire set is **not atomic**: per-file errors are reported, and some zones
 may already have been replaced when another fails. Review errors and retry
-after correcting permissions or other failures. User testing observed DSM
+after correcting permissions or other failures. Any partial failure suppresses
+NAS notification and does not commit a new generation manifest. User testing observed DSM
 automatically reloading deposited zones; this is not a universal guarantee.
 Verify loading on your installation and reload through your normal operator
 workflow if necessary.
+
+Immutable generations and optional NAS update
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Successful local publication also writes copies under
+``generations/dnsgrid-<serial>/``, then commits ``manifest.json`` atomically
+**last**, after every mutable zone file and immutable generation file succeeds.
+The manifest contains version 1, generation, serial, UTC publication time and
+zone name/filename/byte-size/SHA-256 entries. The generation identifier is
+exactly ``dnsgrid-`` plus the ten-digit date serial. Limits are 256 zones,
+4 MiB per zone and 128 KiB per manifest. The root ``manifest.json`` is a latest
+copy for inspection only; the NAS always fetches the exact notified generation.
+``manifest.json`` is a reserved filename and cannot be a managed zone name.
+Same-serial files must be byte-identical; collisions require an upward seed.
+Republishing unchanged content retains the original generation/time.
+Use a real, symlink-free export path on a local filesystem that supports hard
+links, atomic rename and fsync. Restrict writes to one dnsgrid installation.
+
+Ten identified, committed application-owned generations are retained.
+Pruning never traverses symlinks or removes unidentified directories/files,
+the current generation, or ``.pin``-marked pending/unconfirmed updates.
+Inventory's singleton write lock covers publication, pruning and durable pin
+creation. SSH runs outside the database transaction under a separate filesystem
+notification lock; pins prevent pruning while it runs. A simultaneous notifier
+returns a retry-required result rather than mixing requests or blocking inventory.
+Timeout/failed updates retain their pins because the remote process may
+still be running. A successful exact-generation retry removes its pin.
+Pinned generations can fill retention and block new generation commits;
+resolve them before continuing. Older pending generations have retry controls.
+Do not blindly remove pins: if a newer serial is already installed, stop and
+reconcile the old request with the NAS administrator first. Incomplete or
+unidentified crash remnants are not pruned automatically; an administrator
+must inspect them before removal. No other hub files are deleted.
+
+With a configured NAS, the action becomes **Publish zones and update NAS**.
+Local success and NAS confirmation/failure/unconfirmed transport are reported
+separately. SSH uses a fixed ``dnsgrid-update GENERATION SERIAL`` request, never
+a UI-configurable command or shell invocation. It uses BatchMode, strict host
+checking, one connection attempt, a five-second connect timeout and a
+120-second overall timeout. Remote stdout/stderr are discarded rather than
+displaying potentially sensitive or hostile output. Diagnose failures locally
+on the NAS. Exit 0 confirms files installed, **not zones loaded**.
+Timeout/transport interruption may occur after installation: **Retry NAS
+update** reuses a committed immutable generation, without generating new
+bytes or advancing the serial. Retry is authenticated, operator-only,
+CSRF-protected and bound to the current inventory revision. Saving hosts,
+Settings or archives never invokes SSH. Slow network updates do not hold the
+inventory database lock.
+
+Administrator provisioning (not automated)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+1. Provision a dedicated dnsgrid-to-NAS key and a dedicated non-root NAS
+   update account. Put its private key outside the repository/database with
+   service-account-only permissions. Set ``DNSGRID_DNS_SSH_IDENTITY_FILE``
+   and ``DNSGRID_DNS_SSH_KNOWN_HOSTS`` to absolute paths for the web service.
+   Verify NAS/hub host-key fingerprints out of band before adding them to
+   known_hosts; ``ssh-keyscan`` alone does not authenticate a host. Include
+   ``[hostname]:port`` entries for nonstandard ports. Never disable checking.
+2. Copy ``synology/dns_pull.py`` alone to an administrator-owned path on the
+   NAS; no Django installation is required. Provision Python 3 and BIND's
+   ``named-checkzone`` executable. Protect the script, configuration, their
+   parent directories and authorized_keys from the update account's writes.
+   Use a forced key entry like this (replace the public key locally)::
+
+       restrict,command="/usr/bin/python3 -I -S /usr/local/libexec/dns_pull.py --forced-command --config /etc/dnsgrid-dns-pull.ini" ssh-ed25519 PUBLIC_KEY_PLACEHOLDER dnsgrid-notify
+
+   Verify ``restrict`` support on your DSM OpenSSH version. If unavailable,
+   use explicit ``no-agent-forwarding,no-port-forwarding,no-X11-forwarding,
+   no-pty,no-user-rc`` restrictions and verify the equivalent policy.
+   The script validates ``SSH_ORIGINAL_COMMAND`` exactly; no shell,
+   interactive session, arbitrary arguments or forwarding is authorized.
+   Do not allow other unrestricted keys/password login for this account.
+3. Independently provision a **NAS-to-hub read-only** transfer key/account.
+   Prefer an administrator-configured restricted SFTP service/chroot exposing
+   only export generations, with read-only filesystem permissions or mount.
+   A forced-command key by itself does **not** make filesystem access read-only.
+   Configure sshd and filesystem permissions to enforce both scope and no
+   writes; modern scp uses the SFTP subsystem. Do not enable legacy scp mode.
+   The source directory below is the path visible inside that account's chroot,
+   not necessarily the hub's real filesystem path.
+4. Create a root- or execution-account-owned INI file, not a symlink and not
+   group/world writable, with fixed administrator-chosen paths, for example::
+
+       [dns_pull]
+       source_host = hub.example.test
+       source_user = dns-read
+       source_port = 22
+       source_directory = /dns-exports
+       identity_file = /var/lib/dnsgrid-pull/id_ed25519
+       known_hosts = /var/lib/dnsgrid-pull/known_hosts
+       destination_directory = /volume1/@appstore/DNSServer/named/etc/zone/master
+       backup_directory = /var/lib/dnsgrid-pull/backups
+       named_checkzone = /usr/bin/named-checkzone
+
+   Keep identity files private and known_hosts administrator-managed. Paths
+   must be absolute, without symlink escapes; the source uses a deliberately
+   restricted path alphabet. Create destination and private backup directories
+   with appropriate permissions. Give the NAS account write access only to
+   dnsgrid-owned target zones and its backup/state area. If DSM ownership
+   requires privilege, use an administrator-managed narrowly scoped service
+   boundary with this fixed config/script, **not** arbitrary sudo or SSH root.
+   The web application remains unprivileged. It cannot supply destination
+   paths, validator commands, source credentials or privilege parameters.
+
+Before enabling notification, review ``--help`` and manually exercise::
+
+    python3 -I -S /usr/local/libexec/dns_pull.py --config /etc/dnsgrid-dns-pull.ini --dry-run dnsgrid-2026100802 2026100802
+
+Dry run fetches and validates but installs nothing. The utility takes an
+exclusive lock, downloads only the exact generation into private staging,
+validates manifest schema/names/sizes/checksums and uses ``named-checkzone``
+for **every** zone before changing the master directory. Missing/failing
+validation, mismatched serials or a serial below installed files/state
+installs nothing. Equal serials are accepted only for identical contents;
+idempotent success verifies the actual installed files, not just saved state.
+Protect and retain its installation state; it is written atomically.
+
+Before installation it backs up every target and its metadata into a private
+backup set. New destination inodes retain existing permissions/ownership where
+authorized and replace files atomically one at a time. The whole set is not
+atomic; if any replacement/state write fails, it attempts to restore previous
+targets and removes only new files without predecessors. Rollback failures
+are reported explicitly and require administrator recovery from backups.
+It never deletes unrelated zones and never restarts DSM. Backups are not
+automatically pruned: provision disk space and manage their retention locally.
+Neither mocked tests nor a successful SSH return proves DSM loaded zones;
+verify your actual deployment. Automatic reload remains a user observation
+only, not a guaranteed behavior or a restart command implemented here.
 
 These are dedicated application-owned artifacts. Assign dnsgrid exclusive
 ownership of its LAN forward zone and site reverse zones; do not replace

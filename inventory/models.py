@@ -6,6 +6,8 @@ from django.core.validators import MaxLengthValidator, MaxValueValidator, MinVal
 from django.db import connections, models, router, transaction
 from django.db.models import F, Q
 
+from .dns_serial import initial_serial
+
 
 MAX_SERIAL = 2**32 - 1
 MAX_PORTABLE_ID = 2**53 - 1
@@ -130,6 +132,16 @@ class Configuration(models.Model):
     )
     zone_ns = models.CharField(max_length=253, default="ns.example.tld")
     dns_export_directory = models.CharField(max_length=4096, blank=True, default="")
+    soa_serial = models.PositiveBigIntegerField(
+        default=initial_serial, validators=[MinValueValidator(1), MaxValueValidator(MAX_SERIAL)]
+    )
+    dns_content_hash = models.CharField(max_length=64, blank=True, default="", editable=False)
+    dns_nas_host = models.CharField(max_length=253, blank=True, default="")
+    dns_nas_user = models.CharField(max_length=64, blank=True, default="")
+    dns_nas_port = models.PositiveIntegerField(
+        default=22, validators=[MinValueValidator(1), MaxValueValidator(65535)]
+    )
+    dns_published_generation = models.CharField(max_length=32, blank=True, default="", editable=False)
     revision = models.PositiveBigIntegerField(
         default=1, validators=[MinValueValidator(1), MaxValueValidator(MAX_SERIAL)]
     )
@@ -145,15 +157,15 @@ class Configuration(models.Model):
                 condition=Q(ttl__gte=1, ttl__lte=MAX_SERIAL),
                 name="configuration_ttl_bounds",
             ),
+            models.CheckConstraint(
+                condition=Q(soa_serial__gte=1, soa_serial__lte=MAX_SERIAL),
+                name="configuration_dns_serial_bounds",
+            ),
         ]
 
     @classmethod
     def load(cls):
         return cls.objects.get_or_create(pk=1)[0]
-
-    @property
-    def soa_serial(self):
-        return self.revision
 
     def clean(self):
         self.clean_for_hosts(Host.objects.all())
@@ -169,6 +181,11 @@ class Configuration(models.Model):
             "\x00" in self.dns_export_directory or not Path(self.dns_export_directory).is_absolute()
         ):
             errors["dns_export_directory"] = "Enter an absolute directory on the dnsgrid host."
+        from .dns_notify import validate_destination
+        try:
+            validate_destination(self.dns_nas_host, self.dns_nas_user, self.dns_nas_port)
+        except ValidationError as error:
+            errors["dns_nas_host"] = error.messages
         for field in ("lan_prefix", "vpn_prefix"):
             try:
                 setattr(self, field, normalize_prefix(getattr(self, field)))

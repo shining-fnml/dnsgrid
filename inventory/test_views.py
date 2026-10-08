@@ -322,7 +322,8 @@ class OperatorViewsTests(TestCase):
         config = Configuration.load()
         self.assertEqual(config.dns_export_directory, "/tmp/dnsgrid-export")
         self.assertEqual(config.zone_ns, "dns.example.test")
-        self.assertEqual(config.revision, 2026100803)
+        self.assertEqual(config.revision, 2)
+        self.assertEqual(config.soa_serial, 2026100803)
         self.assertEqual((config.soa_refresh, config.soa_retry, config.soa_expire, config.soa_minimum),
                          (43201, 181, 1209601, 10801))
         for updates in ({"soa_retry": 0}, {"soa_minimum": -1}, {"zone_ns": "bad name"},

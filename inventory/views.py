@@ -12,7 +12,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.cache import never_cache
 from django.views.decorators.http import require_GET, require_POST
 
-from .exporters import build_exports, publish_dns_zones
+from .exporters import build_exports
 from .forms import ArchiveUploadForm, ConfigurationForm, HostForm, HostMoveForm
 from .models import Configuration, Host, Site
 from .services import (
@@ -28,6 +28,7 @@ CONFIG_FIELDS = (
     "lan_domain", "vpn_domain", "lan_prefix", "vpn_prefix", "gandi_zone",
     "ttl", "soa_ns", "soa_mailbox",
     "soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns", "dns_export_directory",
+    "dns_nas_host", "dns_nas_user", "dns_nas_port",
 )
 
 
@@ -196,7 +197,7 @@ def configuration(request):
     sites = list(Site.objects.order_by("id"))
     initial = {key: getattr(config, key) for key in CONFIG_FIELDS}
     initial["revision"] = config.revision
-    initial["soa_serial"] = config.revision
+    initial["soa_serial"] = config.soa_serial
     form = ConfigurationForm(request.POST or None, initial=initial, sites=sites)
     if request.method == "POST" and form.is_valid():
         data = form.cleaned_data
@@ -217,7 +218,9 @@ def configuration(request):
         try:
             if data["revision"] != config.revision:
                 raise ValidationError("Inventory changed. Reload this form before previewing.")
-            if data["soa_serial"] < config.revision:
+            from .dns_serial import validate_serial
+            validate_serial(data["soa_serial"])
+            if data["soa_serial"] < config.soa_serial:
                 raise ValidationError("SOA serial must not decrease.")
             candidate.full_clean()
             if len({site["g"] for site in site_data}) != 4:
@@ -227,8 +230,8 @@ def configuration(request):
             changes = [{
                 "label": key, "before": getattr(config, key), "after": getattr(candidate, key),
             } for key in CONFIG_FIELDS if getattr(config, key) != getattr(candidate, key)]
-            if data["soa_serial"] != config.revision:
-                changes.append({"label": "SOA serial", "before": config.revision, "after": data["soa_serial"]})
+            if data["soa_serial"] != config.soa_serial:
+                changes.append({"label": "SOA serial", "before": config.soa_serial, "after": data["soa_serial"]})
             if config.gandi_token != candidate.gandi_token:
                 changes.append({"label": "Gandi token", "before": "Hidden", "after": "Set" if candidate.gandi_token else "Removed"})
             for site, new in zip(sites, site_data):
@@ -346,9 +349,13 @@ def archive_upload(request):
                 candidate = loads(upload.read(MAX_BYTES + 1))
                 next_revision = max(revision, candidate["configuration"]["revision"]) + 1
                 if next_revision > MAX_SERIAL:
-                    raise ValidationError("Restoring would exceed the maximum SOA serial.")
+                    raise ValidationError("Restoring would exceed the maximum inventory revision.")
                 changes = diff(current, candidate)
-                changes.append({"label": "Resulting SOA serial", "before": revision, "after": next_revision})
+                changes.append({"label": "Resulting inventory revision", "before": revision, "after": next_revision})
+                changes.append({
+                    "label": "Resulting SOA serial", "before": current["configuration"]["soa_serial"],
+                    "after": "Never lowered; advanced only if DNS content changes, or an upward seed is restored.",
+                })
                 payload = {"data": candidate, "target_fingerprint": fingerprint(current)}
                 return _pending(request, "archive", payload, revision, changes,
                                 "Confirm application-data replacement", archive=True, warnings=WARNINGS)
@@ -362,6 +369,7 @@ def archive_upload(request):
 
 @operator
 def exports(request):
+    from .dns_publication import pending_generations
     with transaction.atomic():
         Configuration.objects.filter(pk=1).update(revision=F("revision"))
         config = Configuration.load()
@@ -369,21 +377,50 @@ def exports(request):
     return render(request, "inventory/exports.html", {
         "artifacts": artifacts, "revision": config.revision,
         "dns_export_directory": config.dns_export_directory,
+        "dns_nas_enabled": bool(config.dns_nas_host),
+        "dns_published_generation": config.dns_published_generation,
+        "soa_serial": config.soa_serial,
+        "dns_pending_generations": pending_generations(config.dns_export_directory) if config.dns_export_directory else [],
     })
 
 
 @operator
 @require_POST
 def dns_publish(request):
+    from .dns_publication import publish_and_notify
     try:
-        written, errors = publish_dns_zones(request.POST.get("revision"))
-    except (ValidationError, IntegrityError, OperationalError) as error:
+        written, errors, status, summary = publish_and_notify(request.POST.get("revision"))
+    except (ValidationError, OSError, IntegrityError, OperationalError) as error:
         messages.error(request, _errors(error))
     else:
         if written:
             messages.success(request, "DNS zone files written: " + ", ".join(written))
         for filename, error in errors:
             messages.error(request, f"DNS zone write failed for {filename}: {error}")
+        if summary:
+            if status in ("failure", "unconfirmed"):
+                messages.warning(request, summary)
+            elif status == "success":
+                messages.success(request, summary)
+    return redirect("exports")
+
+
+@operator
+@require_POST
+def dns_retry(request):
+    from .dns_publication import retry_nas_update
+    try:
+        revision = request.POST.get("revision", "")
+        if not revision.isascii() or not revision.isdecimal() or len(revision) > 10:
+            raise ValidationError("Reload export previews before retrying.")
+        status, summary = retry_nas_update(int(revision), request.POST.get("generation"))
+    except (ValidationError, OSError, IntegrityError, OperationalError) as error:
+        messages.error(request, _errors(error))
+    else:
+        if status == "success":
+            messages.success(request, summary)
+        else:
+            messages.warning(request, summary)
     return redirect("exports")
 
 
