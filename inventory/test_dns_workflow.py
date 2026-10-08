@@ -77,7 +77,7 @@ class DNSWorkflowTests(TestCase):
             self.assertIn(option, argv)
         self.assertIn("/etc/dnsgrid/id_ed25519", argv)
         self.assertIn("2222", argv)
-        self.assertNotIn("shell", kwargs)
+        self.assertFalse(kwargs["shell"])
         self.assertEqual(kwargs["timeout"], 120)
         self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
         self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)

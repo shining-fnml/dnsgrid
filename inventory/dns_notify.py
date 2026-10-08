@@ -47,6 +47,9 @@ def notify_nas(config, generation, serial):
     known_hosts = settings.DNSGRID_DNS_SSH_KNOWN_HOSTS
     if any(not path or "\x00" in path or not Path(path).is_absolute() for path in (identity, known_hosts)):
         return "failure", "Local publication succeeded; provision absolute SSH identity and known_hosts paths before retrying."
+    # Serialize the fixed request from its validated number, not the POST identifier.
+    serial = int(serial)
+    request = f"dnsgrid-update dnsgrid-{serial} {serial}"
     arguments = [
         "/usr/bin/ssh", "-F", "/dev/null", "-T", "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=yes", "-o", "IdentitiesOnly=yes",
@@ -56,14 +59,14 @@ def notify_nas(config, generation, serial):
         "-o", "ConnectTimeout=5", "-o", "ConnectionAttempts=1",
         "-o", f"UserKnownHostsFile={known_hosts}", "-i", identity,
         "-p", str(config.dns_nas_port), "-l", config.dns_nas_user,
-        "--", config.dns_nas_host, f"dnsgrid-update {generation} {serial}",
+        "--", config.dns_nas_host, request,
     ]
     try:
         # Discard, rather than capture, untrusted output: bounded memory and no
         # private paths, credentials, terminal escapes or markup in UI/logs.
         result = subprocess.run(
             arguments, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, timeout=120, check=False,
+            stderr=subprocess.DEVNULL, timeout=120, check=False, shell=False,
         )
     except subprocess.TimeoutExpired:
         return "unconfirmed", "Local publication succeeded; NAS update timed out and may have occurred. Retry this generation."
