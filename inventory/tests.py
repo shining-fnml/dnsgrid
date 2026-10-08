@@ -39,7 +39,8 @@ class ModelTests(InventoryTestCase):
     def test_seed_and_singleton_defaults(self):
         self.assertEqual(self.config.pk, 1)
         self.assertEqual(self.config.revision, 1)
-        self.assertEqual(self.config.soa_serial, 1)
+        from .dns_serial import initial_serial
+        self.assertEqual(self.config.soa_serial, initial_serial())
         self.assertEqual(self.config.soa_ns, "ns.example.tld")
         self.assertEqual(
             list(Site.objects.values_list("id", "name", "g")),

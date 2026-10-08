@@ -5,6 +5,15 @@ from django.db import IntegrityError, transaction
 from django.db.models import F
 
 from .models import MAX_SERIAL, Configuration, Host, Site
+from .dns_serial import content_fingerprint, track_dns_content, validate_serial
+
+
+def _dns_baseline():
+    config = Configuration.load()
+    if not config.dns_content_hash:
+        config.dns_content_hash = content_fingerprint(config)
+        config.save(update_fields=["dns_content_hash"])
+    return config
 
 
 def _validate_position(row, column):
@@ -43,7 +52,7 @@ def _claim_revision(expected_revision, changed=True):
     if type(expected_revision) is not int or not 1 <= expected_revision <= MAX_SERIAL:
         raise ValidationError("Invalid or stale configuration revision.")
     if changed and expected_revision == MAX_SERIAL:
-        raise ValidationError("The SOA serial has reached its maximum value.")
+        raise ValidationError("The inventory revision has reached its maximum value.")
     updated = Configuration.objects.filter(pk=1, revision=expected_revision).update(
         revision=F("revision") + 1 if changed else F("revision")
     )
@@ -65,6 +74,7 @@ def save_host(host, expected_revision):
         with transaction.atomic():
             # Claim the singleton with a conditional UPDATE, not SQLite's ineffective row lock.
             _claim_revision(expected_revision, changed=False)
+            _dns_baseline()
             host.full_clean(validate_constraints=False)
             existing = Host.objects.filter(pk=host.pk).first() if host.pk else None
             if host.pk and existing is None:
@@ -83,6 +93,7 @@ def save_host(host, expected_revision):
             host.save(force_insert=existing is None or (
                 existing.row, existing.column
             ) != (host.row, host.column))
+            track_dns_content(Configuration.load())
             return host
     except IntegrityError as error:
         host.pk = original_pk
@@ -92,12 +103,14 @@ def save_host(host, expected_revision):
 def delete_host(host_id, expected_revision):
     with transaction.atomic():
         _claim_revision(expected_revision, changed=False)
+        _dns_baseline()
         try:
             host = Host.objects.get(pk=host_id)
         except Host.DoesNotExist as error:
             raise ValidationError("This host no longer exists.") from error
         _claim_revision(expected_revision)
         host.delete()
+        track_dns_content(Configuration.load())
 
 
 def _plan_host_move(host_id, direction):
@@ -128,9 +141,11 @@ def move_host(host_id, direction, expected_revision):
     try:
         with transaction.atomic():
             _claim_revision(expected_revision, changed=False)
+            _dns_baseline()
             _, candidate = _plan_host_move(host_id, direction)
             _claim_revision(expected_revision)
             candidate.save(update_fields=["row", "column"])
+            track_dns_content(Configuration.load())
             return candidate
     except IntegrityError as error:
         raise ValidationError("The destination conflicts with another inventory entry.") from error
@@ -140,6 +155,7 @@ CONFIG_FIELDS = (
     "lan_domain", "vpn_domain", "lan_prefix", "vpn_prefix", "gandi_zone",
     "gandi_token", "ttl", "soa_ns", "soa_mailbox",
     "soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns", "dns_export_directory",
+    "dns_nas_host", "dns_nas_user", "dns_nas_port",
 )
 
 
@@ -153,14 +169,17 @@ def update_settings(config_data, site_data, expected_revision):
     try:
         with transaction.atomic():
             _claim_revision(expected_revision, changed=False)
-            current = Configuration.load()
+            current = _dns_baseline()
             if set(config_data) - set(CONFIG_FIELDS) - {"soa_serial"}:
                 raise ValidationError("Unknown configuration field.")
-            serial = config_data.get("soa_serial", current.revision)
-            if type(serial) is not int or not current.revision <= serial <= MAX_SERIAL:
+            serial = config_data.get("soa_serial", current.soa_serial)
+            validate_serial(serial)
+            if serial < current.soa_serial:
                 raise ValidationError("SOA serial must not decrease and must fit an unsigned 32-bit integer.")
             candidate = Configuration(
-                pk=1, revision=current.revision,
+                pk=1, revision=current.revision, soa_serial=serial,
+                dns_content_hash=current.dns_content_hash,
+                dns_published_generation=current.dns_published_generation,
                 **{field: config_data.get(field, getattr(current, field)) for field in CONFIG_FIELDS},
             )
             candidate.full_clean(validate_unique=False)
@@ -184,7 +203,7 @@ def update_settings(config_data, site_data, expected_revision):
                 raise ValidationError("Site names must be unique.")
             if len({site.g for site in sites}) != 4:
                 raise ValidationError("Site octets must be unique.")
-            changed = serial != current.revision or any(
+            changed = serial != current.soa_serial or any(
                 getattr(candidate, field) != getattr(current, field) for field in CONFIG_FIELDS
             ) or any(
                 (site.name, site.g, site.dsm_ifname) != (
@@ -194,10 +213,11 @@ def update_settings(config_data, site_data, expected_revision):
             )
             if changed:
                 _claim_revision(expected_revision)
-                candidate.revision = max(expected_revision + 1, serial)
-                candidate.save(force_update=True, update_fields=(*CONFIG_FIELDS, "revision"))
+                candidate.revision = expected_revision + 1
+                candidate.save(force_update=True, update_fields=(*CONFIG_FIELDS, "revision", "soa_serial"))
                 for site in sites:
                     site.save(update_fields=["name", "g", "dsm_ifname"])
+                track_dns_content(candidate, seeded=serial > current.soa_serial)
             return candidate
     except IntegrityError as error:
         raise ValidationError("The settings conflict with existing inventory data.") from error

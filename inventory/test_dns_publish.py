@@ -53,7 +53,7 @@ class DNSPublicationTests(TestCase):
             self.assertEqual(stat.S_IMODE((self.path / filename).stat().st_mode), 0o644)
             self.assertContains(response, filename)
         self.assertEqual(unrelated.read_text(), "unrelated")
-        self.assertEqual(len(list(self.path.iterdir())), 6)
+        self.assertEqual(len(list(self.path.iterdir())), 8)
         revision = Configuration.load().revision
         self.publish()
         self.assertEqual(Configuration.load().revision, revision)
@@ -170,17 +170,19 @@ class DNSPublicationTests(TestCase):
 
     def test_serial_can_be_seeded_upward_and_downloads_do_not_increment(self):
         updated = update_settings({"soa_serial": 2026100803}, self.sites(), self.config.revision)
-        self.assertEqual(updated.revision, 2026100803)
+        self.assertEqual(updated.revision, self.config.revision + 1)
+        self.assertEqual(updated.soa_serial, 2026100803)
         self.assertIn("        2026100803\n", build_exports()["forward.zone"])
         self.assertEqual(build_exports(), build_exports())
         self.assertEqual(Configuration.load().revision, updated.revision)
-        same = update_settings({"soa_serial": updated.revision}, self.sites(), updated.revision)
+        same = update_settings({"soa_serial": updated.soa_serial}, self.sites(), updated.revision)
         self.assertEqual(same.revision, updated.revision)
-        for serial in (updated.revision - 1, MAX_SERIAL + 1, True):
+        for serial in (updated.soa_serial - 1, MAX_SERIAL + 1, True):
             with self.assertRaises(ValidationError):
                 update_settings({"soa_serial": serial}, self.sites(), updated.revision)
         save_host(Host(name="alpha", site_id=1, row=1, column=0), updated.revision)
         self.assertEqual(Configuration.load().revision, updated.revision + 1)
+        self.assertEqual(Configuration.load().soa_serial, updated.soa_serial + 1)
 
     def test_archive_soa_round_trip_legacy_defaults_and_local_directory_preserved(self):
         updated = update_settings({

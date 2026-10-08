@@ -74,6 +74,7 @@ class ExportTests(TestCase):
         self.config.gandi_zone = "other.test"
         self.config.ttl = 600
         self.config.revision = 42
+        self.config.soa_serial = 2026100802
         self.config.soa_ns = "ns.lan.other.test"
         self.config.soa_mailbox = "admin.lan.other.test"
         self.config.zone_ns = "dns.other.test"
@@ -84,7 +85,7 @@ class ExportTests(TestCase):
         output = build_exports(self.config, [self.host])
         self.assertIn("alpha.lan.other.test. 600 A 10.24.4.50", output["forward.zone"])
         self.assertIn("lan.other.test. IN SOA ns.lan.other.test. admin.lan.other.test. (\n"
-                      "        42\n        123\n        45\n        6789\n        60\n)", output["forward.zone"])
+                      "        2026100802\n        123\n        45\n        6789\n        60\n)", output["forward.zone"])
         self.assertIn("$TTL 600", output["forward.zone"])
         self.assertIn("$ORIGIN 4.24.10.in-addr.arpa.", output["reverse-4.zone"])
         self.assertIn("50.4.24.10.in-addr.arpa. 600 PTR alpha.lan.other.test.", output["reverse-4.zone"])

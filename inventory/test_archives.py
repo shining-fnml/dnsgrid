@@ -203,6 +203,8 @@ class ArchiveDataTests(TestCase):
         restore(roundtrip, expected_revision=2)
         restored = snapshot()
         restored["configuration"]["revision"] = roundtrip["configuration"]["revision"]
+        self.assertEqual(restored["configuration"]["soa_serial"], roundtrip["configuration"]["soa_serial"] + 1)
+        restored["configuration"]["soa_serial"] = roundtrip["configuration"]["soa_serial"]
         self.assertEqual(restored, roundtrip)
 
     def test_deleting_high_restored_rows_does_not_break_later_portable_allocation(self):
@@ -345,6 +347,8 @@ class ArchiveDataTests(TestCase):
         self.assertEqual(result, 41)
         after = snapshot()
         after["configuration"]["revision"] = self.data["configuration"]["revision"]
+        self.assertEqual(after["configuration"]["soa_serial"], self.data["configuration"]["soa_serial"] + 1)
+        after["configuration"]["soa_serial"] = self.data["configuration"]["soa_serial"]
         self.assertEqual(after, self.data)
         user.refresh_from_db()
         self.assertEqual(user.password, original_password)
@@ -355,7 +359,10 @@ class ArchiveDataTests(TestCase):
             if name != "forward.zone" and not name.startswith("reverse-"):
                 self.assertEqual(build_exports()[name], artifact)
             else:
-                self.assertEqual(build_exports()[name].replace("\n        41\n", "\n        1\n"), artifact)
+                self.assertEqual(build_exports()[name].replace(
+                    f"\n        {Configuration.load().soa_serial}\n",
+                    f"\n        {self.data['configuration']['soa_serial']}\n",
+                ), artifact)
 
     def test_restore_uses_larger_destination_revision(self):
         Configuration.objects.filter(pk=1).update(revision=50)

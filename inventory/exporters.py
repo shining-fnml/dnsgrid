@@ -12,6 +12,7 @@ from django.db.models import F
 
 from .dsm import reservation_payload
 from .models import Configuration, Host, Site
+from .dns_serial import track_dns_content
 
 
 @transaction.atomic
@@ -34,7 +35,7 @@ def _header(config, origin):
         f"$ORIGIN {origin}.",
         f"$TTL {config.ttl}",
         f"{origin}. IN SOA {config.soa_ns}. {config.soa_mailbox}. (",
-        f"        {config.revision}",
+        f"        {config.soa_serial}",
         f"        {config.soa_refresh}",
         f"        {config.soa_retry}",
         f"        {config.soa_expire}",
@@ -77,15 +78,18 @@ def publish_dns_zones(expected_revision):
         raise ValidationError("Configure a DNS export directory in Settings before publishing.")
     if not Path(directory).is_absolute() or "\x00" in directory:
         raise ValidationError("The DNS export directory must be an absolute local path.")
+    track_dns_content(config)
     zones = _dns_zones(config, hosts)
     filenames = [filename for filename, _ in zones.values()]
     if len(filenames) != len(set(filenames)):
         raise ValidationError("Forward and reverse zones must have distinct publication filenames.")
     if any(
-        Path(filename).name != filename or filename in (".", "..") or "\x00" in filename
+        Path(filename).name != filename or filename in (".", "..", "manifest.json") or "\x00" in filename
         for filename in filenames
     ):
         raise ValidationError("Invalid DNS zone filename.")
+    from .dns_publication import preflight_generation
+    preflight_generation(config, zones)
     written, errors = [], []
     for filename, content in zones.values():
         temporary = None
@@ -121,6 +125,12 @@ def publish_dns_zones(expected_revision):
                     pass
                 except OSError as error:
                     errors.append((filename, f"Could not remove temporary file: {error}"))
+    if not errors:
+        from .dns_publication import commit_generation
+        try:
+            commit_generation(config, zones)
+        except (OSError, ValidationError) as error:
+            errors.append(("generation manifest", str(error)))
     return written, errors
 
 

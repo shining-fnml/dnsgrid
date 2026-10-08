@@ -9,6 +9,7 @@ from django.db import transaction
 
 from .models import MAX_PORTABLE_ID, MAX_SERIAL, Configuration, GandiRecord, Host, Site
 from .services import _claim_revision
+from .dns_serial import initial_serial, track_dns_content, validate_serial
 
 FORMAT = "dnsgrid.application-data"
 SCHEMA_VERSION = 1
@@ -19,6 +20,7 @@ CONFIG_FIELDS = (
     "id", "lan_domain", "vpn_domain", "lan_prefix", "vpn_prefix", "gandi_zone",
     "ttl", "soa_ns", "soa_mailbox", "revision",
     "soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns",
+    "soa_serial",
 )
 HOST_FIELDS = (
     "id", "name", "site_id", "row", "column", "category", "status",
@@ -116,8 +118,11 @@ def validate(data):
         if type(data[field]) is not list or len(data[field]) > limit:
             _fail(f"Invalid or excessive {field} count.")
     raw_config = data["configuration"]
-    new_fields = ("soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns")
-    if type(raw_config) is dict and set(raw_config) == set(CONFIG_FIELDS) - set(new_fields):
+    new_fields = ("soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns", "soa_serial")
+    if type(raw_config) is dict and set(raw_config) in (
+        set(CONFIG_FIELDS) - set(new_fields),
+        set(CONFIG_FIELDS) - (set(new_fields) - {"soa_serial"}),
+    ):
         defaults = Configuration()
         raw_config = {
             **raw_config,
@@ -126,9 +131,16 @@ def validate(data):
             "soa_refresh": 3600,
             "soa_retry": 900,
             "soa_minimum": min(raw_config["ttl"], 300) if type(raw_config["ttl"]) is int else 300,
+            "soa_serial": raw_config.get("soa_serial", max(initial_serial(), raw_config["revision"])
+                                        if type(raw_config["revision"]) is int else 0),
         }
+    if type(raw_config) is dict and set(raw_config) == set(CONFIG_FIELDS) - {"soa_serial"}:
+        raw_config = {**raw_config, "soa_serial": max(initial_serial(), raw_config["revision"])
+                      if type(raw_config["revision"]) is int else 0}
+    if type(raw_config) is dict and "soa_serial" in raw_config:
+        validate_serial(raw_config["soa_serial"])
     _object(raw_config, CONFIG_FIELDS, integer=(
-        "id", "revision", "ttl", "soa_refresh", "soa_retry", "soa_expire", "soa_minimum",
+        "id", "revision", "ttl", "soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "soa_serial",
     ))
     if data["configuration"]["id"] != 1:
         _fail("Configuration must have ID 1.")
@@ -245,12 +257,16 @@ def restore(data, expected_revision, expected_fingerprint=None):
     data = validate(data)
     next_revision = max(expected_revision, data["configuration"]["revision"]) + 1
     if next_revision > MAX_SERIAL:
-        _fail("Restoring would exceed the maximum SOA serial.")
+        _fail("Restoring would exceed the maximum inventory revision.")
     _claim_revision(expected_revision, changed=False)
     if expected_fingerprint is not None and fingerprint(snapshot()) != expected_fingerprint:
         _fail("Target data or ownership changed. Generate a fresh archive preview.")
     _claim_revision(expected_revision)
     current = Configuration.objects.get(pk=1)
+    from .services import _dns_baseline
+    current = _dns_baseline()
+    previous_serial = current.soa_serial
+    previous_hash = current.dns_content_hash
     # Delete dependents first, retain the fixed site rows and secret singleton.
     Host.objects.all().delete()
     GandiRecord.objects.all().delete()
@@ -262,7 +278,10 @@ def restore(data, expected_revision, expected_fingerprint=None):
         if field != "id":
             setattr(current, field, data["configuration"][field])
     current.revision = next_revision
+    current.soa_serial = max(previous_serial, current.soa_serial)
+    current.dns_content_hash = previous_hash
     current.save(update_fields=[field for field in CONFIG_FIELDS if field != "id"])
     Host.objects.bulk_create([Host(**raw) for raw in data["hosts"]])
     GandiRecord.objects.bulk_create([GandiRecord(**raw) for raw in data["gandi_records"]])
+    track_dns_content(current, seeded=current.soa_serial > previous_serial)
     return next_revision
