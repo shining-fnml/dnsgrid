@@ -154,17 +154,31 @@ Global settings
 ---------------
 
 The Settings page configures LAN/VPN domains, two-octet IPv4 prefixes,
-the four site names and distinct third octets, TTL, authoritative NS
-and SOA mailbox names, the Gandi zone, and an optional Gandi token.
+the four site names and distinct third octets, ``ttl``, ``soa_ns``,
+``soa_mailbox``, ``soa_refresh``, ``soa_retry``, ``soa_expire``,
+``soa_minimum``, and the separate zone-apex ``zone_ns``, the Gandi zone,
+and an optional Gandi token. ``soa_ns`` is the SOA primary nameserver;
+``zone_ns`` supplies the zone's NS record.
 Each site also has an optional DSM DHCP interface name (for example
 ``ovs_eth0``). Set it to the interface serving that site's LAN subnet
 on its DSM server; leaving it blank disables that site's DSM API exports.
 The SOA mailbox is a DNS name such as ``hostmaster.example.tld``, not
 an email address. Defaults derive ``192.168.g.x`` and ``172.28.g.x``.
+The SOA serial automatically uses the persisted inventory revision.
+Settings' ``soa_serial`` field can seed that revision upward: choose a value
+exceeding an existing DSM zone serial before replacing its zone. It is not
+a separate fixed serial; subsequent inventory/settings changes advance it.
+
+``dns_export_directory`` is an optional absolute path to an existing directory
+on the dnsgrid host. Blank disables directory publishing. Give the application
+account write permission only to the selected directory; the web app needs no
+root access or SSH integration. Restrict target directory access to intended
+application/transfer accounts. This host-specific path is excluded from
+application-data archives and preserved on restore.
 
 Configure a real authoritative nameserver before deploying zones.
 The default ``ns.example.tld`` is an illustrative out-of-zone name.
-If the NS is inside the LAN zone, create its matching inventory host
+If either nameserver is inside the LAN zone, create its matching inventory host
 so the exported zone contains its A record. Delegate the LAN zone and
 each of the four reverse /24 zones to your authoritative server.
 
@@ -189,13 +203,6 @@ the preview if inventory changes instead of mixing different revisions.
     One LAN BIND zone with SOA, NS, and A records for every inventory host.
 ``reverse-<g>.zone``
     One BIND /24 reverse zone per site, with LAN FQDN PTR records.
-``dhcpd.conf``
-    One ISC DHCP configuration with all four subnet declarations and
-    reservations for MAC-bearing hosts. Reservations use LAN FQDNs, not
-    IP literals. Site-only moves leave reservations unchanged.
-``dhcpd-dsm.conf``
-    Legacy dnsmasq-style reservation listing, retained for audit only.
-    Do not copy it into DSM system files; use the reservation API exports.
 ``dsm-reservations-site-<id>.json``
     For each site with a configured DSM interface, the reservation-only
     payload: ``ifname`` and ``reservationData`` containing ``mac``, ``ip``,
@@ -205,16 +212,6 @@ the preview if inventory changes instead of mixing different revisions.
     order. Invalid nonempty MACs abort export rather than silently omitting
     reservations. The JSON export alone does not apply changes; it is input
     to the local NAS-side utility described below.
-``dsm-request-site-<id>.form``
-    Exact URL-encoded form body for an authenticated POST to that site's
-    DSM server at ``/webapi/entry.cgi`` using content type
-    ``application/x-www-form-urlencoded``. The inner call is
-    ``SYNO.Network.DHCPServer.Reservation.set`` version 2, wrapped in
-    ``SYNO.Entry.Request`` version 1 with ``mode="sequential"`` and
-    ``stop_when_error=false``. Credentials/session handling must be supplied
-    separately by the caller; the web app does not authenticate or apply to
-    DSM. This alternative HTTP path does not provide the local utility's
-    backup, IPv6 guard, confirmation, or verification checks.
 ``vpn.hosts``
     One ``ip name.vpn`` line per VPN member, including those not publicly
     exported, for example ``172.28.1.50 alpha.vpn``. It contains neither
@@ -224,11 +221,48 @@ the preview if inventory changes instead of mixing different revisions.
     and public export enabled. Names are relative to the configured
     Gandi zone; VPN domains must be inside that zone.
 
+The obsolete ``dhcpd.conf``, ``dhcpd-dsm.conf``, and
+``dsm-request-site-ID.form`` exports (formerly
+``dsm-request-site-<id>.form``) have been removed, along with the authenticated
+HTTP form-injection workflow. Use the standalone NAS reservation JSON utility
+below instead.
+
+DNS zones begin with explicit ``$ORIGIN`` and ``$TTL`` directives and a
+multiline SOA. A and PTR records have explicit FQDN owners and TTLs, sorted
+alphabetically by hostname; PTR targets are full LAN FQDNs. Each zone ends
+with its zone-apex NS record, configured separately from the SOA nameserver.
+
+After reviewing the preview, use **Write DNS zones to directory** to publish.
+This is an explicit CSRF-protected POST to ``dns-publish`` carrying the preview's
+``revision``; stale revisions are rejected. The configured
+``dns_export_directory`` is displayed on the page. Saving hosts or Settings,
+downloads, and archive download/restore never implicitly write zones.
+Deposited filenames are the zone names, without a ``.zone`` suffix:
+``lan_domain`` for the forward zone and
+``<g>.<second>.<first>.in-addr.arpa`` for each reverse zone (the latter two
+octets come from ``lan_prefix``). Download names remain ``forward.zone`` and
+``reverse-<g>.zone``.
+
+Each zone is written to a temporary file in the destination directory and
+atomically replaced with ``os.replace``. Existing matching files are overwritten
+without a prompt; no backups are made and no unrelated files are deleted.
+Existing regular zone files retain their read/write permission bits and group
+ownership; new zones use mode 0644 (readable DNS data). The application owns the
+newly replaced inode. Symlink destinations are replaced, not followed. If
+preserving an existing group is unauthorized, a per-file error is reported and
+the original file stays unchanged; no root access is needed.
+The entire set is **not atomic**: per-file errors are reported, and some zones
+may already have been replaced when another fails. Review errors and retry
+after correcting permissions or other failures. User testing observed DSM
+automatically reloading deposited zones; this is not a universal guarantee.
+Verify loading on your installation and reload through your normal operator
+workflow if necessary.
+
 These are dedicated application-owned artifacts. Assign dnsgrid exclusive
 ownership of its LAN forward zone and site reverse zones; do not replace
 existing user-managed zones with downloads. For a mixed deployment merge
 explicitly reviewed records or use separate delegated zones. Include or
-merge DHCP and hosts artifacts into configurations you own; the app does
+merge hosts artifacts into configurations you own; the app does
 not manage unrelated stanzas, leases, options, routers, or dynamic pools.
 DSM uses ``SYNO.Network.DHCPServer.Reservation.set`` for reservations.
 User testing observed local writes updating
@@ -326,14 +360,6 @@ the downloaded files with your existing tools, for example::
 
     named-checkzone intranet.example.tld forward.zone
     named-checkzone 1.168.192.in-addr.arpa reverse-1.zone
-    dhcpd -t -cf dhcpd.conf
-
-For DHCP validation and operation, LAN FQDNs must already resolve on the
-DHCP server. ISC dhcpd resolves ``fixed-address`` names when it reads its
-configuration: publish DNS first, wait for old caches to expire, then
-reload/restart DHCP to resolve moved hosts. No textual reservation edit
-is needed for a site move, but running DHCP does not continuously refresh
-these names. Active leases do not change automatically.
 
 For planned moves, reduce TTL sufficiently ahead of time, wait out the
 previous TTL, publish forward/reverse records together, refresh DHCP,
@@ -423,7 +449,12 @@ The deterministic UTF-8 JSON schema has exactly these top-level keys:
 * ``schema_version``: integer ``1``.
 * ``configuration``: ``id`` (always 1), ``lan_domain``, ``vpn_domain``,
   ``lan_prefix``, ``vpn_prefix``, ``gandi_zone``, ``ttl``, ``soa_ns``,
-  ``soa_mailbox``, and ``revision``.
+  ``soa_mailbox``, ``soa_refresh``, ``soa_retry``, ``soa_expire``,
+  ``soa_minimum``, ``zone_ns``, and ``revision``. Older v1 archives without
+  these new SOA timing and zone NS fields remain accepted. Legacy migration
+  and archive compatibility retain the old SOA timing values and existing
+  nameserver rather than changing them to new DSM defaults.
+  ``dns_export_directory`` is host-specific and excluded.
 * ``sites``: exactly four objects with ``id`` (1–4), ``name``, ``g``, and
   ``dsm_ifname``. Older v1 archives without ``dsm_ifname`` are accepted
   with an empty mapping; new exports include it.
@@ -434,8 +465,8 @@ The deterministic UTF-8 JSON schema has exactly these top-level keys:
   ``record_type`` (``A``), ``values``, and ``ttl``.
 
 Lists are ordered by IDs; ownership values and JSON keys are sorted.
-Unknown/missing fields, duplicate JSON keys, wrong types (including booleans
-for integers), invalid references, duplicates, and violated model invariants
+Unknown fields, missing required fields, duplicate JSON keys, wrong types
+(including booleans for integers), invalid references, duplicates, and violated model invariants
 are rejected. Uploads and pending archive data are bounded to 8 MiB, 127
 hosts, 1,024 ownership records, and 1–16 IPv4 values per owned record.
 The byte bound accommodates the complete grid with maximum-length Unicode
@@ -458,7 +489,8 @@ they are retained so future sync can safely delete obsolete records.
 
 Confirmation replaces settings, fixed-site mappings, hosts, and the ledger
 atomically with foreign-key-safe ordering. It preserves destination users
-and the saved token. The resulting revision is
+and the saved token, as well as the destination's ``dns_export_directory``.
+The resulting revision is
 ``max(destination revision, archive revision) + 1``; serial overflow,
 stale inventory, or changed target ownership rejects the replacement.
 Neither preview nor restore calls Gandi. Subsequent provider previews

@@ -139,6 +139,7 @@ def move_host(host_id, direction, expected_revision):
 CONFIG_FIELDS = (
     "lan_domain", "vpn_domain", "lan_prefix", "vpn_prefix", "gandi_zone",
     "gandi_token", "ttl", "soa_ns", "soa_mailbox",
+    "soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns", "dns_export_directory",
 )
 
 
@@ -153,8 +154,11 @@ def update_settings(config_data, site_data, expected_revision):
         with transaction.atomic():
             _claim_revision(expected_revision, changed=False)
             current = Configuration.load()
-            if set(config_data) - set(CONFIG_FIELDS):
+            if set(config_data) - set(CONFIG_FIELDS) - {"soa_serial"}:
                 raise ValidationError("Unknown configuration field.")
+            serial = config_data.get("soa_serial", current.revision)
+            if type(serial) is not int or not current.revision <= serial <= MAX_SERIAL:
+                raise ValidationError("SOA serial must not decrease and must fit an unsigned 32-bit integer.")
             candidate = Configuration(
                 pk=1, revision=current.revision,
                 **{field: config_data.get(field, getattr(current, field)) for field in CONFIG_FIELDS},
@@ -180,7 +184,7 @@ def update_settings(config_data, site_data, expected_revision):
                 raise ValidationError("Site names must be unique.")
             if len({site.g for site in sites}) != 4:
                 raise ValidationError("Site octets must be unique.")
-            changed = any(
+            changed = serial != current.revision or any(
                 getattr(candidate, field) != getattr(current, field) for field in CONFIG_FIELDS
             ) or any(
                 (site.name, site.g, site.dsm_ifname) != (
@@ -190,8 +194,8 @@ def update_settings(config_data, site_data, expected_revision):
             )
             if changed:
                 _claim_revision(expected_revision)
-                candidate.revision = expected_revision + 1
-                candidate.save(force_update=True, update_fields=CONFIG_FIELDS)
+                candidate.revision = max(expected_revision + 1, serial)
+                candidate.save(force_update=True, update_fields=(*CONFIG_FIELDS, "revision"))
                 for site in sites:
                     site.save(update_fields=["name", "g", "dsm_ifname"])
             return candidate

@@ -44,8 +44,21 @@ class ConfigurationForm(forms.Form):
     )
     clear_token = forms.BooleanField(required=False, label="Remove saved Gandi token")
     ttl = forms.IntegerField(min_value=60, max_value=86400, label="DNS TTL (seconds)")
-    soa_ns = forms.CharField(max_length=253, label="Authoritative nameserver FQDN")
+    soa_ns = forms.CharField(max_length=253, label="SOA primary nameserver FQDN")
     soa_mailbox = forms.CharField(max_length=253, label="SOA mailbox (DNS name, not email)")
+    soa_refresh = forms.IntegerField(min_value=1, max_value=MAX_SERIAL, label="SOA refresh (seconds)")
+    soa_retry = forms.IntegerField(min_value=1, max_value=MAX_SERIAL, label="SOA retry (seconds)")
+    soa_expire = forms.IntegerField(min_value=1, max_value=MAX_SERIAL, label="SOA expire (seconds)")
+    soa_minimum = forms.IntegerField(min_value=0, max_value=MAX_SERIAL, label="SOA negative-cache TTL (seconds)")
+    zone_ns = forms.CharField(max_length=253, label="Zone NS nameserver FQDN")
+    soa_serial = forms.IntegerField(
+        min_value=1, max_value=MAX_SERIAL, label="SOA serial",
+        help_text="May only increase. Seed above the existing DNS server serial; changes increment it automatically.",
+    )
+    dns_export_directory = forms.CharField(
+        max_length=4096, required=False, label="DNS export directory",
+        help_text="Absolute existing directory on the dnsgrid host. Blank disables publication. Saving never writes files.",
+    )
     revision = forms.IntegerField(widget=forms.HiddenInput)
 
     def __init__(self, *args, sites, **kwargs):

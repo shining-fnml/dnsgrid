@@ -79,7 +79,7 @@ class DSMReservationTests(TestCase):
         }])
         body = reservation_form_body(self.config, self.site, self.hosts)
         self.assertEqual(parse_qs(body), {key: [str(value)] for key, value in params.items()})
-        self.assertEqual(build_exports(self.config, self.hosts)["dsm-request-site-1.form"], body)
+        self.assertNotIn("dsm-request-site-1.form", build_exports(self.config, self.hosts))
 
     def test_changed_subnet_interface_and_site_move(self):
         self.config.lan_prefix = "10.24"

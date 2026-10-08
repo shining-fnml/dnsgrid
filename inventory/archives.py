@@ -18,6 +18,7 @@ MAX_ID = MAX_PORTABLE_ID
 CONFIG_FIELDS = (
     "id", "lan_domain", "vpn_domain", "lan_prefix", "vpn_prefix", "gandi_zone",
     "ttl", "soa_ns", "soa_mailbox", "revision",
+    "soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns",
 )
 HOST_FIELDS = (
     "id", "name", "site_id", "row", "column", "category", "status",
@@ -114,10 +115,24 @@ def validate(data):
     for field, limit in (("sites", 4), ("hosts", 127), ("gandi_records", MAX_LEDGER)):
         if type(data[field]) is not list or len(data[field]) > limit:
             _fail(f"Invalid or excessive {field} count.")
-    _object(data["configuration"], CONFIG_FIELDS, integer=("id", "revision", "ttl"))
+    raw_config = data["configuration"]
+    new_fields = ("soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns")
+    if type(raw_config) is dict and set(raw_config) == set(CONFIG_FIELDS) - set(new_fields):
+        defaults = Configuration()
+        raw_config = {
+            **raw_config,
+            **{field: getattr(defaults, field) for field in new_fields},
+            "zone_ns": raw_config["soa_ns"],
+            "soa_refresh": 3600,
+            "soa_retry": 900,
+            "soa_minimum": min(raw_config["ttl"], 300) if type(raw_config["ttl"]) is int else 300,
+        }
+    _object(raw_config, CONFIG_FIELDS, integer=(
+        "id", "revision", "ttl", "soa_refresh", "soa_retry", "soa_expire", "soa_minimum",
+    ))
     if data["configuration"]["id"] != 1:
         _fail("Configuration must have ID 1.")
-    config = Configuration(**data["configuration"])
+    config = Configuration(**raw_config)
     config.clean_for_hosts([])
     sites = []
     for raw in data["sites"]:
