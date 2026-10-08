@@ -146,3 +146,7 @@ requirements. No dependency or application behavior was changed.
 are ignored and source/test/documentation/sample paths remain visible.
 README/publication text and links were reviewed manually against code;
 no RST renderer was available, so no rendering check is claimed.
+The automated validation endpoint was invoked: its code-review engine was
+unavailable and CodeQL was skipped for documentation/ignore-only changes.
+A separate read-only review of the three-file diff found no significant
+issues. Neither outcome is a complete security certification.
