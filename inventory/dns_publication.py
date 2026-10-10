@@ -42,14 +42,14 @@ def _read(path, limit):
     return content
 
 
-def _atomic(path, content, exclusive=False):
+def _atomic(path, content, exclusive=False, mode=0o644):
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".dnsgrid-", delete=False) as stream:
             temporary = stream.name
             stream.write(content)
             stream.flush()
-            os.fchmod(stream.fileno(), 0o644)
+            os.fchmod(stream.fileno(), mode)
             os.fsync(stream.fileno())
         if exclusive:
             try:
@@ -129,7 +129,7 @@ def _owned_generations(root):
             _, manifest = read_generation(root.parent, entry.name)
         except (ValidationError, OSError):
             continue
-        allowed = {"manifest.json", ".pin"} | {zone["filename"] for zone in manifest["zones"]}
+        allowed = {"manifest.json", ".pin", ".delivery.json"} | {zone["filename"] for zone in manifest["zones"]}
         if {child.name for child in entry.iterdir()} <= allowed:
             owned.append(entry)
     return sorted(owned, key=lambda entry: entry.name)
@@ -147,6 +147,7 @@ def _make_room(root, current, new):
         for zone in manifest["zones"]:
             (path / zone["filename"]).unlink()
         (path / "manifest.json").unlink()
+        (path / ".delivery.json").unlink(missing_ok=True)
         path.rmdir()
         needed -= 1
     if needed > 0:

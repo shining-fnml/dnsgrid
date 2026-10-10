@@ -59,7 +59,15 @@ class ConfigurationForm(forms.Form):
         max_length=4096, required=False, label="DNS export directory",
         help_text="Absolute existing directory on the dnsgrid host. Blank disables publication. Saving never writes files.",
     )
+    dns_sftp_host = forms.CharField(max_length=253, required=False, label="NAS SFTP hostname or IP")
+    dns_sftp_user = forms.CharField(max_length=64, required=False, label="NAS SFTP account")
+    dns_sftp_port = forms.IntegerField(min_value=1, max_value=65535, required=False, initial=22)
+    dns_sftp_inbox = forms.CharField(max_length=4096, required=False, label="NAS SFTP inbox")
+    dns_sftp_outbox = forms.CharField(max_length=4096, required=False, label="NAS SFTP result outbox")
     revision = forms.IntegerField(widget=forms.HiddenInput)
+
+    def clean_dns_sftp_port(self):
+        return self.cleaned_data["dns_sftp_port"] or 22
 
     def __init__(self, *args, sites, **kwargs):
         super().__init__(*args, **kwargs)

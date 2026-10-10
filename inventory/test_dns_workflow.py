@@ -19,7 +19,7 @@ from .models import Configuration
 
 class DNSWorkflowTests(TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory(dir=Path.cwd())
+        directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name)
         Configuration.objects.update(

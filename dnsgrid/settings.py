@@ -141,3 +141,6 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # Read-only VPN alignment report sources on the VPN center (never written).
 DNSGRID_VPN_HOSTS_FILE = os.environ.get("DNSGRID_VPN_HOSTS_FILE", "/etc/hosts")
 DNSGRID_VPN_CCD_DIR = os.environ.get("DNSGRID_VPN_CCD_DIR", "/etc/openvpn/ccd")
+
+DNSGRID_DNS_SFTP_IDENTITY_FILE = os.environ.get("DNSGRID_DNS_SFTP_IDENTITY_FILE", "")
+DNSGRID_DNS_SFTP_KNOWN_HOSTS = os.environ.get("DNSGRID_DNS_SFTP_KNOWN_HOSTS", "")

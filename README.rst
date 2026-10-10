@@ -201,6 +201,161 @@ If either nameserver is inside the LAN zone, create its matching inventory host
 so the exported zone contains its A record. Delegate the LAN zone and
 each of the four reverse /24 zones to your authoritative server.
 
+NAS delivery: SFTP and local DSM installation
+--------------------------------------------
+
+The NAS receives files using a non-administrator SFTP account. dnsgrid never
+requests a shell or remote command, and the NAS never connects back to dnsgrid.
+A privileged **local** DSM Task Scheduler task validates and installs files.
+Successful upload means **delivered, awaiting processing**, not installed.
+Successful installation means **files installed**, not that the DNS service
+has loaded them. No package restart or reload command is supplied.
+
+In Settings configure ``dns_sftp_host``, ``dns_sftp_user``, ``dns_sftp_port``,
+``dns_sftp_inbox`` and ``dns_sftp_outbox``. Paths must be absolute as seen by
+the SFTP account; a chroot or shared-folder mapping can make these different
+from the installer paths. Leave host/user blank to disable delivery.
+Keep the private key and independently verified NAS host key on the dnsgrid
+host, outside its database, export directories and archives::
+
+    DNSGRID_DNS_SFTP_IDENTITY_FILE=/etc/dnsgrid/nas_sftp_key
+    DNSGRID_DNS_SFTP_KNOWN_HOSTS=/etc/dnsgrid/nas_known_hosts
+
+The application account must be able to read these files; other accounts
+must not be able to replace them. Use an absolute known_hosts path without
+whitespace, quotes or backslashes. Verify the NAS host key fingerprint through
+an independent administrative channel before adding it; merely collecting
+a key from the network does not authenticate it. A nonstandard port needs
+the corresponding known_hosts entry. The client uses key-only batch SFTP,
+strict host-key checking and bounded timeouts; there is no alternate transport.
+
+DSM setup (manual, version-specific)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Check SFTP service availability, public-key authentication and shared-folder
+ACL behavior on **your installed DSM version**. Do not add the SFTP account
+to administrators or give it access to the DNS master directory. This flow
+does not require changing the account shell, passwd or sshd configuration.
+If the installed DSM version cannot offer the required isolation using its
+supported configuration, stop and resolve that deployment prerequisite.
+
+Provision separate paths, for example:
+
+* ``/volume1/dnsgrid-incoming/inbox``: writable by the SFTP account.
+  Its parent must not be writable by that account.
+* ``/volume1/dnsgrid-results/outbox``: readable, **not writable**, by that
+  account. Its parent and every ancestor must prevent the account from
+  renaming or replacing the outbox. Do not place it underneath inbox or
+  any other SFTP-writable parent.
+* ``/volume1/dnsgrid-private/state``: installer-owned mode 0700; stores the
+  lock, persistent serial/content identity, transaction journal, private
+  validation copies and backups.
+* The existing DNS package master directory, script, configuration and
+  validator executable: writable only by their privileged administrators.
+
+These are examples, not verified DSM paths. Check ownership **and DSM ACLs**,
+including inherited ACLs and ancestor permissions, from the SFTP account.
+The installer checks POSIX ownership/modes and symlink-free paths; those
+checks do not inspect DSM ACLs. Deny the SFTP account write/delete/rename
+rights to outbox, state, backups, script, configuration, validator, master
+files and their parent directories. The task user must own these protected
+paths or they must be root-owned, with no group/world write access.
+The inbox itself is the only deliberately untrusted writable directory.
+
+Copy ``synology/dns_install.py`` by itself to an administrator-owned location.
+Python 3 and a working ``named-checkzone`` are prerequisites. Copy and edit
+``synology/dns_install.ini.example`` as a protected local INI configuration,
+for example ``/etc/dnsgrid-dns-install.ini``. Configure exact authorized
+zone names (the LAN zone and all four reverse zones), verified master and
+validator paths, inbox, outbox and state. Provision directories in advance;
+state and backups must be private. All configured directories are distinct
+and must not be nested inside one another.
+
+Test locally with the Python executable and paths actually available on DSM::
+
+    python3 /protected/dns_install.py --help
+    python3 /protected/dns_install.py --config /protected/dns-install.ini --dry-run
+
+Dry-run validates complete deliveries, including ``named-checkzone``, without
+installing files or publishing receipts. It may acquire the lock and create
+temporary private copies. Then configure a recurring DSM Task Scheduler task
+to execute, with the privileges required for the master files::
+
+    python3 /protected/dns_install.py --config /protected/dns-install.ini
+
+Verify the scheduler's supported recurrence and execution identity on the
+installed DSM release. Choose an operationally suitable interval; there is
+no guaranteed minimum interval. Expected latency is up to the chosen interval
+plus validation/install time and scheduler delays. A second concurrent run
+exits busy. Monitor task exit status and protected local diagnostics.
+
+Delivery, receipts and retries
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Local publication preserves immutable ``generations/dnsgrid-<serial>`` files
+and their checksum manifest. The DNS ``YYYYMMDDnn`` serial is independent of
+the inventory revision. A delivery adds a unique attempt suffix:
+``dnsgrid-<serial>-<32 lowercase hex characters>``.
+
+SFTP creates ``inbox/<attempt>.partial``, uploads zone files, uploads
+``manifest.json`` **last**, then renames the directory to ``inbox/<attempt>``.
+Never edit a delivered directory. Partial directories are ignored. Failed
+or interrupted transfers can leave partial directories; an administrator can
+remove abandoned partial directories after checking that no upload is active.
+The client never overwrites a delivered generation during a retry.
+
+The installer acquires a lock and copies bounded regular files through
+anchored descriptors into private storage. It rejects symlinks, traversal,
+unexpected files, unauthorized zone sets, invalid schemas, sizes, checksums
+and SOA serials. It runs ``named-checkzone`` on every zone before installation.
+One failed validation prevents all files in that delivery from being installed.
+It rejects lower serials and equal serials with different content.
+
+Backups and a persistent recovery journal precede per-file atomic replacement.
+There is **no whole-zone-set atomicity**: readers can observe a mixed set
+during installation or rollback. Failure restores previous files; an incomplete
+rollback blocks further installation until recovery succeeds. Unrelated
+master files are not deleted. Inspect and retain protected backups according
+to local policy; there is no automatic NAS backup/inbox/outbox cleanup.
+Budget space for deliveries, private copies and backups.
+
+The installer atomically writes ``outbox/<attempt>.json`` with delivery ID,
+serial, status ``installed``, ``already_installed`` or ``failed``, UTC timestamp
+and a limited non-secret summary. dnsgrid displays its own bounded messages,
+not arbitrary remote diagnostics. Use **Controlla esito NAS** to retrieve the
+current attempt's receipt. This is an explicit bounded network request, not
+continuous polling and not a wait for the next scheduler run.
+Until a valid matching receipt is read, installation remains unconfirmed.
+
+SFTP timeout/interruption can happen after delivery rename, so it is reported
+as **delivery unconfirmed**. Check the receipt before retrying. An explicit retry
+uses the same immutable generation and serial with a fresh attempt ID; an old
+attempt's receipt cannot confirm the new one. The installer treats equal-serial,
+equal-content retries idempotently. Pending local generations stay pinned until
+installation is confirmed; bounded local retention may block new publication
+if all retained slots are pending. Resolve receipts before publishing again.
+All deployment actions require operator authorization, CSRF and current
+inventory revisions.
+
+Migrating an existing deployment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Back up the database, exported zones and installed master files first.
+Apply the new migrations; historical migrations are not rewritten.
+Old NAS destination settings are removed, and legacy archive fields are
+discarded rather than reactivating deployment. Configure the new SFTP fields
+explicitly. Verify permissions, validator and serial baseline before enabling
+the scheduler and delivering a generation.
+
+The administrator must retire the old forced-command authorized_keys entry,
+pull wrapper/script/configuration, NAS-to-hub private key and its corresponding
+hub authorization, old SSH credential environment settings and any old task
+or service invocation. Remove obsolete access grants after verifying they
+are not shared by another service. Reassess any previous service-shell or
+administrator-group changes using supported DSM administration. dnsgrid does
+**not** revoke credentials or modify account/service settings automatically.
+These references describe dismission only, not an alternate supported flow.
+
 Prefer supplying ``DNSGRID_GANDI_TOKEN`` through your deployment's secret
 manager; it overrides the saved token. A token entered in Settings is
 never rendered back to the browser. Blank preserves it; "Remove saved
@@ -251,7 +406,8 @@ multiline SOA. A and PTR records have explicit FQDN owners and TTLs, sorted
 alphabetically by hostname; PTR targets are full LAN FQDNs. Each zone ends
 with its zone-apex NS record, configured separately from the SOA nameserver.
 
-After reviewing the preview, use **Write DNS zones to directory** to publish.
+After reviewing the preview, use the local publication action to write zones,
+or the publication-and-SFTP action to publish and deliver them to the NAS.
 This is an explicit CSRF-protected POST to ``dns-publish`` carrying the preview's
 ``revision``; stale revisions are rejected. The configured
 ``dns_export_directory`` is displayed on the page. Saving hosts or Settings,
@@ -273,10 +429,9 @@ the original file stays unchanged; no root access is needed.
 The entire set is **not atomic**: per-file errors are reported, and some zones
 may already have been replaced when another fails. Review errors and retry
 after correcting permissions or other failures. Any partial failure does not
-commit a new generation manifest. User testing observed DSM
-automatically reloading deposited zones; this is not a universal guarantee.
-Verify loading on your installation and reload through your normal operator
-workflow if necessary.
+commit a new generation manifest. This directory is on the dnsgrid host,
+not the NAS master directory. Verify zone loading on the NAS separately after
+the local DSM installer reports that files were installed.
 
 Immutable local generations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -288,7 +443,7 @@ The manifest contains version 1, generation, serial, UTC publication time and
 zone name/filename/byte-size/SHA-256 entries. The generation identifier is
 exactly ``dnsgrid-`` plus the ten-digit date serial. Limits are 256 zones,
 4 MiB per zone and 128 KiB per manifest. The root ``manifest.json`` is a latest
-copy for inspection only; publication does not update a remote server.
+copy for inspection only; local-only publication does not update a remote server.
 ``manifest.json`` is a reserved filename and cannot be a managed zone name.
 Same-serial files must be byte-identical; collisions require an upward seed.
 Republishing unchanged content retains the original generation/time.
@@ -300,8 +455,9 @@ Pruning never traverses symlinks or removes unidentified directories/files,
 the current generation, or existing ``.pin``-marked generations.
 Inventory's singleton write lock covers publication and pruning. Existing pins
 remain protected and can fill retention and block new generation commits.
-An administrator must review them before removal; local publication never
-creates or clears pins. Incomplete or
+The SFTP workflow creates pins and clears them only after matching successful
+receipts; the local-only publication action never creates or clears pins.
+An administrator must review unresolved pins before manual removal. Incomplete or
 unidentified crash remnants are not pruned automatically; an administrator
 must inspect them before removal. No other hub files are deleted.
 
@@ -584,3 +740,8 @@ Tests cover grid boundaries, shifts, rollback, no-compaction deletions,
 site moves, validation, deterministic artifacts, export membership,
 MAC normalization, Gandi conflicts/idempotency/failure recovery, operator
 authorization, CSRF, confirmation workflows, and token redaction.
+NAS tests cover SFTP batch delivery, asynchronous receipt validation,
+immutable retries, hostile inbox acquisition, installer locking, validation,
+rollback/recovery, dry-run and a copied standalone CLI. They do not replace
+testing SFTP authentication, DSM ACLs/scheduler, real BIND validation and zone
+loading on the deployed NAS.
