@@ -12,7 +12,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.cache import never_cache
 from django.views.decorators.http import require_GET, require_POST
 
-from .exporters import build_exports
+from .exporters import build_exports, publish_dns_zones
 from .forms import ArchiveUploadForm, ConfigurationForm, HostForm, HostMoveForm
 from .models import Configuration, Host, Site
 from .services import (
@@ -28,7 +28,7 @@ CONFIG_FIELDS = (
     "lan_domain", "vpn_domain", "lan_prefix", "vpn_prefix", "gandi_zone",
     "ttl", "soa_ns", "soa_mailbox",
     "soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns", "dns_export_directory",
-    "dns_nas_host", "dns_nas_user", "dns_nas_port",
+    "dns_sftp_host", "dns_sftp_user", "dns_sftp_port", "dns_sftp_inbox", "dns_sftp_outbox",
 )
 
 
@@ -369,7 +369,7 @@ def archive_upload(request):
 
 @operator
 def exports(request):
-    from .dns_publication import pending_generations
+    from .dns_delivery import delivery_states, enabled
     with transaction.atomic():
         Configuration.objects.filter(pk=1).update(revision=F("revision"))
         config = Configuration.load()
@@ -377,19 +377,18 @@ def exports(request):
     return render(request, "inventory/exports.html", {
         "artifacts": artifacts, "revision": config.revision,
         "dns_export_directory": config.dns_export_directory,
-        "dns_nas_enabled": bool(config.dns_nas_host),
         "dns_published_generation": config.dns_published_generation,
         "soa_serial": config.soa_serial,
-        "dns_pending_generations": pending_generations(config.dns_export_directory) if config.dns_export_directory else [],
+        "dns_delivery_enabled": enabled(config),
+        "dns_deliveries": delivery_states(config),
     })
 
 
 @operator
 @require_POST
 def dns_publish(request):
-    from .dns_publication import publish_and_notify
     try:
-        written, errors, status, summary = publish_and_notify(request.POST.get("revision"))
+        written, errors = publish_dns_zones(request.POST.get("revision"))
     except (ValidationError, OSError, IntegrityError, OperationalError) as error:
         messages.error(request, _errors(error))
     else:
@@ -397,30 +396,60 @@ def dns_publish(request):
             messages.success(request, "DNS zone files written: " + ", ".join(written))
         for filename, error in errors:
             messages.error(request, f"DNS zone write failed for {filename}: {error}")
-        if summary:
-            if status in ("failure", "unconfirmed"):
-                messages.warning(request, summary)
-            elif status == "success":
-                messages.success(request, summary)
+    return redirect("exports")
+
+
+def _delivery_message(request, status, summary):
+    if status in ("failure", "failed", "invalid", "unconfirmed"):
+        messages.warning(request, summary)
+    elif status in ("installed", "already_installed"):
+        messages.success(request, summary)
+    else:
+        messages.info(request, summary)
+
+
+@operator
+@require_POST
+def dns_deliver(request):
+    from .dns_delivery import publish_and_deliver
+    try:
+        written, errors, status, summary = publish_and_deliver(request.POST.get("revision"))
+        if written:
+            messages.success(request, "Local DNS zone files written: " + ", ".join(written))
+        for filename, error in errors:
+            messages.error(request, f"DNS zone write failed for {filename}: {error}")
+        _delivery_message(request, status, summary)
+    except (ValidationError, OSError, IntegrityError, OperationalError) as error:
+        messages.error(request, _errors(error))
     return redirect("exports")
 
 
 @operator
 @require_POST
 def dns_retry(request):
-    from .dns_publication import retry_nas_update
+    from .dns_delivery import retry_delivery
+    return _dns_attempt_action(request, retry_delivery)
+
+
+@operator
+@require_POST
+def dns_result(request):
+    from .dns_delivery import check_result
+    return _dns_attempt_action(request, check_result, check=True)
+
+
+def _dns_attempt_action(request, action, check=False):
     try:
         revision = request.POST.get("revision", "")
         if not revision.isascii() or not revision.isdecimal() or len(revision) > 10:
-            raise ValidationError("Reload export previews before retrying.")
-        status, summary = retry_nas_update(int(revision), request.POST.get("generation"))
+            raise ValidationError("Reload export previews before updating the NAS delivery.")
+        arguments = [int(revision), request.POST.get("generation")]
+        if check:
+            arguments.append(request.POST.get("delivery"))
+        status, summary = action(*arguments)
+        _delivery_message(request, status, summary)
     except (ValidationError, OSError, IntegrityError, OperationalError) as error:
         messages.error(request, _errors(error))
-    else:
-        if status == "success":
-            messages.success(request, summary)
-        else:
-            messages.warning(request, summary)
     return redirect("exports")
 
 

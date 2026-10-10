@@ -1,7 +1,6 @@
-"""Immutable, bounded generation storage and synchronous notification leases."""
+"""Immutable, bounded generation storage for local DNS publication."""
 
 import hashlib
-import fcntl
 import json
 import os
 import re
@@ -11,16 +10,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from django.core.exceptions import ValidationError
-from django.db import DatabaseError, transaction
-from django.db.models import F
-
-from .dns_notify import notify_nas, validate_generation
+from .dns_serial import validate_serial
 from .models import Configuration, normalize_domain
-from .services import _claim_revision
 
 RETENTION = 10
 MAX_ZONE_BYTES = 4 * 1024 * 1024
 MAX_MANIFEST_BYTES = 128 * 1024
+
+
+def validate_generation(generation, serial):
+    validate_serial(serial)
+    if generation != f"dnsgrid-{serial}":
+        raise ValidationError("Invalid DNS generation identifier.")
 
 
 def _directory(path):
@@ -41,14 +42,14 @@ def _read(path, limit):
     return content
 
 
-def _atomic(path, content, exclusive=False):
+def _atomic(path, content, exclusive=False, mode=0o644):
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".dnsgrid-", delete=False) as stream:
             temporary = stream.name
             stream.write(content)
             stream.flush()
-            os.fchmod(stream.fileno(), 0o644)
+            os.fchmod(stream.fileno(), mode)
             os.fsync(stream.fileno())
         if exclusive:
             try:
@@ -128,7 +129,7 @@ def _owned_generations(root):
             _, manifest = read_generation(root.parent, entry.name)
         except (ValidationError, OSError):
             continue
-        allowed = {"manifest.json", ".pin"} | {zone["filename"] for zone in manifest["zones"]}
+        allowed = {"manifest.json", ".pin", ".delivery.json"} | {zone["filename"] for zone in manifest["zones"]}
         if {child.name for child in entry.iterdir()} <= allowed:
             owned.append(entry)
     return sorted(owned, key=lambda entry: entry.name)
@@ -146,10 +147,11 @@ def _make_room(root, current, new):
         for zone in manifest["zones"]:
             (path / zone["filename"]).unlink()
         (path / "manifest.json").unlink()
+        (path / ".delivery.json").unlink(missing_ok=True)
         path.rmdir()
         needed -= 1
     if needed > 0:
-        raise ValidationError("Generation retention is full of pending NAS updates. Retry pinned generations before publishing.")
+        raise ValidationError("Generation retention is full of pinned generations. Administrator review is required before publishing.")
 
 
 def preflight_generation(config, zones):
@@ -226,71 +228,3 @@ def pending_generations(directory):
         return [path.name for path in _owned_generations(_directory(root)) if (path / ".pin").exists()]
     except (ValidationError, OSError):
         return []
-
-
-def _prepare_notification(config, generation):
-    path, manifest = read_generation(config.dns_export_directory, generation)
-    if not config.dns_nas_host:
-        return path, manifest
-    _atomic(path / ".pin", b"Pending or unconfirmed NAS update.\n")
-    return path, manifest
-
-
-def _notify(config, generation):
-    if not config.dns_nas_host:
-        return "disabled", "NAS notification is disabled."
-    root = _root(config.dns_export_directory)
-    descriptor = os.open(root.parent / ".dnsgrid-notify.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ValidationError("Invalid notification lock file.")
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return "failure", "Local publication succeeded; another NAS notification is running. Retry this generation."
-        # Refresh the pin after acquiring the notification lock: a preceding
-        # successful request may have cleared a pin prepared by this request.
-        with transaction.atomic():
-            Configuration.objects.filter(pk=1).update(revision=F("revision"))
-            path, manifest = _prepare_notification(config, generation)
-        status, summary = notify_nas(config, generation, manifest["serial"])
-        if status == "success":
-            try:
-                with transaction.atomic():
-                    Configuration.objects.filter(pk=1).update(revision=F("revision"))
-                    (path / ".pin").unlink()
-            except (OSError, DatabaseError):
-                summary += " Retention pin cleanup failed; contact the administrator."
-        return status, summary
-    finally:
-        os.close(descriptor)
-
-
-def publish_and_notify(expected_revision):
-    from .exporters import publish_dns_zones
-    with transaction.atomic():
-        written, errors = publish_dns_zones(expected_revision)
-        config = Configuration.load()
-        if not errors and config.dns_nas_host:
-            try:
-                _prepare_notification(config, config.dns_published_generation)
-            except (ValidationError, OSError):
-                return written, errors, "failure", "Local publication succeeded; notification preparation failed. Retry NAS update."
-    status, summary = "disabled", ""
-    if not errors:
-        try:
-            status, summary = _notify(config, config.dns_published_generation)
-        except (ValidationError, OSError):
-            status, summary = "failure", "Local publication succeeded; notification preparation failed. Retry NAS update."
-    return written, errors, status, summary
-
-
-def retry_nas_update(expected_revision, generation):
-    with transaction.atomic():
-        _claim_revision(expected_revision, changed=False)
-        config = Configuration.load()
-        if not config.dns_nas_host:
-            raise ValidationError("NAS notification is disabled.")
-        # Retry a committed generation only, including older pinned generations.
-        _prepare_notification(config, generation)
-    return _notify(config, generation)

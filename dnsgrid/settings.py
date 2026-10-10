@@ -142,6 +142,5 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 DNSGRID_VPN_HOSTS_FILE = os.environ.get("DNSGRID_VPN_HOSTS_FILE", "/etc/hosts")
 DNSGRID_VPN_CCD_DIR = os.environ.get("DNSGRID_VPN_CCD_DIR", "/etc/openvpn/ccd")
 
-# Deployment-only SSH material: never stored in application data or the UI.
-DNSGRID_DNS_SSH_IDENTITY_FILE = os.environ.get("DNSGRID_DNS_SSH_IDENTITY_FILE", "")
-DNSGRID_DNS_SSH_KNOWN_HOSTS = os.environ.get("DNSGRID_DNS_SSH_KNOWN_HOSTS", "")
+DNSGRID_DNS_SFTP_IDENTITY_FILE = os.environ.get("DNSGRID_DNS_SFTP_IDENTITY_FILE", "")
+DNSGRID_DNS_SFTP_KNOWN_HOSTS = os.environ.get("DNSGRID_DNS_SFTP_KNOWN_HOSTS", "")
