@@ -1,0 +1,9 @@
+# Illustrative paths only: verify paths and ACLs on the installed DSM version.
+# Store the real configuration outside all SFTP-writable directories.
+[dns_install]
+inbox_directory = /volume1/dnsgrid-incoming/inbox
+outbox_directory = /volume1/dnsgrid-results/outbox
+destination_directory = /verified/dns-package/master
+state_directory = /volume1/dnsgrid-private/state
+allowed_zones = example.test, 1.168.192.in-addr.arpa
+named_checkzone = /verified/bin/named-checkzone

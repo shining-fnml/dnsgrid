@@ -24,15 +24,15 @@ STATUSES = {
 }
 CONFIRMED = {"installed", "already_installed"}
 LABELS = {
-    "inflight": "Consegna in corso, in attesa di elaborazione NAS.",
-    "delivered": "Consegnato via SFTP, in attesa di elaborazione NAS.",
-    "unconfirmed": "Consegna SFTP non confermata; controllare esito NAS.",
-    "failure": "Consegna SFTP fallita; nessuna installazione confermata.",
-    "installed": "File installati sul NAS; caricamento delle zone non verificato.",
-    "already_installed": "File già installati sul NAS; caricamento delle zone non verificato.",
-    "failed": "Installazione NAS fallita; consultare la diagnostica locale.",
-    "pending": "Esito non disponibile, in attesa di elaborazione NAS.",
-    "invalid": "Esito NAS non valido; nessuna installazione confermata.",
+    "inflight": "Delivery in progress, awaiting NAS processing.",
+    "delivered": "Delivered via SFTP, awaiting NAS processing.",
+    "unconfirmed": "SFTP delivery unconfirmed; check NAS result.",
+    "failure": "SFTP delivery failed; no installation confirmed.",
+    "installed": "Files installed on the NAS; zone loading not verified.",
+    "already_installed": "Files already installed on the NAS; zone loading not verified.",
+    "failed": "NAS installation failed; consult local diagnostics.",
+    "pending": "Result unavailable, awaiting NAS processing.",
+    "invalid": "Invalid NAS result; no installation confirmed.",
 }
 
 

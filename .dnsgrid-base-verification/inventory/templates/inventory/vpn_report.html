@@ -1,0 +1,58 @@
+{% extends 'inventory/base.html' %}
+{% block title %}VPN alignment report · dnsgrid{% endblock %}
+{% block content %}
+<h1>VPN alignment report</h1>
+<p>Inventory revision {{ report.revision }}. This page is <strong>read-only</strong>: it compares dnsgrid's VPN members with the VPN center's hosts file and OpenVPN client-config directory and only reports discrepancies. It never writes, corrects, or deletes files and never reloads services. Fix any reported item manually, then reload this page.</p>
+<p>Checked for every VPN member: an <code>ip name.vpn</code> entry in the hosts file with the computed VPN address, and a CCD file named exactly after the host whose single <code>ifconfig-push</code> directive assigns that address with a valid IPv4 netmask/peer. The netmask/peer value is shown but not compared, because dnsgrid does not model the VPN topology. Only <code>*.vpn</code> names in the hosts file are inspected; other entries are out of scope. The CCD <code>DEFAULT</code> file is ignored. This checks files only, not connected clients or DNS resolution.</p>
+{% if report.aligned %}
+<p role="status" class="message">No discrepancies found.</p>
+{% else %}
+<p class="warning">{{ report.issue_count }} discrepanc{{ report.issue_count|pluralize:"y,ies" }} found.</p>
+{% endif %}
+<h2>Sources</h2>
+<table>
+<thead><tr><th>Source</th><th>Path</th><th>Status</th></tr></thead>
+<tbody>
+{% for source in report.sources %}
+<tr><td>{{ source.label }}</td><td><code>{{ source.path }}</code></td><td>{% if source.error %}Not inspected: {{ source.error }}{% else %}Read{% endif %}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+<h2>VPN hosts</h2>
+{% if report.rows %}
+<table>
+<thead><tr><th>Host</th><th>Expected</th><th>Hosts file</th><th>CCD ifconfig-push</th><th>Issues</th></tr></thead>
+<tbody>
+{% for row in report.rows %}
+<tr><td>{{ row.short_name }}</td><td>{{ row.expected }}</td><td>{{ row.hosts_value }}</td><td>{{ row.ccd_value }}</td>
+<td>{% if row.issues %}<ul>{% for issue in row.issues %}<li>{{ issue }}</li>{% endfor %}</ul>{% else %}OK{% endif %}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p>No hosts are VPN members.</p>
+{% endif %}
+<h2>Orphaned hosts-file entries</h2>
+{% if report.hosts_orphans %}
+<table>
+<thead><tr><th>Name</th><th>Address</th><th>Lines</th></tr></thead>
+<tbody>
+{% for orphan in report.hosts_orphans %}
+<tr><td>{{ orphan.name }}</td><td>{{ orphan.addresses }}</td><td>{{ orphan.lines }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p>None.</p>
+{% endif %}
+<h2>Orphaned CCD files</h2>
+{% if report.ccd_orphans %}
+<ul>
+{% for orphan in report.ccd_orphans %}
+<li><code>{{ orphan.name }}</code>{% if not orphan.regular_file %} (not a regular file){% endif %}</li>
+{% endfor %}
+</ul>
+{% else %}
+<p>None.</p>
+{% endif %}
+{% endblock %}

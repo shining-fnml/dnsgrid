@@ -131,12 +131,12 @@ def deliver(config, path, manifest, delivery):
     try:
         code = _run(config, "\n".join(batch) + "\n")
     except subprocess.TimeoutExpired:
-        return "unconfirmed", "Consegna non confermata: timeout SFTP. Controlla esito NAS prima di riprovare."
+        return "unconfirmed", "Delivery unconfirmed: SFTP timed out. Check NAS result before retrying."
     except OSError:
-        return "failure", "Impossibile avviare SFTP; controllare la configurazione locale."
+        return "failure", "Unable to start SFTP; check local configuration."
     if code:
-        return "unconfirmed", "Consegna non confermata: SFTP interrotto o fallito. Controlla esito NAS."
-    return "delivered", "Consegnato, in attesa di elaborazione. I file non sono ancora confermati installati."
+        return "unconfirmed", "Delivery unconfirmed: SFTP interrupted or failed. Check NAS result."
+    return "delivered", "Delivered, awaiting NAS processing. File installation is not yet confirmed."
 
 
 def read_result(config, delivery, serial):
@@ -147,7 +147,7 @@ def read_result(config, delivery, serial):
         batch = f"get {quote(config.dns_sftp_outbox + '/' + delivery + '.json')} {quote(path)}\n"
         try:
             if _run(config, batch, download=True):
-                return "pending", "Esito non disponibile: consegnato o non confermato, in attesa di elaborazione."
+                return "pending", "Result unavailable: delivery completed or unconfirmed, awaiting NAS processing."
             descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(descriptor, "rb") as stream:
                 info = os.fstat(stream.fileno())
@@ -168,12 +168,12 @@ def read_result(config, delivery, serial):
                     or any(ord(char) < 32 or ord(char) == 127 for char in result["summary"])):
                 raise ValueError
         except (subprocess.TimeoutExpired, OSError):
-            return "pending", "Lettura esito NAS non confermata; riprovare il controllo."
+            return "pending", "NAS result read unconfirmed; retry the check."
         except (ValueError, KeyError, TypeError, AttributeError, UnicodeError, RecursionError):
-            return "invalid", "Esito NAS non valido; nessuna installazione confermata."
+            return "invalid", "Invalid NAS result; no installation confirmed."
     # Never display NAS-provided text, even from a structurally valid result.
     return result["status"], {
-        "installed": "File installati sul NAS; caricamento delle zone non verificato.",
-        "already_installed": "File già installati sul NAS; caricamento delle zone non verificato.",
-        "failed": "Installazione NAS fallita; consultare la diagnostica locale protetta.",
+        "installed": "Files installed on the NAS; zone loading not verified.",
+        "already_installed": "Files already installed on the NAS; zone loading not verified.",
+        "failed": "NAS installation failed; consult protected local diagnostics.",
     }[result["status"]]

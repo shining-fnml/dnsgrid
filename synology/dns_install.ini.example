@@ -3,7 +3,12 @@
 [dns_install]
 inbox_directory = /volume1/dnsgrid-incoming/inbox
 outbox_directory = /volume1/dnsgrid-results/outbox
-destination_directory = /verified/dns-package/master
+destination_directory = /volume1/@appstore/DNSServer/named/etc/zone/master
 state_directory = /volume1/dnsgrid-private/state
 allowed_zones = example.test, 1.168.192.in-addr.arpa
-named_checkzone = /verified/bin/named-checkzone
+named_checkzone = /volume1/@appstore/DNSServer/bin/named-checkzone
+# Optional pair: trust this DSM account only inside this verified package root.
+# UID and primary GID are resolved locally; run the installer as root.
+# Omit both settings to retain administrator-only package path checks.
+package_root = /volume1/@appstore/DNSServer
+package_owner = DNSServer

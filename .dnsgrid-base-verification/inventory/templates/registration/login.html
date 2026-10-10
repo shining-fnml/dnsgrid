@@ -1,0 +1,6 @@
+{% extends 'inventory/base.html' %}
+{% block content %}
+<h1>Sign in to dnsgrid</h1>
+<p>An operator account is required.</p>
+<form method="post" class="editor">{% csrf_token %}{{ form.as_p }}<input type="hidden" name="next" value="{{ next }}"><button>Sign in</button></form>
+{% endblock %}
