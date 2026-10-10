@@ -13,7 +13,6 @@ urlpatterns = [
     path("settings/", views.configuration, name="configuration"),
     path("exports/", views.exports, name="exports"),
     path("exports/publish-dns/", views.dns_publish, name="dns-publish"),
-    path("exports/retry-nas/", views.dns_retry, name="dns-retry"),
     path("archive/download/", views.archive_download, name="archive-download"),
     path("archive/upload/", views.archive_upload, name="archive-upload"),
     path("exports/download/<str:filename>/", views.download, name="download"),

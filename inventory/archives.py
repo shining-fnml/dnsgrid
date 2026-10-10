@@ -118,6 +118,12 @@ def validate(data):
         if type(data[field]) is not list or len(data[field]) > limit:
             _fail(f"Invalid or excessive {field} count.")
     raw_config = data["configuration"]
+    if type(raw_config) is dict:
+        # Retired deployment fields are accepted only for archive compatibility.
+        raw_config = {
+            field: value for field, value in raw_config.items()
+            if field not in {"dns_nas_host", "dns_nas_user", "dns_nas_port"}
+        }
     new_fields = ("soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns", "soa_serial")
     if type(raw_config) is dict and set(raw_config) in (
         set(CONFIG_FIELDS) - set(new_fields),

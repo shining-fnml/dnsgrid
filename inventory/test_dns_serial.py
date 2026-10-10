@@ -130,35 +130,3 @@ class DNSConcurrentMutationTests(TransactionTestCase):
         self.assertEqual(Host.objects.count(), 1)
         self.assertEqual(Configuration.load().revision, 2)
         self.assertEqual(Configuration.load().soa_serial, 2026100801)
-
-    def test_ssh_executes_after_publication_transaction_commits(self):
-        import tempfile
-        from pathlib import Path
-        from types import SimpleNamespace
-        from django.db import connection
-        from django.test import override_settings
-        from .dns_publication import publish_and_notify
-
-        Configuration.load()
-        for index in range(1, 5):
-            Site.objects.update_or_create(pk=index, defaults={"name": f"Site{index}", "g": index})
-        with tempfile.TemporaryDirectory() as directory:
-            Configuration.objects.update(
-                dns_export_directory=directory, dns_nas_host="nas.example.test", dns_nas_user="dns",
-            )
-
-            def invoke(*args, **kwargs):
-                self.assertFalse(connection.in_atomic_block)
-                config = Configuration.load()
-                generation = Path(directory) / "generations" / config.dns_published_generation
-                self.assertTrue((generation / "manifest.json").exists())
-                self.assertTrue((generation / ".pin").exists())
-                save_host(Host(name="concurrent", site_id=1, row=1, column=0), config.revision)
-                return SimpleNamespace(returncode=0)
-
-            with override_settings(DNSGRID_DNS_SSH_IDENTITY_FILE="/etc/dnsgrid/key",
-                                   DNSGRID_DNS_SSH_KNOWN_HOSTS="/etc/dnsgrid/known_hosts"):
-                with patch("inventory.dns_notify.subprocess.run", side_effect=invoke):
-                    result = publish_and_notify("1")
-            self.assertEqual(result[2], "success")
-            self.assertEqual(Configuration.load().revision, 2)

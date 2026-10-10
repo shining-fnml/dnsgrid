@@ -19,7 +19,7 @@ Pre-publication checklist
   for that decision. Use a complete authorized checkout and enumerate refs
   before repeating local scans; include remote branches absent here.
 * Check SQLite/database files and journals/WALs, dumps, inventory archives,
-  backups, downloaded DNS/DHCP/VPN/Gandi/DSM exports, and NAS backup responses.
+  backups, downloaded DNS/DHCP/VPN/Gandi/DSM exports, and DSM backup responses.
   Database users, password hashes, sessions, and pending settings confirmations
   may be sensitive. A saved Gandi token and pending confirmations are not
   encrypted at rest. Application archives exclude credentials but still

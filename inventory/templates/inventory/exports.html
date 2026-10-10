@@ -11,40 +11,21 @@
 <p>Generated from current inventory, including every status. Files are dedicated dnsgrid-owned artifacts: do not replace user-managed zones or configurations with them. Downloads do not deploy anything.</p>
 <p class="warning">Use these zones only for networks/domains delegated to dnsgrid. Validate with BIND before deployment; review DSM reservations before applying them. DNS caching and existing DHCP leases can delay moves.</p>
 <h2>Write DNS zones to directory</h2>
-<p>In Settings, set <code>dns_export_directory</code> to an absolute, existing directory on the dnsgrid host. Blank disables publishing. Grant the unprivileged application account write permission only to that directory. Optional NAS SSH notification requires administrator-provisioned restricted keys and a NAS-local configuration; see README.</p>
+<p>In Settings, set <code>dns_export_directory</code> to an absolute, existing directory on the dnsgrid host. Blank disables publishing. Grant the unprivileged application account write permission only to that directory.</p>
 {% if dns_export_directory %}
 <p>Configured directory: <code>{{ dns_export_directory }}</code></p>
 <form method="post" action="{% url 'dns-publish' %}">
 {% csrf_token %}
 <input type="hidden" name="revision" value="{{ revision }}">
-<button>{% if dns_nas_enabled %}Publish zones and update NAS{% else %}Write DNS zones to directory{% endif %}</button>
+<button>Write DNS zones to directory</button>
 </form>
-{% if dns_nas_enabled and dns_published_generation %}
-<form method="post" action="{% url 'dns-retry' %}">
-{% csrf_token %}
-<input type="hidden" name="revision" value="{{ revision }}">
-<input type="hidden" name="generation" value="{{ dns_published_generation }}">
-<button>Retry NAS update</button>
-</form>
-<p>Retry reuses <code>{{ dns_published_generation }}</code> without changing its serial or files. Timeouts are unconfirmed: the NAS may already have installed them.</p>
-{% for generation in dns_pending_generations %}
-{% if generation != dns_published_generation %}
-<form method="post" action="{% url 'dns-retry' %}">
-{% csrf_token %}
-<input type="hidden" name="revision" value="{{ revision }}">
-<input type="hidden" name="generation" value="{{ generation }}">
-<button>Retry pending NAS update: {{ generation }}</button>
-</form>
-{% endif %}
-{% endfor %}
-{% endif %}
 {% else %}
 <p>No DNS export directory configured; directory publishing is disabled.</p>
 {% endif %}
 <p>Only this explicit action writes zones. Saving inventory or Settings, downloading files, and downloading or restoring archives never publish DNS. Files are named for their zones: the forward <code>lan_domain</code> and reverse <code>&lt;g&gt;.&lt;second&gt;.&lt;first&gt;.in-addr.arpa</code>. Downloads retain <code>forward.zone</code> and <code>reverse-&lt;g&gt;.zone</code>.</p>
 <p>Each file is written to a temporary file in the directory and replaced atomically with <code>os.replace</code>, overwriting without a prompt. No unrelated files are deleted and no backups are made. The entire set is not atomic; review per-file errors and any partial publication. User testing observed DSM automatically reloading these zones, but this is not a guarantee for every installation.</p>
 <p>Existing regular zone files retain read/write permission bits and group ownership; new zones use mode <code>0644</code> (readable DNS data). The application owns the newly replaced inode. Symlink destinations are replaced, not followed. If preserving an existing group is unauthorized, a per-file error is reported and the original stays unchanged. No root access is needed.</p>
-<p>After all zone writes succeed, an immutable <code>generations/dnsgrid-SERIAL/manifest.json</code> commits checksummed generation copies. Any partial failure suppresses notification. The NAS pulls this exact generation, never mutable latest files. Ten committed generations are retained; pending/unconfirmed updates are pinned and can block publication until successfully retried. NAS validation precedes backup/install; installation is atomic per file, not across the entire set, and failures attempt rollback.</p>
+<p>After all zone writes succeed, an immutable <code>generations/dnsgrid-SERIAL/manifest.json</code> commits checksummed generation copies. Partial failure does not commit a new manifest. Ten committed generations are retained; existing pins are preserved and can block publication until reviewed by an administrator. Publication is local only and does not update a remote server.</p>
 <p>Legacy migration and archive compatibility retain old SOA timing values and the existing nameserver rather than changing them to new DSM defaults.</p>
 <p>Zones start with explicit origin and TTL directives and a multiline SOA. A/PTR records have explicit FQDN owners and TTLs, are ordered alphabetically by hostname, and PTR targets are full LAN names. The final record is the zone-apex NS. Settings configures <code>ttl</code>, <code>soa_ns</code>, <code>soa_mailbox</code>, <code>soa_refresh</code>, <code>soa_retry</code>, <code>soa_expire</code>, <code>soa_minimum</code>, and the separate <code>zone_ns</code>. Persisted UTC <code>YYYYMMDDnn</code> serials advance only for DNS content changes or upward manual seeding; counter 99 exhaustion is rejected. Future seeds and clock rollback never lower the serial. Downloads, previews, and unchanged republication do not advance it.</p>
 <h2>DSM DHCP reservations (API)</h2>

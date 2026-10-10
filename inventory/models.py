@@ -136,11 +136,6 @@ class Configuration(models.Model):
         default=initial_serial, validators=[MinValueValidator(1), MaxValueValidator(MAX_SERIAL)]
     )
     dns_content_hash = models.CharField(max_length=64, blank=True, default="", editable=False)
-    dns_nas_host = models.CharField(max_length=253, blank=True, default="")
-    dns_nas_user = models.CharField(max_length=64, blank=True, default="")
-    dns_nas_port = models.PositiveIntegerField(
-        default=22, validators=[MinValueValidator(1), MaxValueValidator(65535)]
-    )
     dns_published_generation = models.CharField(max_length=32, blank=True, default="", editable=False)
     revision = models.PositiveBigIntegerField(
         default=1, validators=[MinValueValidator(1), MaxValueValidator(MAX_SERIAL)]
@@ -181,11 +176,6 @@ class Configuration(models.Model):
             "\x00" in self.dns_export_directory or not Path(self.dns_export_directory).is_absolute()
         ):
             errors["dns_export_directory"] = "Enter an absolute directory on the dnsgrid host."
-        from .dns_notify import validate_destination
-        try:
-            validate_destination(self.dns_nas_host, self.dns_nas_user, self.dns_nas_port)
-        except ValidationError as error:
-            errors["dns_nas_host"] = error.messages
         for field in ("lan_prefix", "vpn_prefix"):
             try:
                 setattr(self, field, normalize_prefix(getattr(self, field)))
