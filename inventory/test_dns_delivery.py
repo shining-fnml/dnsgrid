@@ -78,6 +78,18 @@ class DNSDeliveryTests(TestCase):
         ):
             self.assertContains(response, label)
 
+    def test_unix_timestamp_retry_preserves_generation_and_bytes(self):
+        Configuration.objects.update(soa_serial=1692746706)
+        self.assertEqual(self.publish()[2], "delivered")
+        path, manifest, attempt = self.state()
+        raw = (path / "manifest.json").read_bytes()
+        self.assertEqual(manifest["generation"], "dnsgrid-1692746706")
+        self.assertTrue(attempt["delivery"].startswith("dnsgrid-1692746706-"))
+        retry_delivery(Configuration.load().revision, manifest["generation"])
+        self.assertNotEqual(self.state()[2]["delivery"], attempt["delivery"])
+        self.assertEqual((path / "manifest.json").read_bytes(), raw)
+        self.assertEqual(Configuration.load().soa_serial, 1692746706)
+
     def test_all_delivery_status_help_is_english_and_displayed(self):
         expected = {
             "inflight": "Delivery in progress, awaiting NAS processing.",

@@ -17,7 +17,7 @@ Exit codes: 0 success, 2 configuration, 3 busy, 5 rejected delivery,
 
 import argparse
 import configparser
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -40,7 +40,9 @@ TIMEOUT = 120
 STATE_NAME = "installed.json"
 JOURNAL_NAME = "transaction.json"
 LOCK_NAME = "installer.lock"
-DELIVERY = re.compile(r"dnsgrid-([0-9]{10})-[0-9a-f]{32}")
+DELIVERY = re.compile(r"dnsgrid-(0|[1-9][0-9]{0,9})-[0-9a-f]{32}")
+MAX_SERIAL = 0xFFFFFFFF
+HALF_SERIAL = 0x80000000
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 
@@ -126,7 +128,7 @@ def read_file(directory, name, limit, trusted=False, missing=False, package=None
     except FileNotFoundError:
         if missing:
             return None
-        raise
+        raise InstallError(f"Required file {str(path or name)!r} is missing.", 2 if trusted else 5) from None
     except OSError:
         info = os.stat(name, dir_fd=directory, follow_symlinks=False)
         raise validation_error(path or name, info, "Cannot open file safely.", 5) from None
@@ -145,7 +147,7 @@ def read_file(directory, name, limit, trusted=False, missing=False, package=None
                 or after.st_nlink != 1 or after.st_size != before.st_size
                 or after.st_mtime_ns != before.st_mtime_ns
                 or after.st_ctime_ns != before.st_ctime_ns):
-            raise InstallError()
+            raise InstallError(f"File {str(path or name)!r} changed while being acquired.")
         return data, before
 
 
@@ -211,17 +213,23 @@ def load_config(path):
         raise InstallError("Invalid configuration.", 2) from None
 
 
-def serial_value(text):
-    if not isinstance(text, str) or not re.fullmatch(r"[0-9]{10}", text):
-        raise InstallError()
-    try:
-        date(int(text[:4]), int(text[4:6]), int(text[6:8]))
-    except ValueError:
-        raise InstallError() from None
+def serial_value(text, context="SOA serial"):
+    if not isinstance(text, str) or not re.fullmatch(r"[0-9]{1,10}", text):
+        raise InstallError(f"Invalid {context}: expected decimal uint32 (0..{MAX_SERIAL}).")
     value = int(text)
-    if value > 0xFFFFFFFF or str(value) != text:
-        raise InstallError()
+    if value > MAX_SERIAL:
+        raise InstallError(f"Invalid {context} {text!r}: outside uint32 range 0..{MAX_SERIAL}.")
     return value
+
+
+def compare_serial(serial, previous, context):
+    """RFC 1982 ordering; a half-range difference has no defined order."""
+    difference = (serial - previous) & MAX_SERIAL
+    if difference == HALF_SERIAL:
+        raise InstallError(
+            f"Ambiguous RFC 1982 serial comparison for {context}: "
+            f"candidate {serial}, installed {previous}; difference is 2^31.")
+    return 0 if difference == 0 else (1 if difference < HALF_SERIAL else -1)
 
 
 def unique_object(pairs):
@@ -233,60 +241,69 @@ def unique_object(pairs):
     return result
 
 
-def decode_json(data):
+def decode_json(data, context="JSON"):
     try:
         return json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
     except (ValueError, UnicodeError, RecursionError):
-        raise InstallError() from None
+        raise InstallError(f"Invalid {context}: malformed JSON or duplicate object key.") from None
 
 
 def decode_manifest(data, delivery, allowed):
     match = DELIVERY.fullmatch(delivery)
     if not match:
-        raise InstallError()
-    serial = serial_value(match[1])
-    manifest = decode_json(data)
+        raise InstallError(f"Invalid delivery ID {delivery!r}: expected canonical uint32 serial and lowercase UUID.")
+    serial = serial_value(match[1], "delivery serial")
+    manifest = decode_json(data, f"manifest for {delivery!r}")
     try:
         if (type(manifest) is not dict
                 or set(manifest) != {"version", "generation", "serial", "published_at", "zones"}
-                or type(manifest["version"]) is not int or manifest["version"] != 1
-                or type(manifest["serial"]) is not int or manifest["serial"] != serial
-                or manifest["generation"] != "dnsgrid-" + match[1]):
-            raise ValueError
+                or type(manifest["version"]) is not int or manifest["version"] != 1):
+            raise InstallError("Invalid manifest schema or version.")
+        if type(manifest["serial"]) is not int:
+            raise InstallError("Invalid manifest serial: expected an integer uint32.")
+        serial_value(str(manifest["serial"]), "manifest serial")
+        if manifest["serial"] != serial:
+            raise InstallError(f"Manifest serial {manifest['serial']} does not match delivery serial {serial}.")
+        if manifest["generation"] != "dnsgrid-" + match[1]:
+            raise InstallError(f"Manifest generation does not match delivery serial {serial}.")
         published = manifest["published_at"]
         if not isinstance(published, str) or not re.fullmatch(
                 r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
                 r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)", published):
-            raise ValueError
+            raise InstallError("Invalid manifest published_at: expected a UTC timestamp.")
         datetime.fromisoformat(published.replace("Z", "+00:00"))
         zones = manifest["zones"]
         if type(zones) is not list or not 1 <= len(zones) <= MAX_ZONES:
-            raise ValueError
+            raise InstallError(f"Invalid manifest zones: expected 1..{MAX_ZONES} entries.")
         names = set()
         for zone in zones:
             if type(zone) is not dict or set(zone) != {"name", "filename", "size", "sha256"}:
-                raise ValueError
+                raise InstallError("Invalid manifest zone entry schema.")
             name = zone["name"]
-            if not valid_zone(name) or zone["filename"] != name or name in names:
-                raise ValueError
+            if not valid_zone(name):
+                raise InstallError(f"Invalid manifest zone name {name!r}.")
+            if zone["filename"] != name:
+                raise InstallError(f"Invalid filename {zone['filename']!r} for zone {name!r}; must equal the zone name.")
+            if name in names:
+                raise InstallError(f"Duplicate manifest zone {name!r}.")
             if type(zone["size"]) is not int or not 1 <= zone["size"] <= MAX_ZONE:
-                raise ValueError
+                raise InstallError(f"Invalid size for zone {name!r}: expected 1..{MAX_ZONE} bytes.")
             if not isinstance(zone["sha256"], str) or not re.fullmatch("[0-9a-f]{64}", zone["sha256"]):
-                raise ValueError
+                raise InstallError(f"Invalid SHA-256 checksum for zone {name!r}.")
             names.add(name)
         if names != allowed:
-            raise ValueError
+            raise InstallError(f"Manifest zone allowlist mismatch: missing {sorted(allowed - names)!r}; unexpected {sorted(names - allowed)!r}.")
         return manifest
     except (ValueError, TypeError, KeyError, OverflowError):
-        raise InstallError() from None
+        raise InstallError("Invalid manifest value or UTC publication timestamp.") from None
 
 
-def soa_serial(data):
+def soa_serial(data, context="zone"):
     """Tokenize master-file records without treating comments or TXT as SOAs."""
     try:
         text = data.decode("ascii")
     except UnicodeError:
-        raise InstallError() from None
+        raise InstallError(f"Invalid {context}: zone file must be ASCII.") from None
     tokens, record, records = [], [], []
     depth = 0
     # Quoted strings and escapes are kept as opaque tokens.
@@ -300,7 +317,7 @@ def soa_serial(data):
         elif token == ")":
             depth -= 1
             if depth < 0:
-                raise InstallError()
+                raise InstallError(f"Invalid {context}: unmatched closing parenthesis.")
         elif token == "\n":
             if not depth and record:
                 records.append(record)
@@ -308,13 +325,13 @@ def soa_serial(data):
         else:
             record.append(token)
     if depth:
-        raise InstallError()
+        raise InstallError(f"Invalid {context}: unclosed record parenthesis.")
     if record:
         records.append(record)
     for record in records:
         if record[0].startswith("$"):
             if record[0].upper() not in {"$ORIGIN", "$TTL"}:
-                raise InstallError()
+                raise InstallError(f"Invalid {context}: external or unsupported directive {record[0]!r}.")
             continue
         # Only the record header can contain a type: once another type is seen,
         # SOA in its RDATA is not a type (notably unquoted TXT strings).
@@ -327,12 +344,12 @@ def soa_serial(data):
             index += 1
         if index < len(record) and record[index].upper() == "SOA":
             tail = record[index + 1:]
-            if (len(tail) != 7 or not re.fullmatch("[0-9]{10}", tail[2])
+            if (len(tail) != 7
                     or not all(re.fullmatch("[0-9]+[smhdwSMHDW]?", token) for token in tail[3:])):
-                raise InstallError()
-            tokens.append(serial_value(tail[2]))
+                raise InstallError(f"Invalid {context}: malformed SOA record.")
+            tokens.append(serial_value(tail[2], f"SOA serial in {context}"))
     if len(tokens) != 1:
-        raise InstallError()
+        raise InstallError(f"Invalid {context}: expected exactly one SOA record, found {len(tokens)}.")
     return tokens[0]
 
 
@@ -386,33 +403,42 @@ def check_zone(config, name, path, stage):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        timeout=TIMEOUT, check=True, shell=False)
     except (OSError, subprocess.SubprocessError):
-        raise InstallError("Zone validation failed.") from None
+        raise InstallError(f"Zone validation failed for {name!r} at {str(path)!r}.") from None
 
 
 def snapshot(config, inbox, delivery, stage):
-    fd = os.open(delivery, DIR_FLAGS, dir_fd=inbox)
+    delivery_path = config["inbox_directory"] / delivery
     try:
-        raw, _ = read_file(fd, "manifest.json", MAX_MANIFEST)
+        fd = os.open(delivery, DIR_FLAGS, dir_fd=inbox)
+    except OSError:
+        raise InstallError(f"Cannot open delivery directory safely: {str(delivery_path)!r}.") from None
+    try:
+        raw, _ = read_file(fd, "manifest.json", MAX_MANIFEST, path=delivery_path / "manifest.json")
         # The inbox is never used by validation or named-checkzone.
         (stage / "manifest.json").write_bytes(raw)
         manifest = decode_manifest(raw, delivery, config["allowed_zones"])
         expected = {"manifest.json"} | config["allowed_zones"]
         if set(os.listdir(fd)) != expected:
-            raise InstallError()
+            raise InstallError(f"Unexpected or missing files in delivery {str(delivery_path)!r}.")
         for zone in manifest["zones"]:
             name = zone["name"]
-            data, _ = read_file(fd, name, MAX_ZONE)
+            data, _ = read_file(fd, name, MAX_ZONE, path=delivery_path / name)
             (stage / name).write_bytes(data)
         if set(os.listdir(fd)) != expected:
-            raise InstallError()
+            raise InstallError(f"Delivery file set changed during acquisition: {str(delivery_path)!r}.")
     finally:
         os.close(fd)
     for zone in manifest["zones"]:
         name = zone["name"]
         data = (stage / name).read_bytes()
-        if (len(data) != zone["size"] or hashlib.sha256(data).hexdigest() != zone["sha256"]
-                or soa_serial(data) != manifest["serial"]):
-            raise InstallError()
+        context = f"zone {name!r} at {str(delivery_path / name)!r}"
+        if len(data) != zone["size"]:
+            raise InstallError(f"Size mismatch for {context}: expected {zone['size']}, acquired {len(data)}.")
+        if hashlib.sha256(data).hexdigest() != zone["sha256"]:
+            raise InstallError(f"SHA-256 checksum mismatch for {context}.")
+        actual_serial = soa_serial(data, context)
+        if actual_serial != manifest["serial"]:
+            raise InstallError(f"SOA serial mismatch for {context}: found {actual_serial}, manifest {manifest['serial']}.")
         check_zone(config, name, stage / name, stage)
     content = [{"name": z["name"], "size": z["size"], "sha256": z["sha256"]}
                for z in sorted(manifest["zones"], key=lambda z: z["name"])]
@@ -423,13 +449,19 @@ def read_state(state):
     value = read_file(state, STATE_NAME, MAX_MANIFEST, trusted=True, missing=True)
     if value is None:
         return None
-    data = decode_json(value[0])
+    try:
+        data = decode_json(value[0], f"installer state {STATE_NAME!r}")
+    except InstallError as error:
+        raise InstallError(str(error), 7) from None
     if (type(data) is not dict or set(data) != {"serial", "fingerprint"}
             or type(data["serial"]) is not int
             or not isinstance(data["fingerprint"], str)
             or not re.fullmatch("[0-9a-f]{64}", data["fingerprint"])):
         raise InstallError("Invalid installer state.", 7)
-    serial_value(str(data["serial"]))
+    try:
+        serial_value(str(data["serial"]), f"installer state serial in {STATE_NAME!r}")
+    except InstallError as error:
+        raise InstallError(str(error), 7) from None
     return data
 
 
@@ -440,10 +472,15 @@ def check_existing_baseline(destination, stage, names, serial, config=None):
                              package=config, path=config["destination_directory"] / name if config else name)
         if existing is None:
             continue
-        previous_serial = soa_serial(existing[0])
-        if serial < previous_serial or (
-                serial == previous_serial and existing[0] != (stage / name).read_bytes()):
-            raise InstallError("Serial reuse or regression rejected.")
+        path = config["destination_directory"] / name if config else name
+        context = f"installed zone {name!r} at {str(path)!r}"
+        previous_serial = soa_serial(existing[0], context)
+        ordering = compare_serial(serial, previous_serial, context)
+        if ordering < 0 or (
+                ordering == 0 and existing[0] != (stage / name).read_bytes()):
+            raise InstallError(
+                f"Serial reuse or regression rejected for {context}: "
+                f"candidate {serial}, installed {previous_serial}.")
 
 
 def recover(state, destination, names=None):
@@ -462,7 +499,7 @@ def recover(state, destination, names=None):
                 or not re.fullmatch("backup-[0-9a-f]{32}", journal["backup"])
                 or type(journal["entries"]) is not list
                 or not 1 <= len(journal["entries"]) <= MAX_ZONES):
-            raise InstallError()
+            raise InstallError(f"Invalid recovery journal {JOURNAL_NAME!r}: schema or backup name.")
         seen = set()
         for entry in journal["entries"]:
             if (type(entry) is not dict or set(entry) != {"name", "present", "mode", "uid", "gid"}
@@ -472,7 +509,7 @@ def recover(state, destination, names=None):
                     or type(entry["mode"]) is not int or entry["mode"] & ~0o7777
                     or any(type(entry[key]) is not int or not 0 <= entry[key] < 2**32 - 1
                            for key in ("uid", "gid"))):
-                raise InstallError()
+                raise InstallError(f"Invalid recovery journal {JOURNAL_NAME!r}: zone entry metadata.")
             seen.add(entry["name"])
         backup = os.open(journal["backup"], DIR_FLAGS, dir_fd=state)
         try:
@@ -631,6 +668,7 @@ def run(config, dry_run=False):
                 continue
             serial = int(match[1])
             try:
+                serial_value(match[1], f"delivery serial in {delivery!r}")
                 if not dry_run and completed_result(directories["outbox_directory"], delivery, serial):
                     continue
                 with tempfile.TemporaryDirectory(prefix=".stage-", dir=config["state_directory"]) as folder:
@@ -639,9 +677,12 @@ def run(config, dry_run=False):
                     current = {"serial": serial, "fingerprint": fingerprint}
                     if previous is None:
                         check_existing_baseline(destination, stage, config["allowed_zones"], serial, config)
-                    if previous and (serial < previous["serial"]
-                                     or (serial == previous["serial"] and current != previous)):
-                        raise InstallError("Serial reuse or regression rejected.")
+                    if previous:
+                        ordering = compare_serial(serial, previous["serial"], f"installer state {STATE_NAME!r}")
+                        if ordering < 0 or (ordering == 0 and current != previous):
+                            raise InstallError(
+                                f"Serial reuse or regression rejected for installer state: "
+                                f"candidate {serial}, installed {previous['serial']}.")
                     status = "already_installed" if current == previous else "installed"
                     if not dry_run:
                         if status == "installed":
@@ -649,7 +690,8 @@ def run(config, dry_run=False):
                             previous = current
             except (OSError, InstallError):
                 error = sys.exc_info()[1]
-                failure = error if isinstance(error, InstallError) else InstallError("Delivery processing failed.", 6)
+                failure = error if isinstance(error, InstallError) else InstallError(
+                    f"Delivery {delivery!r} filesystem processing failed at {str(error.filename)!r}.", 6)
                 print(str(failure), file=sys.stderr)
                 code = max(code, failure.code)
                 if not dry_run:

@@ -52,8 +52,8 @@ class ConfigurationForm(forms.Form):
     soa_minimum = forms.IntegerField(min_value=0, max_value=MAX_SERIAL, label="SOA negative-cache TTL (seconds)")
     zone_ns = forms.CharField(max_length=253, label="Zone NS nameserver FQDN")
     soa_serial = forms.IntegerField(
-        min_value=1, max_value=MAX_SERIAL, label="SOA serial",
-        help_text="UTC YYYYMMDDnn (00..99), upward only. DNS content changes advance it; previews and downloads do not.",
+        min_value=0, max_value=MAX_SERIAL, label="SOA serial",
+        help_text="Unix seconds, advanced only for DNS content changes using max(now, last serial + 1). Existing uint32 serials are accepted; normal seeds must advance under RFC 1982.",
     )
     dns_export_directory = forms.CharField(
         max_length=4096, required=False, label="DNS export directory",

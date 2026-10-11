@@ -165,26 +165,59 @@ on its DSM server; leaving it blank disables that site's DSM API exports.
 The SOA mailbox is a DNS name such as ``hostmaster.example.tld``, not
 an email address. Defaults derive ``192.168.g.x`` and ``172.28.g.x``.
 The persisted SOA serial is separate from the optimistic inventory revision.
-All zones share a UTC ``YYYYMMDDnn`` serial, with a counter from 00 through 99.
+All zones share a Unix timestamp in seconds, an unsigned 32-bit integer
+(``0..4294967295``), not a calendar date or ``YYYYMMDDnn`` counter.
 DNS-changing service mutations compare deterministic zone contents excluding
 the serial: host names/addresses, site subnets, domains, TTL, SOA and NS changes
 advance it, but descriptive metadata, VPN/Gandi-only settings and previews,
-downloads or unchanged republication do not. Today's ``YYYYMMDD00`` is used
-when larger; otherwise the previous date's counter advances. Clock rollback
-and future seeds never lower the date. Counter 99 rejects the entire mutation
-until UTC advances beyond that date; it never invents tomorrow's date.
-Settings' ``soa_serial`` allows an upward-only real-date uint32 seed above
-the installed DSM serial, for example ``2026100802``.
+downloads or unchanged republication do not. Allocation uses
+``max(now, last + 1)``: same-second edits and clock rollback still advance.
+The timestamp-based serial need not equal the exact wall-clock second:
+rapid edits, clock rollback, or a previously seeded value can keep it ahead.
+There is no daily limit. Exhausting uint32 rejects the mutation rather than
+wrapping silently. Settings' ``soa_serial`` permits a uint32 seed that advances
+under RFC 1982 serial arithmetic, including a numerically smaller value when
+RFC 1982 wraparound makes it newer.
+Comparisons separated by exactly ``2147483648`` are ambiguous and rejected;
+numerically larger values are not necessarily newer under RFC 1982.
 
-Migration preserves the larger of today's base serial and the old revision.
-Legacy archives without a serial follow the same rule; restore never lowers
-the destination serial. Higher incompatible/non-date legacy values are retained
-by migration but block DNS mutations/publication with explicit guidance.
-Do not fake a date or lower them: an administrator must coordinate a DNS serial
-reset with authoritative/secondary servers before migrating those deployments.
-Back up first; this is not automated by the web app. Archives now include
+Migration preserves the larger of the timestamp baseline and the old revision.
+Legacy archives without a serial follow the same rule; restore never regresses
+the destination serial under RFC 1982 (numeric wraparound can still advance).
+Higher legacy values are preserved, not rewritten
+automatically. Archives now include
 ``soa_serial`` in JSON v1; older archive shapes remain accepted. Restore may
 advance the serial when DNS content differs, independently of its revision.
+
+Exceptional administrator-confirmed baseline lowering
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Only a superuser (``is_superuser``), not an ordinary staff operator, can
+preview and confirm timestamp baseline lowering from Settings. It is for
+legacy serials that **no DNS server has loaded**, not a way to downgrade
+an installed zone. For example, an uninstalled legacy generation with
+serial ``2026100800`` can be numerically above a NAS's existing timestamp
+serial ``1692746706``. Preserve that NAS state; do not reset the installer.
+Compare the actual proposed baseline with all deployed servers before delivery.
+
+First pause the DSM scheduled task and remove legacy deliveries, including
+abandoned partial deliveries and receipts, from the inbox and outbox before
+enabling the new flow. Review the exact old/new serials in the preview and
+check both acknowledgments: no DNS server loaded the legacy serials, and
+the DSM task is paused with legacy inbox/outbox deliveries removed.
+If legacy queued deliveries are not removed, the installer could load them
+and make their higher serial its persistent high-water mark, blocking the
+new timestamp flow.
+The browser cannot choose an arbitrary baseline. Confirmation requires the
+same inventory revision and current serial, and rejects a preview timestamp
+that is now in the future after clock rollback. A nonce is single-use.
+
+Back up first. No inventory is deleted, no installer state is automatically
+reset, and stale immutable generations are preserved. Never retry or deliver
+those legacy generations after lowering. Publish and validate a new generation
+before resuming the task. If any server has already loaded the legacy serial,
+**do not lower**: coordinate a migration with authoritative and secondary DNS
+servers, respecting RFC 1982, outside this exceptional web action.
 
 ``dns_export_directory`` is an optional absolute path to an existing directory
 on the dnsgrid host. Blank disables directory publishing. Give the application
@@ -313,7 +346,7 @@ Delivery, receipts and retries
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Local publication preserves immutable ``generations/dnsgrid-<serial>`` files
-and their checksum manifest. The DNS ``YYYYMMDDnn`` serial is independent of
+and their checksum manifest. The DNS timestamp serial is independent of
 the inventory revision. A delivery adds a unique attempt suffix:
 ``dnsgrid-<serial>-<32 lowercase hex characters>``.
 
@@ -329,7 +362,8 @@ anchored descriptors into private storage. It rejects symlinks, traversal,
 unexpected files, unauthorized zone sets, invalid schemas, sizes, checksums
 and SOA serials. It runs ``named-checkzone`` on every zone before installation.
 One failed validation prevents all files in that delivery from being installed.
-It rejects lower serials and equal serials with different content.
+It rejects older serials under RFC 1982 and equal serials with different
+content; half-range comparisons are ambiguous and rejected.
 
 Backups and a persistent recovery journal precede per-file atomic replacement.
 There is **no whole-zone-set atomicity**: readers can observe a mixed set
@@ -473,11 +507,13 @@ Successful local publication also writes copies under
 **last**, after every mutable zone file and immutable generation file succeeds.
 The manifest contains version 1, generation, serial, UTC publication time and
 zone name/filename/byte-size/SHA-256 entries. The generation identifier is
-exactly ``dnsgrid-`` plus the ten-digit date serial. Limits are 256 zones,
+exactly ``dnsgrid-`` plus the canonical decimal uint32 serial, without leading
+zeroes (including ``dnsgrid-0``). Limits are 256 zones,
 4 MiB per zone and 128 KiB per manifest. The root ``manifest.json`` is a latest
 copy for inspection only; local-only publication does not update a remote server.
 ``manifest.json`` is a reserved filename and cannot be a managed zone name.
-Same-serial files must be byte-identical; collisions require an upward seed.
+Same-serial files must be byte-identical; collisions require a seed that
+advances under RFC 1982.
 Republishing unchanged content retains the original generation/time.
 Use a real, symlink-free export path on a local filesystem that supports hard
 links, atomic rename and fsync. Restrict writes to one dnsgrid installation.
@@ -587,9 +623,9 @@ stale previews but DSM provides no atomic compare-and-set here.
 No direct writes to ``/etc/dhcpd`` or package modifications are made.
 Copying/downloading an export alone never applies it.
 
-Output ordering is deterministic. BIND serials use the persisted inventory
-revision, not the clock: unchanged inventory yields identical exports,
-and successful inventory/settings changes increase the serial. Back up
+Output ordering is deterministic. BIND serials use the persisted DNS content
+serial, separate from inventory revision: unchanged DNS content yields identical
+exports, and DNS-changing mutations allocate ``max(now, last + 1)``. Back up
 the database to preserve serial continuity. Before deployment, validate
 the downloaded files with your existing tools, for example::
 

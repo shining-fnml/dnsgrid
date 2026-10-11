@@ -1,4 +1,5 @@
 import copy
+import tempfile
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -9,10 +10,10 @@ from django.db import OperationalError, close_old_connections
 from django.test import TestCase, TransactionTestCase
 
 from .archives import restore, snapshot, validate
-from .dns_serial import initial_serial, next_serial, validate_serial
+from .dns_serial import compare_serial, initial_serial, next_serial, validate_serial
 from .exporters import build_exports
 from .models import MAX_SERIAL, Configuration, Host, Site
-from .services import delete_host, move_host, save_host, update_settings
+from .services import delete_host, lower_dns_serial, move_host, save_host, update_settings
 
 
 class DNSSerialTests(TestCase):
@@ -23,11 +24,12 @@ class DNSSerialTests(TestCase):
         Configuration.objects.update(soa_serial=2026100800, dns_content_hash="")
         self.sites = list(Site.objects.values("id", "name", "g", "dsm_ifname"))
 
-    def test_utc_day_and_calendar_counter_rules(self):
+    def test_unix_seconds_and_monotonic_rules(self):
         with patch("inventory.dns_serial.datetime") as clock:
-            clock.now.return_value = datetime(2026, 10, 8, 0, 0, tzinfo=timezone.utc)
+            instant = datetime(2026, 10, 8, 0, 0, 0, 999999, tzinfo=timezone.utc)
+            clock.now.return_value = instant
             # Test the original function, not the patched initial_serial.
-            self.assertEqual(initial_serial(), 2026100800)
+            self.assertEqual(initial_serial(), int(instant.timestamp()))
             clock.now.assert_called_with(timezone.utc)
         for previous, expected in ((2026100709, 2026100800), (2026100800, 2026100801),
                                    (2026100903, 2026100904), (20261008098, None)):
@@ -38,12 +40,42 @@ class DNSSerialTests(TestCase):
                 else:
                     self.assertEqual(next_serial(previous), expected)
         for previous in (2026100899, 2026100999):
-            with self.assertRaisesMessage(ValidationError, "exhausted"):
-                next_serial(previous)
-        for invalid in (True, 42, 2026023000, 2026130100, MAX_SERIAL, MAX_SERIAL + 1):
+            self.assertEqual(next_serial(previous), previous + 1)
+        for invalid in (True, -1, 1.5, "1692746706", MAX_SERIAL + 1):
             with self.assertRaises(ValidationError):
                 validate_serial(invalid)
-        validate_serial(4294123199)
+        for valid in (0, 42, 1692746706, 2026023000, MAX_SERIAL):
+            validate_serial(valid)
+        with patch("inventory.dns_serial.initial_serial", return_value=1692746706):
+            self.assertEqual(next_serial(1692746706), 1692746707)
+            self.assertEqual(next_serial(1692746708), 1692746709)
+            self.assertEqual(next_serial(1692746700), 1692746706)
+        with patch("inventory.dns_serial.initial_serial", return_value=MAX_SERIAL):
+            self.assertEqual(next_serial(MAX_SERIAL - 1), MAX_SERIAL)
+            with self.assertRaisesMessage(ValidationError, "exhausted"):
+                next_serial(MAX_SERIAL)
+
+    def test_rfc1982_wrap_and_ambiguity(self):
+        for candidate, previous, expected in (
+            (0, MAX_SERIAL, 1), (MAX_SERIAL, 0, -1), (42, 42, 0),
+            (1692746707, 1692746706, 1), (1692746706, 1692746707, -1),
+        ):
+            self.assertEqual(compare_serial(candidate, previous), expected)
+        for candidate, previous in ((0, 2**31), (2**31, 0), (MAX_SERIAL, 2**31 - 1)):
+            with self.assertRaisesMessage(ValidationError, "Ambiguous RFC 1982"):
+                compare_serial(candidate, previous)
+
+    def test_baseline_lowering_rejects_active_delivery_before_changing_state(self):
+        from .dns_delivery import _lock
+        with tempfile.TemporaryDirectory() as directory:
+            Configuration.objects.update(dns_export_directory=directory)
+            before = snapshot()
+            with _lock(directory), self.assertRaisesMessage(ValidationError, "Another DNS delivery"):
+                lower_dns_serial(1, 2026100800, 1692746706, confirmed=True)
+            self.assertEqual(snapshot(), before)
+            with patch("inventory.services.initial_serial", return_value=1692746706):
+                config = lower_dns_serial(1, 2026100800, 1692746706, confirmed=True)
+            self.assertEqual(config.soa_serial, 1692746706)
 
     def test_content_mutations_but_not_metadata_or_gets_advance(self):
         host = Host(name="alpha", site_id=1, row=1, column=0)
@@ -64,7 +96,7 @@ class DNSSerialTests(TestCase):
         self.assertEqual(Configuration.load().soa_serial, 2026100804)
 
     def test_exhaustion_rolls_back_inventory_and_revision(self):
-        Configuration.objects.update(soa_serial=2026100899)
+        Configuration.objects.update(soa_serial=MAX_SERIAL)
         with self.assertRaises(ValidationError):
             save_host(Host(name="alpha", site_id=1, row=1, column=0), 1)
         self.assertFalse(Host.objects.exists())
@@ -80,7 +112,7 @@ class DNSSerialTests(TestCase):
         save_host(Host(name="alpha", site_id=1, row=1, column=0), 2)
         self.assertEqual(Configuration.load().soa_serial, 2026100903)
 
-    def test_archive_never_lowers_serial_and_rejects_incompatible_legacy(self):
+    def test_archive_never_lowers_serial_and_accepts_uint32_legacy(self):
         data = snapshot()
         update_settings({"soa_serial": 2026100902}, self.sites, 1)
         restore(data, 2)
@@ -90,8 +122,19 @@ class DNSSerialTests(TestCase):
         legacy["configuration"]["revision"] = 2026101002
         self.assertEqual(validate(legacy)["configuration"]["soa_serial"], 2026101002)
         legacy["configuration"]["revision"] = MAX_SERIAL
-        with self.assertRaisesMessage(ValidationError, "administrator-coordinated"):
-            validate(legacy)
+        self.assertEqual(validate(legacy)["configuration"]["soa_serial"], MAX_SERIAL)
+
+    def test_archive_rfc1982_seed_and_ambiguous_restore_is_atomic(self):
+        data = snapshot()
+        Configuration.objects.update(soa_serial=MAX_SERIAL)
+        data["configuration"]["soa_serial"] = 0
+        restore(data, 1)
+        self.assertEqual(Configuration.load().soa_serial, 0)
+        before = snapshot()
+        data["configuration"]["soa_serial"] = 2**31
+        with self.assertRaisesMessage(ValidationError, "Ambiguous RFC 1982"):
+            restore(data, Configuration.load().revision)
+        self.assertEqual(snapshot(), before)
 
     def test_data_migration_preserves_higher_legacy_values(self):
         from importlib import import_module

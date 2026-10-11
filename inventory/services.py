@@ -1,11 +1,12 @@
 import copy
+from contextlib import nullcontext
 
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import F
 
 from .models import MAX_SERIAL, Configuration, Host, Site
-from .dns_serial import content_fingerprint, track_dns_content, validate_serial
+from .dns_serial import compare_serial, content_fingerprint, initial_serial, track_dns_content, validate_serial
 
 
 def _dns_baseline():
@@ -174,8 +175,9 @@ def update_settings(config_data, site_data, expected_revision):
                 raise ValidationError("Unknown configuration field.")
             serial = config_data.get("soa_serial", current.soa_serial)
             validate_serial(serial)
-            if serial < current.soa_serial:
-                raise ValidationError("SOA serial must not decrease and must fit an unsigned 32-bit integer.")
+            serial_order = compare_serial(serial, current.soa_serial)
+            if serial_order < 0:
+                raise ValidationError("SOA serial must not decrease under RFC 1982.")
             candidate = Configuration(
                 pk=1, revision=current.revision, soa_serial=serial,
                 dns_content_hash=current.dns_content_hash,
@@ -217,7 +219,31 @@ def update_settings(config_data, site_data, expected_revision):
                 candidate.save(force_update=True, update_fields=(*CONFIG_FIELDS, "revision", "soa_serial"))
                 for site in sites:
                     site.save(update_fields=["name", "g", "dsm_ifname"])
-                track_dns_content(candidate, seeded=serial > current.soa_serial)
+                track_dns_content(candidate, seeded=serial_order > 0)
             return candidate
     except IntegrityError as error:
         raise ValidationError("The settings conflict with existing inventory data.") from error
+
+
+def lower_dns_serial(expected_revision, expected_serial, baseline, confirmed=False):
+    if confirmed is not True:
+        raise ValidationError("Administrator confirmation that no DNS server loaded the legacy serials is required.")
+    validate_serial(expected_serial)
+    validate_serial(baseline)
+    from .dns_delivery import _lock
+    directory = Configuration.load().dns_export_directory
+    with (_lock(directory) if directory else nullcontext()), transaction.atomic():
+        _claim_revision(expected_revision, changed=False)
+        current = Configuration.load()
+        if current.dns_export_directory != directory:
+            raise ValidationError("DNS export directory changed. Generate a new baseline preview.")
+        if current.soa_serial != expected_serial:
+            raise ValidationError("SOA serial changed. Generate a new baseline preview.")
+        if baseline >= current.soa_serial or baseline > initial_serial():
+            raise ValidationError("The baseline must lower the stored serial to a Unix timestamp no later than now.")
+        _claim_revision(expected_revision)
+        Configuration.objects.filter(pk=1).update(
+            soa_serial=baseline, dns_content_hash=content_fingerprint(current),
+            dns_published_generation="",
+        )
+        return Configuration.load()

@@ -81,7 +81,7 @@ def _root(directory, create=False):
 
 
 def read_generation(directory, generation):
-    if not isinstance(generation, str) or not re.fullmatch(r"dnsgrid-[0-9]{10}", generation):
+    if not isinstance(generation, str) or not re.fullmatch(r"dnsgrid-(?:0|[1-9][0-9]{0,9})", generation):
         raise ValidationError("Invalid DNS generation identifier.")
     serial = int(generation.removeprefix("dnsgrid-"))
     validate_generation(generation, serial)
@@ -123,7 +123,7 @@ def read_generation(directory, generation):
 def _owned_generations(root):
     owned = []
     for entry in root.iterdir():
-        if entry.is_symlink() or not re.fullmatch(r"dnsgrid-[0-9]{10}", entry.name):
+        if entry.is_symlink() or not re.fullmatch(r"dnsgrid-(?:0|[1-9][0-9]{0,9})", entry.name):
             continue
         try:
             _, manifest = read_generation(root.parent, entry.name)
@@ -132,7 +132,7 @@ def _owned_generations(root):
         allowed = {"manifest.json", ".pin", ".delivery.json"} | {zone["filename"] for zone in manifest["zones"]}
         if {child.name for child in entry.iterdir()} <= allowed:
             owned.append(entry)
-    return sorted(owned, key=lambda entry: entry.name)
+    return sorted(owned, key=lambda entry: (entry.stat().st_mtime_ns, entry.name))
 
 
 def _make_room(root, current, new):

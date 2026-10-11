@@ -11,6 +11,7 @@ urlpatterns = [
     path("confirm/", views.confirm, name="confirm"),
     path("confirm/cancel/", views.cancel, name="cancel"),
     path("settings/", views.configuration, name="configuration"),
+    path("settings/lower-dns-serial/", views.dns_baseline_preview, name="dns-baseline-preview"),
     path("exports/", views.exports, name="exports"),
     path("exports/publish-dns/", views.dns_publish, name="dns-publish"),
     path("exports/deliver-dns/", views.dns_deliver, name="dns-deliver"),

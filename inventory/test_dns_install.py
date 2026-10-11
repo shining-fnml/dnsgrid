@@ -19,7 +19,7 @@ from synology import dns_install as installer
 
 class DNSInstallTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="dns-install-test-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="dns-install-test-", dir=Path.cwd())
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.paths = {}
@@ -447,14 +447,178 @@ class DNSInstallTests(unittest.TestCase):
             self.assertEqual(self.invoke(), 5)
             self.assert_empty_install()
 
-    def test_calendar_serial_and_delivery_syntax(self):
-        for value in ("2026022900", "2026130100", "2026103200", "4295010100", "0001010100"):
-            with self.assertRaises(installer.InstallError):
+    def test_uint32_serial_and_canonical_delivery_syntax(self):
+        for value in ("-1", "4294967296", "9999999999", "10000000000", "", "1.0", "١", True, 0):
+            with self.subTest(value=value), self.assertRaisesRegex(installer.InstallError, "uint32"):
                 installer.serial_value(value)
-        for value in ("2024022900", "2026100800", "2026100899"):
+        for value in ("0", "1", "1692746706", "2026022900", "2026130100", "2026103200",
+                      "4294967295", "0001010100"):
             self.assertEqual(installer.serial_value(value), int(value))
+            self.assertEqual(installer.soa_serial(self.zone(value)), int(value))
+        for value in ("0", "1", "1692746706", "2026100801", "4294967295"):
+            self.assertIsNotNone(installer.DELIVERY.fullmatch(f"dnsgrid-{value}-" + "a" * 32))
+        for value in ("00", "01", "0001010100", "-1", "10000000000"):
+            self.assertIsNone(installer.DELIVERY.fullmatch(f"dnsgrid-{value}-" + "a" * 32))
         self.assertIsNone(installer.DELIVERY.fullmatch(self.delivery.upper()))
         self.assertIsNone(installer.DELIVERY.fullmatch(self.delivery + "\n"))
+
+    def test_timestamp_serial_initial_baseline(self):
+        for name in self.names:
+            path = self.paths["destination"] / name
+            path.write_bytes(self.zone(1692746706))
+            path.chmod(0o644)
+        self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.result()["status"], "installed")
+
+    def test_zero_initial_baseline_is_not_missing(self):
+        source = self.paths["inbox"] / self.delivery
+        source.rename(source.with_name(self.delivery + ".partial"))
+        candidate = self.publish(0, "b", 'text IN TXT "changed"\n')
+        existing = self.paths["destination"] / "example.net"
+        existing.write_bytes(self.zone(0))
+        existing.chmod(0o644)
+        self.assertEqual(self.invoke(), 5)
+        self.assertIn("candidate 0, installed 0", self.result(candidate.name)["summary"])
+        self.assertEqual(existing.read_bytes(), self.zone(0))
+        self.assertFalse((self.paths["state"] / installer.STATE_NAME).exists())
+        candidate.rename(candidate.with_name(candidate.name + ".partial"))
+        newer = self.publish(1, "c")
+        self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.result(newer.name)["status"], "installed")
+
+    def test_uint32_delivery_bounds_and_invalid_manifest_serials(self):
+        source = self.paths["inbox"] / self.delivery
+        source.rename(source.with_name(self.delivery + ".partial"))
+        for serial in (0, 1, 4294967295, 4294967296):
+            with self.subTest(serial=serial):
+                delivery = self.publish(serial, "b")
+                self.assertEqual(self.invoke(True), 5 if serial > installer.MAX_SERIAL else 0)
+                delivery.rename(delivery.with_name(delivery.name + ".partial"))
+        manifest = json.loads((source.with_name(self.delivery + ".partial") / "manifest.json").read_text())
+        for serial in (-1, 4294967296, True, "0"):
+            manifest["serial"] = serial
+            with self.subTest(manifest_serial=serial), self.assertRaisesRegex(
+                    installer.InstallError, "manifest serial"):
+                installer.decode_manifest(json.dumps(manifest).encode(), self.delivery, self.names)
+        with self.assertRaisesRegex(installer.InstallError, "delivery serial"):
+            installer.decode_manifest(b"{}", "dnsgrid-4294967296-" + "a" * 32, self.names)
+        self.assert_empty_install()
+
+    def test_rfc1982_serial_order_and_ambiguity(self):
+        for serial, previous, expected in (
+                (0, 4294967295, 1), (4294967295, 0, -1), (1, 0, 1),
+                (0, 0, 0), (2147483647, 0, 1), (2147483649, 0, -1)):
+            self.assertEqual(installer.compare_serial(serial, previous, "test"), expected)
+        for serial, previous in ((2147483648, 0), (0, 2147483648)):
+            with self.assertRaisesRegex(installer.InstallError, r"Ambiguous RFC 1982.*test"):
+                installer.compare_serial(serial, previous, "test")
+
+    def test_initial_baseline_wrap_regression_and_ambiguity_diagnostics(self):
+        source = self.paths["inbox"] / self.delivery
+        source.rename(source.with_name(self.delivery + ".partial"))
+        wrapped = self.publish(0, "b")
+        existing = self.paths["destination"] / "example.net"
+        for previous, code, message in (
+                (4294967295, 0, None), (1, 5, "regression"),
+                (2147483648, 5, "Ambiguous RFC 1982")):
+            existing.write_bytes(self.zone(previous))
+            existing.chmod(0o644)
+            with self.subTest(previous=previous):
+                self.assertEqual(self.invoke(True), code)
+                if message:
+                    self.assertEqual(self.invoke(), code)
+                    summary = self.result(wrapped.name)["summary"]
+                    self.assertIn(message, summary)
+                    self.assertIn("example.net", summary)
+                    self.assertIn(str(previous), summary)
+                    self.assertIn(str(existing), summary)
+                self.assertEqual(existing.read_bytes(), self.zone(previous))
+                self.assertFalse((self.paths["state"] / installer.STATE_NAME).exists())
+
+    def test_state_wrap_install_idempotence_regression_and_ambiguity(self):
+        source = self.paths["inbox"] / self.delivery
+        source.rename(source.with_name(self.delivery + ".partial"))
+        maximum = self.publish(4294967295, "b")
+        self.assertEqual(self.invoke(), 0)
+        wrapped = self.publish(0, "c")
+        self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.result(wrapped.name)["status"], "installed")
+        equal = self.publish(0, "d")
+        self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.result(equal.name)["status"], "already_installed")
+        rollback = self.publish(4294967295, "e")
+        ambiguous = self.publish(2147483648, "f")
+        self.assertEqual(self.invoke(), 5)
+        self.assertIn("regression", self.result(rollback.name)["summary"])
+        self.assertIn("Ambiguous RFC 1982", self.result(ambiguous.name)["summary"])
+        self.assertIn("installed.json", self.result(ambiguous.name)["summary"])
+        self.assertEqual(self.result(maximum.name)["status"], "installed")
+        for name in self.names:
+            self.assertEqual((self.paths["destination"] / name).read_bytes(), self.zone(0))
+        self.assertEqual(json.loads((self.paths["state"] / installer.STATE_NAME).read_text())["serial"], 0)
+
+    def test_invalid_installer_state_serial_blocks_installation(self):
+        state = self.paths["state"] / installer.STATE_NAME
+        for serial in (-1, 4294967296, True):
+            state.write_text(json.dumps({"serial": serial, "fingerprint": "a" * 64}))
+            state.chmod(0o600)
+            with self.subTest(serial=serial):
+                self.assertEqual(self.invoke(), 7)
+                self.assertEqual(list(self.paths["destination"].iterdir()), [])
+
+    def test_failed_wrapped_install_restores_previous_uint32_state(self):
+        source = self.paths["inbox"] / self.delivery
+        source.rename(source.with_name(self.delivery + ".partial"))
+        self.publish(4294967295, "b")
+        self.assertEqual(self.invoke(), 0)
+        state = self.paths["state"] / installer.STATE_NAME
+        previous = state.read_bytes()
+        wrapped = self.publish(0, "c")
+        original = installer.atomic_write
+        failed = False
+        def fail(fd, filename, data, mode=0o600, **kwargs):
+            nonlocal failed
+            if filename == installer.STATE_NAME and not failed:
+                failed = True
+                raise OSError("simulated state write failure")
+            return original(fd, filename, data, mode, **kwargs)
+        with patch.object(installer, "atomic_write", side_effect=fail):
+            self.assertEqual(self.invoke(), 6)
+        self.assertTrue(failed)
+        self.assertEqual(state.read_bytes(), previous)
+        for name in self.names:
+            self.assertEqual((self.paths["destination"] / name).read_bytes(), self.zone(4294967295))
+        self.assertEqual(self.result(wrapped.name)["status"], "failed")
+        self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.result(wrapped.name)["status"], "installed")
+
+    def test_diagnostics_identify_manifest_zone_path_checksum_and_serial(self):
+        directory = self.paths["inbox"] / self.delivery
+        original = (directory / "manifest.json").read_bytes()
+        for mutation, message in (
+                (lambda m: m["zones"][0].update(filename="../escape"), "Invalid filename"),
+                (lambda m: m["zones"][0].update(name="../../escape"), "Invalid manifest zone name"),
+                (lambda m: m["zones"][0].update(sha256="0" * 64), "checksum mismatch"),
+                (lambda m: m["zones"][0].update(size=m["zones"][0]["size"] + 1), "Size mismatch")):
+            (directory / "manifest.json").write_bytes(original)
+            self.edit_manifest(mutation)
+            self.assertEqual(self.invoke(), 5)
+            self.assertIn(message, self.result()["summary"])
+            self.assertIn(sorted(self.names)[0] if "mismatch" in message else "escape",
+                          self.result()["summary"])
+        (directory / "manifest.json").write_bytes(original)
+        path = directory / "example.net"
+        path.write_bytes(self.zone(1692746706))
+        self.edit_manifest(lambda m: next(z for z in m["zones"] if z["name"] == path.name).update(
+            size=path.stat().st_size, sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
+        self.assertEqual(self.invoke(), 5)
+        self.assertIn("SOA serial mismatch", self.result()["summary"])
+        self.assertIn(str(path), self.result()["summary"])
+        self.assertIn("1692746706", self.result()["summary"])
+        path.unlink()
+        self.assertEqual(self.invoke(), 5)
+        self.assertIn("Unexpected or missing files", self.result()["summary"])
+        self.assert_empty_install()
 
     def test_unexpected_file_and_nested_directory(self):
         directory = self.paths["inbox"] / self.delivery

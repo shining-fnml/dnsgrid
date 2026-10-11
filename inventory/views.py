@@ -218,10 +218,10 @@ def configuration(request):
         try:
             if data["revision"] != config.revision:
                 raise ValidationError("Inventory changed. Reload this form before previewing.")
-            from .dns_serial import validate_serial
+            from .dns_serial import compare_serial, validate_serial
             validate_serial(data["soa_serial"])
-            if data["soa_serial"] < config.soa_serial:
-                raise ValidationError("SOA serial must not decrease.")
+            if compare_serial(data["soa_serial"], config.soa_serial) < 0:
+                raise ValidationError("SOA serial must not decrease under RFC 1982.")
             candidate.full_clean()
             if len({site["g"] for site in site_data}) != 4:
                 raise ValidationError("Each of the four sites must have a distinct octet.")
@@ -261,6 +261,7 @@ def configuration(request):
             form.add_error(None, _errors(error))
     return render(request, "inventory/form.html", {
         "form": form, "title": "Global settings", "settings_page": True,
+        "revision": config.revision,
         "token_saved": bool(config.gandi_token),
         "archive_form": ArchiveUploadForm(initial={"revision": config.revision}, auto_id="archive_%s"),
         "archive_warnings": WARNINGS,
@@ -269,10 +270,44 @@ def configuration(request):
 
 @operator
 @require_POST
+def dns_baseline_preview(request):
+    if not request.user.is_superuser:
+        raise PermissionDenied
+    from .dns_serial import initial_serial, validate_serial
+    request.session.pop("pending", None)
+    config = Configuration.load()
+    try:
+        revision = request.POST.get("revision", "")
+        if not revision.isascii() or not revision.isdecimal() or len(revision) > 10:
+            raise ValidationError("Provide a valid inventory revision.")
+        if int(revision) != config.revision:
+            raise ValidationError("Inventory changed. Reload settings before previewing.")
+        baseline = initial_serial()
+        validate_serial(baseline)
+        validate_serial(config.soa_serial)
+        if baseline >= config.soa_serial:
+            raise ValidationError("The current SOA serial is not above the timestamp baseline; no lowering is needed.")
+        return _pending(
+            request, "dns-baseline", {
+                "expected_serial": config.soa_serial, "baseline": baseline,
+            }, config.revision, [{
+                "label": "SOA serial baseline", "before": config.soa_serial, "after": baseline,
+            }], "Confirm administrator-only DNS timestamp baseline lowering",
+            dns_baseline=True,
+        )
+    except ValidationError as error:
+        messages.error(request, _errors(error))
+        return redirect("configuration")
+
+
+@operator
+@require_POST
 def confirm(request):
     pending = request.session.get("pending")
+    if pending and pending["kind"] == "dns-baseline" and not request.user.is_superuser:
+        raise PermissionDenied
     if not pending or request.POST.get("nonce") != pending["nonce"]:
-        if pending and pending["kind"] == "archive":
+        if pending and pending["kind"] in ("archive", "dns-baseline"):
             request.session.pop("pending", None)
         messages.error(request, "This confirmation expired. Generate a new preview.")
         return redirect("grid")
@@ -287,6 +322,18 @@ def confirm(request):
             delete_host(payload["id"], expected_revision=revision)
         elif pending["kind"] == "settings":
             update_settings(payload["config"], payload["sites"], expected_revision=revision)
+        elif pending["kind"] == "dns-baseline":
+            from .services import lower_dns_serial
+            if (request.POST.get("dns_unloaded_ack") != "yes"
+                    or request.POST.get("delivery_cleanup_ack") != "yes"):
+                raise ValidationError(
+                    "Confirm that no DNS server loaded the legacy serials and that the DSM task "
+                    "is paused with legacy inbox/outbox deliveries removed."
+                )
+            lower_dns_serial(
+                expected_revision=revision, expected_serial=payload["expected_serial"],
+                baseline=payload["baseline"], confirmed=True,
+            )
         elif pending["kind"] == "gandi":
             from .gandi import sync
             sync(expected_fingerprint=payload["fingerprint"])
@@ -305,6 +352,8 @@ def confirm(request):
     else:
         messages.success(request, "Changes applied.")
     request.session.pop("pending", None)
+    if pending["kind"] == "dns-baseline":
+        return redirect("configuration")
     return redirect("exports" if pending["kind"] == "gandi" else "grid")
 
 
@@ -354,7 +403,7 @@ def archive_upload(request):
                 changes.append({"label": "Resulting inventory revision", "before": revision, "after": next_revision})
                 changes.append({
                     "label": "Resulting SOA serial", "before": current["configuration"]["soa_serial"],
-                    "after": "Never lowered; advanced only if DNS content changes, or an upward seed is restored.",
+                    "after": "Never regressed under RFC 1982; advanced only if DNS content changes, or a newer seed is restored.",
                 })
                 payload = {"data": candidate, "target_fingerprint": fingerprint(current)}
                 return _pending(request, "archive", payload, revision, changes,

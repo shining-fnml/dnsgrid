@@ -13,6 +13,17 @@
 <form method="post" enctype="multipart/form-data" class="editor">{% csrf_token %}{{ form.as_p }}<button>Preview changes</button></form>
 <form method="post" action="{% url 'cancel' %}">{% csrf_token %}<button>Cancel</button></form>
 {% if settings_page %}
+{% if request.user.is_superuser %}
+<section aria-labelledby="dns-baseline-heading">
+<h2 id="dns-baseline-heading">Administrator-only DNS timestamp baseline</h2>
+<p class="warning">Only for legacy serials that no DNS server has loaded. Pause the DSM scheduled task and remove legacy deliveries from its inbox and outbox before enabling the new flow. Never lower an installed serial: coordinate a DNS migration instead.</p>
+<p>Preview shows the exact current serial and Unix timestamp baseline. Confirmation does not reset installer state, delete inventory, or remove immutable generations.</p>
+<form method="post" action="{% url 'dns-baseline-preview' %}">
+{% csrf_token %}<input type="hidden" name="revision" value="{{ revision }}">
+<button class="danger">Preview DNS timestamp baseline lowering</button>
+</form>
+</section>
+{% endif %}
 <section aria-labelledby="archive-import-heading">
 <h2 id="archive-import-heading">Import application-data archive</h2>
 <p class="warning">Destructive replacement: preview first, then explicitly confirm replacement of target application data. This portable JSON archive is not a SQLite database backup.</p>

@@ -72,6 +72,22 @@ class SFTPTests(SimpleTestCase):
                 validate_destination(host, user, port)
         self.assertEqual(quote('/a"b\\c*[d]?'), r'"/a\"b\\c*[d]?"')
 
+    def test_uint32_delivery_identifiers_and_receipts(self):
+        for serial in (0, 42, 1692746706, 2026023000, 4294967295):
+            delivery = f"dnsgrid-{serial}-" + "a" * 32
+            validate_delivery(delivery, serial)
+            result = {
+                "delivery": delivery, "serial": serial, "status": "installed",
+                "timestamp": "2026-10-09T23:00:00+00:00", "summary": "Installed",
+            }
+
+            def transfer(config, batch, download=False):
+                Path(batch.split('"')[-2]).write_text(json.dumps(result))
+                return 0
+
+            with patch("inventory.dns_sftp._run", side_effect=transfer):
+                self.assertEqual(read_result(self.config, delivery, serial)[0], "installed")
+
     def test_result_is_bound_to_delivery_and_serial_and_never_displays_remote_summary(self):
         result = {
             "delivery": self.delivery, "serial": 2026100900, "status": "installed",
