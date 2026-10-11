@@ -239,6 +239,12 @@ class DNSResetTests(TestCase):
                 self.execute()
         journal = self.root / dns_reset.JOURNAL
         record = json.loads(journal.read_text())
+        original_record = json.dumps(record)
+        record["after"] = "0" * 64
+        journal.write_text(json.dumps(record))
+        with self.assertRaisesMessage(ValidationError, "fingerprint"):
+            self.recover()
+        journal.write_text(original_record)
         pin = self.root / record["quarantine"] / "generations" / self.old_generation / ".pin"
         pin.write_text("tampered")
         with self.assertRaisesMessage(ValidationError, "changed"):

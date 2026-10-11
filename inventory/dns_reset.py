@@ -202,6 +202,8 @@ def _finish(root, record):
     after.soa_serial = plan["timestamp"]
     after.dns_content_hash = content_fingerprint(config)
     after.dns_published_generation = ""
+    if record["after"] != _config_state(after):
+        raise ValidationError("Reset completion fingerprint is invalid; preserve journal for administrator recovery.")
     current_state = _config_state(config)
     already_committed = current_state == record["after"]
     if current_state != plan["state"] and not already_committed:
@@ -271,7 +273,10 @@ def reset(timestamp=None, token=None, *, confirmed=False, unloaded=False, nas_ha
                 after.dns_content_hash = content_fingerprint(after)
                 after.dns_published_generation = ""
                 record = {"plan": plan, "quarantine": quarantine.name, "after": _config_state(after)}
-                _atomic(journal, (json.dumps(record, sort_keys=True) + "\n").encode(), mode=0o600)
+                content = (json.dumps(record, sort_keys=True) + "\n").encode()
+                if len(content) > MAX_JOURNAL:
+                    raise ValidationError("Reset plan exceeds the recovery journal limit; review artifacts manually.")
+                _atomic(journal, content, mode=0o600)
             quarantine = _finish(root, record)
         # Commit DB before retiring the journal. A failure here is recoverable even
         # when DB commit succeeded; the recorded after-state detects that case.
