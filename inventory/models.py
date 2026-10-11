@@ -133,7 +133,7 @@ class Configuration(models.Model):
     zone_ns = models.CharField(max_length=253, default="ns.example.tld")
     dns_export_directory = models.CharField(max_length=4096, blank=True, default="")
     soa_serial = models.PositiveBigIntegerField(
-        default=initial_serial, validators=[MinValueValidator(1), MaxValueValidator(MAX_SERIAL)]
+        default=initial_serial, validators=[MinValueValidator(0), MaxValueValidator(MAX_SERIAL)]
     )
     dns_content_hash = models.CharField(max_length=64, blank=True, default="", editable=False)
     dns_sftp_host = models.CharField(max_length=253, blank=True, default="")
@@ -160,7 +160,7 @@ class Configuration(models.Model):
                 name="configuration_ttl_bounds",
             ),
             models.CheckConstraint(
-                condition=Q(soa_serial__gte=1, soa_serial__lte=MAX_SERIAL),
+                condition=Q(soa_serial__gte=0, soa_serial__lte=MAX_SERIAL),
                 name="configuration_dns_serial_bounds",
             ),
         ]

@@ -13,6 +13,11 @@
 <p><label><input type="checkbox" name="replace_ack" value="yes" required> I acknowledge replacement of all conflicting target application data, not a merge.</label></p>
 <p><label><input type="checkbox" name="ledger_ack" value="yes" required> I trust this ownership ledger for the SAME Gandi domain/scope, accept its update/delete authority, and have stopped the source writer.</label></p>
 {% endif %}
+{% if dns_baseline %}
+<p class="warning">This lowers the exact serial shown above, not DNS content. Do not proceed if any DNS server has loaded the legacy serials. No installer state is reset and stale immutable generations are preserved; never deliver them after lowering.</p>
+<p><label><input type="checkbox" name="dns_unloaded_ack" value="yes" required> I confirm that no DNS server has loaded the legacy serials.</label></p>
+<p><label><input type="checkbox" name="delivery_cleanup_ack" value="yes" required> I have paused the DSM scheduled task and removed legacy deliveries from its inbox and outbox before enabling the new flow.</label></p>
+{% endif %}
 <button>Confirm and apply</button></form>
 <form method="post" action="{% url 'cancel' %}">{% csrf_token %}<button>Cancel</button></form>
 {% endblock %}

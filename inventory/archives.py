@@ -9,7 +9,7 @@ from django.db import transaction
 
 from .models import MAX_PORTABLE_ID, MAX_SERIAL, Configuration, GandiRecord, Host, Site
 from .services import _claim_revision
-from .dns_serial import initial_serial, track_dns_content, validate_serial
+from .dns_serial import compare_serial, initial_serial, track_dns_content, validate_serial
 
 FORMAT = "dnsgrid.application-data"
 SCHEMA_VERSION = 1
@@ -284,10 +284,12 @@ def restore(data, expected_revision, expected_fingerprint=None):
         if field != "id":
             setattr(current, field, data["configuration"][field])
     current.revision = next_revision
-    current.soa_serial = max(previous_serial, current.soa_serial)
+    seeded = compare_serial(current.soa_serial, previous_serial) > 0
+    if not seeded:
+        current.soa_serial = previous_serial
     current.dns_content_hash = previous_hash
     current.save(update_fields=[field for field in CONFIG_FIELDS if field != "id"])
     Host.objects.bulk_create([Host(**raw) for raw in data["hosts"]])
     GandiRecord.objects.bulk_create([GandiRecord(**raw) for raw in data["gandi_records"]])
-    track_dns_content(current, seeded=current.soa_serial > previous_serial)
+    track_dns_content(current, seeded=seeded)
     return next_revision

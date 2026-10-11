@@ -3,7 +3,7 @@
 import copy
 import hashlib
 import json
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 from django.core.exceptions import ValidationError
 
@@ -11,36 +11,42 @@ MAX_SERIAL = 2**32 - 1
 
 
 def initial_serial():
-    return int(datetime.now(timezone.utc).strftime("%Y%m%d") + "00")
+    serial = int(datetime.now(timezone.utc).timestamp())
+    validate_serial(serial)
+    return serial
 
 
 def validate_serial(serial):
-    text = str(serial)
-    try:
-        if type(serial) is not int or len(text) != 10 or not 1 <= serial <= MAX_SERIAL:
-            raise ValueError
-        date(int(text[:4]), int(text[4:6]), int(text[6:8]))
-    except ValueError as error:
+    if type(serial) is not int or not 0 <= serial <= MAX_SERIAL:
         raise ValidationError(
-            "SOA serial must be a real UTC YYYYMMDDnn date, counter 00..99, within uint32. "
-            "Seed upward above the installed serial. Incompatible higher legacy serials "
-            "require an administrator-coordinated DNS serial reset before migration."
-        ) from error
+            "SOA serial must be an unsigned 32-bit integer (0..4294967295)."
+        )
+
+
+def compare_serial(candidate, previous):
+    """Return RFC 1982 ordering, rejecting the undefined half-range distance."""
+    validate_serial(candidate)
+    validate_serial(previous)
+    distance = (candidate - previous) & MAX_SERIAL
+    if distance == 2**31:
+        raise ValidationError(
+            f"Ambiguous RFC 1982 serial comparison: {candidate} and {previous} differ by 2147483648."
+        )
+    return 0 if distance == 0 else 1 if distance < 2**31 else -1
 
 
 def next_serial(previous):
     validate_serial(previous)
     today = initial_serial()
     validate_serial(today)
-    if today > previous:
-        return today
-    if previous % 100 == 99:
+    if previous == MAX_SERIAL:
         raise ValidationError(
-            "SOA counter 99 is exhausted for its date. Wait until UTC passes that date; "
-            "clock rollback or a future seed never permits a lower or fictitious date."
+            "SOA serial uint32 range is exhausted. An administrator-coordinated migration is required."
         )
-    result = previous + 1
+    result = max(today, previous + 1)
     validate_serial(result)
+    if compare_serial(result, previous) != 1:
+        raise ValidationError("Timestamp SOA serial would not advance under RFC 1982.")
     return result
 
 

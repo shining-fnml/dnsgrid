@@ -39,8 +39,13 @@ class ModelTests(InventoryTestCase):
     def test_seed_and_singleton_defaults(self):
         self.assertEqual(self.config.pk, 1)
         self.assertEqual(self.config.revision, 1)
-        from .dns_serial import initial_serial
-        self.assertEqual(self.config.soa_serial, initial_serial())
+        from .dns_serial import initial_serial, validate_serial
+        validate_serial(self.config.soa_serial)
+        self.assertLessEqual(self.config.soa_serial, initial_serial())
+        self.assertEqual(Configuration.load().soa_serial, self.config.soa_serial)
+        with patch("inventory.dns_serial.datetime") as clock:
+            clock.now.return_value.timestamp.return_value = 1692746706.999
+            self.assertEqual(Configuration().soa_serial, 1692746706)
         self.assertEqual(self.config.soa_ns, "ns.example.tld")
         self.assertEqual(
             list(Site.objects.values_list("id", "name", "g")),

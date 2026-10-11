@@ -114,9 +114,21 @@ class DNSWorkflowTests(TestCase):
     def test_generation_identifier_and_serial_validation_is_preserved(self):
         validate_generation("dnsgrid-2026100800", 2026100800)
         for generation, serial in (("../escape", 2026100800), ("dnsgrid-2026100801", 2026100800),
-                                   ("dnsgrid-2026023000", 2026023000), ("dnsgrid-True", True)):
+                                   ("dnsgrid-4294967296", 4294967296), ("dnsgrid-True", True)):
             with self.subTest(generation=generation), self.assertRaises(ValidationError):
                 validate_generation(generation, serial)
+
+    def test_uint32_and_timestamp_generations_round_trip_without_date_rules(self):
+        for serial in (0, 42, 1692746706, 2026023000, 4294967295):
+            with self.subTest(serial=serial):
+                Configuration.objects.update(soa_serial=serial)
+                self.assertEqual(self.publish()[1], [])
+                generation = f"dnsgrid-{serial}"
+                path, manifest = read_generation(str(self.path), generation)
+                raw = (path / "manifest.json").read_bytes()
+                self.assertEqual(manifest["serial"], serial)
+                self.publish()
+                self.assertEqual((path / "manifest.json").read_bytes(), raw)
 
     def test_safe_bounded_retention_preserves_unrelated_and_pins(self):
         self.publish()
