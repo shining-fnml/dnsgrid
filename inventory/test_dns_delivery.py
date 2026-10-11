@@ -1,15 +1,17 @@
 import copy
 import fcntl
 import json
+import os
 import stat
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import connection
-from django.test import Client, TestCase, TransactionTestCase
+from django.test import Client, TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 
 from .archives import restore, snapshot, validate
@@ -287,6 +289,61 @@ class DNSDeliveryTests(TestCase):
         response = self.client.get(reverse("configuration"))
         self.assertContains(response, "dns_sftp_inbox")
         self.assertNotContains(response, "DNSGRID_DNS_SFTP_IDENTITY_FILE")
+
+    @override_settings(DNSGRID_DIAGNOSTICS=True)
+    def test_skipped_delivery_diagnostics_explain_disabled_incomplete_and_reused(self):
+        Configuration.objects.update(dns_sftp_inbox="")
+        with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
+            self.assertEqual(self.publish()[2], "disabled")
+        self.assertIn("Delivery skipped", "\n".join(output.output))
+        self.assertIn("disabled", "\n".join(output.output))
+        self.deliver.assert_not_called()
+        Configuration.objects.update(dns_sftp_inbox="/inbox")
+        with patch("inventory.exporters.os.replace", side_effect=OSError("secret")):
+            with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
+                self.assertEqual(self.publish()[2], "failure")
+        text = "\n".join(output.output)
+        self.assertIn("Local publication incomplete", text)
+        self.assertNotIn("secret", text)
+        self.deliver.assert_not_called()
+        self.publish()
+        _, manifest, attempt = self.state()
+        with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
+            self.publish()
+        text = "\n".join(output.output)
+        self.assertIn("Reusing saved attempt", text)
+        self.assertIn(manifest["generation"], text)
+        self.assertIn(attempt["delivery"], text)
+        self.deliver.assert_called_once()
+
+    @override_settings(DNSGRID_DIAGNOSTICS=False)
+    def test_normal_logs_include_outcome_and_no_detailed_skip_trace(self):
+        with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
+            self.publish()
+        text = "\n".join(output.output)
+        self.assertIn("Delivery outcome", text)
+        self.assertIn(self.state()[2]["delivery"], text)
+        self.assertIn("consult matching NAS receipt", text)
+        with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
+            self.publish()
+        self.assertNotIn("Delivery skipped", "\n".join(output.output))
+
+    @override_settings(DNSGRID_DIAGNOSTICS=True)
+    def test_remote_diagnostics_stay_out_of_browser_responses(self):
+        # Exercise the real delivery code and diagnostic pipe capture.
+        self.send.stop()
+        with override_settings(DNSGRID_DNS_SFTP_IDENTITY_FILE="/etc/dnsgrid/key",
+                               DNSGRID_DNS_SFTP_KNOWN_HOSTS="/etc/dnsgrid/known_hosts"):
+            def transfer(*args, **kwargs):
+                os.write(kwargs["stderr"], b"Permission denied (publickey). private remote text")
+                return SimpleNamespace(returncode=255)
+            with patch("inventory.dns_sftp.subprocess.run", side_effect=transfer):
+                with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
+                    response = self.client.post(reverse("dns-deliver"), {"revision": 1}, follow=True)
+        self.assertIn("permission denied", "\n".join(output.output))
+        self.assertNotContains(response, "permission denied")
+        self.assertNotContains(response, "private remote text")
+        self.assertContains(response, "Delivery unconfirmed")
 
 
 class DNSDeliveryTransactionTests(TransactionTestCase):

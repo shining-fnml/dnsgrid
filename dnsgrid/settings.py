@@ -26,6 +26,30 @@ SECRET_KEY = os.environ.get("DNSGRID_SECRET_KEY") or secrets.token_urlsafe(64)
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get("DNSGRID_DEBUG") == "1"
+DNSGRID_DIAGNOSTICS = os.environ.get("DNSGRID_DEBUG") == "2"
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "delivery": {"format": "%(levelname)s dnsgrid.delivery %(message)s"},
+    },
+    "handlers": {
+        "delivery_console": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stderr",
+            "formatter": "delivery",
+            "level": "DEBUG" if DNSGRID_DIAGNOSTICS else "INFO",
+        },
+    },
+    "loggers": {
+        "dnsgrid.delivery": {
+            "handlers": ["delivery_console"],
+            "level": "DEBUG" if DNSGRID_DIAGNOSTICS else "INFO",
+            "propagate": False,
+        },
+    },
+}
 
 ALLOWED_HOSTS = os.environ.get("DNSGRID_ALLOWED_HOSTS", "localhost,127.0.0.1,[::1]").split(",")
 

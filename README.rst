@@ -82,7 +82,9 @@ generated secret in your process environment. Without it, a new random
 key is generated on each process startup: existing sessions are invalidated
 and multiple workers cannot share sessions reliably. Never commit secrets.
 Set ``DNSGRID_ALLOWED_HOSTS`` to a comma-separated hostname allowlist.
-Leave ``DNSGRID_DEBUG`` unset in production.
+Leave ``DNSGRID_DEBUG`` unset in production unless temporarily collecting
+terminal diagnostics with level 2 (described below). Never use level 1 in
+production: it enables Django's web DEBUG mode.
 
 Use a production WSGI/ASGI server with ``dnsgrid.wsgi:application`` or
 ``dnsgrid.asgi:application``, not Django's development server. Terminate
@@ -261,6 +263,57 @@ an independent administrative channel before adding it; merely collecting
 a key from the network does not authenticate it. A nonstandard port needs
 the corresponding known_hosts entry. The client uses key-only batch SFTP,
 strict host-key checking and bounded timeouts; there is no alternate transport.
+
+Terminal publication and delivery diagnostics
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Publication and delivery outcomes are logged through ``dnsgrid.delivery`` to
+the web application's **stderr**, including generation/delivery identifiers.
+SFTP success confirms only the upload batch and final rename, not NAS
+installation. Use **Check NAS result** for the matching validated receipt;
+even an installed receipt does not prove that zones have loaded.
+
+To collect detailed diagnostics, set ``DNSGRID_DEBUG=2`` in the environment of
+your production WSGI/ASGI service and restart its workers. For a local terminal
+session (not a production server), run::
+
+    DNSGRID_DEBUG=2 python manage.py runserver 127.0.0.1:8000
+
+Level 2 does **not** enable Django's web DEBUG mode. Level 1 retains its existing
+development behavior and does not enable detailed SFTP tracing. At level 2,
+logs explain attempted/skipped delivery, including disabled configuration,
+incomplete publication and reuse of a saved attempt. They show destination
+host/port, planned directory creation, zone uploads, manifest-last upload,
+atomic rename and receipt download. Plans are explicitly unconfirmed until
+the process succeeds. A failed/timed-out batch cannot establish which steps
+completed; check the receipt before explicitly retrying with a new identifier.
+Logs also show exit status, elapsed time, startup failure and timeout outcomes.
+SFTP quiet mode is disabled, but arbitrary stdout/stderr is never printed:
+only a fixed allowlist of diagnostic phrases is retained, with redaction,
+byte counts and truncation indicators. Capture retains at most 4096 bytes per
+stream while draining/discarding the rest, and terminal fields are bounded
+and control-escaped. Keys, credentials, payload contents, raw receipts and
+remote summaries are not logged or included in browser responses.
+
+This repository does not supply a service unit or a fixed deployment log
+path. Find logs on the **dnsgrid host**, not in the NAS inbox:
+
+* Foreground execution writes diagnostics to the invoking terminal.
+* With a systemd service using journal collection for stdout/stderr, read
+  ``journalctl -u <your-dnsgrid-unit> -f``. Check the actual unit's
+  ``StandardOutput``/``StandardError`` settings if nothing appears.
+* With a container, inspect its configured logging driver and use
+  ``docker logs -f <your-dnsgrid-container>`` when that driver supports it.
+* With another supervisor or a redirected launcher, use its configured
+  stdout/stderr files; ensure stderr is collected, not discarded. There is
+  no automatic ``dnsgrid.log`` file.
+
+Restrict access to service logs: they include destination metadata and zone
+filenames. Remove level 2 and restart workers after diagnosis. The privileged
+DSM installer runs separately: consult the NAS Task Scheduler's configured
+task output/log collection for its local errors. Web-service diagnostics
+cannot verify DSM authentication, ACLs, scheduling or actual BIND zone loading;
+these require testing on the deployed DSM version.
 
 DSM setup (manual, version-specific)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
