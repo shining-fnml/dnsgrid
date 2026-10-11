@@ -87,13 +87,16 @@ class DNSSerialTests(TestCase):
         host.notes = "metadata"
         host.vpn = True
         save_host(host, Configuration.load().revision)
-        self.assertEqual(Configuration.load().soa_serial, 2026100801)
-        move_host(host.pk, "down", Configuration.load().revision)
         self.assertEqual(Configuration.load().soa_serial, 2026100802)
-        update_settings({"ttl": 600}, self.sites, Configuration.load().revision)
+        host.public_export = True
+        save_host(host, Configuration.load().revision)
+        self.assertEqual(Configuration.load().soa_serial, 2026100802)
+        move_host(host.pk, "down", Configuration.load().revision)
         self.assertEqual(Configuration.load().soa_serial, 2026100803)
-        delete_host(host.pk, Configuration.load().revision)
+        update_settings({"ttl": 600}, self.sites, Configuration.load().revision)
         self.assertEqual(Configuration.load().soa_serial, 2026100804)
+        delete_host(host.pk, Configuration.load().revision)
+        self.assertEqual(Configuration.load().soa_serial, 2026100805)
 
     def test_exhaustion_rolls_back_inventory_and_revision(self):
         Configuration.objects.update(soa_serial=MAX_SERIAL)

@@ -181,13 +181,10 @@ class VpnReportTests(TestCase):
         self.assertEqual(set(modes), {"rb"})
         self.assertEqual(snapshot(), before)
 
-    def test_vpn_hosts_export_matches_report_expectation(self):
-        lines = build_exports()["vpn.hosts"].splitlines()[1:]
-        self.assertIn("172.28.1.50 alpha.vpn", lines)
-        self.assertNotIn("lan", " ".join(lines))
-        for line in lines:
-            address, name = line.split()
-            self.assertTrue(name.endswith(".vpn"))
+    def test_vpn_zone_export_replaces_hosts_file_export(self):
+        exports = build_exports()
+        self.assertIn("alpha.vpn. 300 A 172.28.1.50", exports["vpn.zone"])
+        self.assertNotIn("vpn.hosts", exports)
 
 
 class VpnReportViewTests(TestCase):
@@ -230,14 +227,12 @@ class VpnReportViewTests(TestCase):
         self.user.save()
         self.assertEqual(self.client.get(reverse("vpn-report")).status_code, 403)
 
-    def test_navigation_and_export_page_link_report_and_keep_vpn_hosts_download(self):
+    def test_navigation_and_export_page_link_report_without_hosts_file_download(self):
         response = self.client.get(reverse("exports"))
         self.assertContains(response, reverse("vpn-report"))
-        self.assertContains(response, "<code>ip name.vpn</code>", html=True)
+        self.assertContains(response, "<code>vpn.</code>", html=True)
         revision = response.context["revision"]
         download = self.client.get(
             reverse("download", args=["vpn.hosts"]) + f"?revision={revision}",
         )
-        self.assertEqual(download.status_code, 200)
-        self.assertIn("172.28.1.50 alpha.vpn\n", download.content.decode())
-        self.assertNotIn("vpn.example.tld", download.content.decode())
+        self.assertEqual(download.status_code, 404)

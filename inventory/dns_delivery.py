@@ -1,4 +1,8 @@
-"""Persist exact SFTP attempts; only a matching NAS receipt releases retention."""
+"""Deprecated DNS SFTP machinery retained only for legacy recovery metadata.
+
+DNS zone publication no longer routes through this module. Its transport,
+retry, and receipt functions are not exposed in the application workflow.
+"""
 
 import fcntl
 import hashlib

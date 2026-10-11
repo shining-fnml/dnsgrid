@@ -28,7 +28,7 @@ CONFIG_FIELDS = (
     "lan_domain", "vpn_domain", "lan_prefix", "vpn_prefix", "gandi_zone",
     "ttl", "soa_ns", "soa_mailbox",
     "soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns", "dns_export_directory",
-    "dns_sftp_host", "dns_sftp_user", "dns_sftp_port", "dns_sftp_inbox", "dns_sftp_outbox",
+    "named_checkzone", "rndc", "rndc_key",
 )
 
 
@@ -327,8 +327,8 @@ def confirm(request):
             if (request.POST.get("dns_unloaded_ack") != "yes"
                     or request.POST.get("delivery_cleanup_ack") != "yes"):
                 raise ValidationError(
-                    "Confirm that no DNS server loaded the legacy serials and that the DSM task "
-                    "is paused with legacy inbox/outbox deliveries removed."
+                    "Confirm that no DNS server loaded the legacy serials and that the retired "
+                    "DSM DNS task is stopped with legacy deliveries quarantined."
                 )
             lower_dns_serial(
                 expected_revision=revision, expected_serial=payload["expected_serial"],
@@ -418,7 +418,6 @@ def archive_upload(request):
 
 @operator
 def exports(request):
-    from .dns_delivery import delivery_states, enabled
     with transaction.atomic():
         Configuration.objects.filter(pk=1).update(revision=F("revision"))
         config = Configuration.load()
@@ -427,9 +426,8 @@ def exports(request):
         "artifacts": artifacts, "revision": config.revision,
         "dns_export_directory": config.dns_export_directory,
         "dns_published_generation": config.dns_published_generation,
-        "soa_serial": config.soa_serial,
-        "dns_delivery_enabled": enabled(config),
-        "dns_deliveries": delivery_states(config),
+        "soa_serial": config.soa_serial, "named_checkzone": config.named_checkzone,
+        "rndc": config.rndc, "rndc_key": config.rndc_key,
     })
 
 
@@ -442,63 +440,26 @@ def dns_publish(request):
         messages.error(request, _errors(error))
     else:
         if written:
-            messages.success(request, "DNS zone files written: " + ", ".join(written))
+            if any(filename == "RNDC reload" for filename, _ in errors):
+                messages.error(
+                    request,
+                    "DNS zone files were installed, but the general RNDC reload failed; "
+                    "external client resolution was not checked: " + ", ".join(written),
+                )
+            elif errors:
+                messages.warning(
+                    request,
+                    "Some DNS zone files were installed; the complete set was not installed "
+                    "and RNDC was not invoked: " + ", ".join(written),
+                )
+            else:
+                messages.success(
+                    request,
+                    "DNS zone files installed; the general RNDC reload command succeeded "
+                    "(external client resolution was not checked): " + ", ".join(written),
+                )
         for filename, error in errors:
-            messages.error(request, f"DNS zone write failed for {filename}: {error}")
-    return redirect("exports")
-
-
-def _delivery_message(request, status, summary):
-    if status in ("failure", "failed", "invalid", "unconfirmed", "reload_failed"):
-        messages.warning(request, summary)
-    elif status in ("installed", "already_installed", "reloaded"):
-        messages.success(request, summary)
-    else:
-        messages.info(request, summary)
-
-
-@operator
-@require_POST
-def dns_deliver(request):
-    from .dns_delivery import publish_and_deliver
-    try:
-        written, errors, status, summary = publish_and_deliver(request.POST.get("revision"))
-        if written:
-            messages.success(request, "Local DNS zone files written: " + ", ".join(written))
-        for filename, error in errors:
-            messages.error(request, f"DNS zone write failed for {filename}: {error}")
-        _delivery_message(request, status, summary)
-    except (ValidationError, OSError, IntegrityError, OperationalError) as error:
-        messages.error(request, _errors(error))
-    return redirect("exports")
-
-
-@operator
-@require_POST
-def dns_retry(request):
-    from .dns_delivery import retry_delivery
-    return _dns_attempt_action(request, retry_delivery)
-
-
-@operator
-@require_POST
-def dns_result(request):
-    from .dns_delivery import check_result
-    return _dns_attempt_action(request, check_result, check=True)
-
-
-def _dns_attempt_action(request, action, check=False):
-    try:
-        revision = request.POST.get("revision", "")
-        if not revision.isascii() or not revision.isdecimal() or len(revision) > 10:
-            raise ValidationError("Reload export previews before updating the NAS delivery.")
-        arguments = [int(revision), request.POST.get("generation")]
-        if check:
-            arguments.append(request.POST.get("delivery"))
-        status, summary = action(*arguments)
-        _delivery_message(request, status, summary)
-    except (ValidationError, OSError, IntegrityError, OperationalError) as error:
-        messages.error(request, _errors(error))
+            messages.error(request, f"DNS publication failed for {filename}: {error}")
     return redirect("exports")
 
 

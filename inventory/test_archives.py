@@ -187,20 +187,21 @@ class ArchiveDataTests(TestCase):
         candidate = copy.deepcopy(self.data)
         candidate["hosts"][0]["id"] = MAX_ID
         candidate["gandi_records"][0]["id"] = MAX_ID
-        restore(candidate, expected_revision=1)
-        self.assertTrue(Host.objects.filter(pk=MAX_ID, name="host-1").exists())
-        self.assertTrue(GandiRecord.objects.filter(pk=MAX_ID, name="retired.vpn").exists())
-        following_host = Host.objects.create(
-            name="following", site_id=1, row=7, column=2,
-        )
-        following_record = GandiRecord.objects.create(
-            zone="example.tld", name="following.vpn", values=["172.28.1.39"],
-        )
-        self.assertEqual(following_host.pk, 1)
-        self.assertEqual(following_record.pk, 1)
-        self.assertEqual(Configuration.load().revision, 2)
-        roundtrip = loads(dumps(snapshot()).encode())
-        restore(roundtrip, expected_revision=2)
+        with patch("inventory.dns_serial.initial_serial", return_value=self.data["configuration"]["soa_serial"]):
+            restore(candidate, expected_revision=1)
+            self.assertTrue(Host.objects.filter(pk=MAX_ID, name="host-1").exists())
+            self.assertTrue(GandiRecord.objects.filter(pk=MAX_ID, name="retired.vpn").exists())
+            following_host = Host.objects.create(
+                name="following", site_id=1, row=7, column=2,
+            )
+            following_record = GandiRecord.objects.create(
+                zone="example.tld", name="following.vpn", values=["172.28.1.39"],
+            )
+            self.assertEqual(following_host.pk, 1)
+            self.assertEqual(following_record.pk, 1)
+            self.assertEqual(Configuration.load().revision, 2)
+            roundtrip = loads(dumps(snapshot()).encode())
+            restore(roundtrip, expected_revision=2)
         restored = snapshot()
         restored["configuration"]["revision"] = roundtrip["configuration"]["revision"]
         self.assertEqual(restored["configuration"]["soa_serial"], roundtrip["configuration"]["soa_serial"] + 1)
@@ -343,7 +344,8 @@ class ArchiveDataTests(TestCase):
         candidate = copy.deepcopy(self.data)
         candidate["configuration"]["revision"] = 40
         Host.objects.create(name="target-conflict", row=7, column=1, site_id=4)
-        result = restore(candidate, expected_revision=1)
+        with patch("inventory.dns_serial.initial_serial", return_value=self.data["configuration"]["soa_serial"]):
+            result = restore(candidate, expected_revision=1)
         self.assertEqual(result, 41)
         after = snapshot()
         after["configuration"]["revision"] = self.data["configuration"]["revision"]
@@ -353,10 +355,12 @@ class ArchiveDataTests(TestCase):
         user.refresh_from_db()
         self.assertEqual(user.password, original_password)
         self.assertEqual(Configuration.load().gandi_token, "destination-secret")
+        for field in ("named_checkzone", "rndc", "rndc_key"):
+            self.assertEqual(getattr(Configuration.load(), field), "")
         self.assertEqual([host.pk for host in Host.objects.order_by("pk")], [11, 12, 13])
         self.assertEqual(GandiRecord.objects.get().pk, 20)
         for name, artifact in before_exports.items():
-            if name != "forward.zone" and not name.startswith("reverse-"):
+            if name != "forward.zone" and name != "vpn.zone" and not name.startswith("reverse-"):
                 self.assertEqual(build_exports()[name], artifact)
             else:
                 self.assertEqual(build_exports()[name].replace(

@@ -272,7 +272,7 @@ class OperatorViewsTests(TestCase):
                 "lan_domain", "vpn_domain", "lan_prefix", "vpn_prefix",
                 "gandi_zone", "ttl", "soa_ns", "soa_mailbox", "revision",
                 "soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns",
-                "dns_export_directory", "soa_serial",
+                "dns_export_directory", "named_checkzone", "rndc", "rndc_key", "soa_serial",
             )
         }
         for site in Site.objects.all():

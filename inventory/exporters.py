@@ -2,8 +2,10 @@
 
 import json
 import os
+import subprocess
 import stat
 import tempfile
+import time
 from pathlib import Path
 
 from django.core.exceptions import ValidationError
@@ -14,6 +16,10 @@ from .dsm import reservation_payload
 from .models import Configuration, Host, Site
 from .dns_serial import track_dns_content
 from .dns_diagnostics import log
+
+RNDC_TIMEOUT = 10
+ZONE_CHECK_TIMEOUT = 10
+VPN_ZONE = "vpn"
 
 
 @transaction.atomic
@@ -66,7 +72,51 @@ def _dns_zones(config, hosts):
         )
         reverse.append(f"{origin}. NS {config.zone_ns}.")
         zones[f"reverse-{group}.zone"] = (origin, "\n".join(reverse) + "\n")
+    origin = VPN_ZONE
+    vpn = _header(config, origin)
+    vpn.extend(
+        f"{host.name}.{origin}. {config.ttl} A {host.vpn_address(config)}"
+        for host in hosts if host.vpn
+    )
+    vpn.append(f"{origin}. NS {config.zone_ns}.")
+    zones[f"{origin}.zone"] = (f"{origin}.zone", "\n".join(vpn) + "\n")
     return zones
+
+
+def _run(command, timeout):
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            command, shell=False, check=False, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, time.monotonic() - started
+    return result.returncode, time.monotonic() - started
+
+
+def _validate_zone(config, zone, path):
+    result, elapsed = _run(
+        [config.named_checkzone, f"{zone}.", str(path)], ZONE_CHECK_TIMEOUT,
+    )
+    log(
+        "BIND zone validation succeeded" if result == 0 else "BIND zone validation failed",
+        detail=result is not None, zone=zone, exit_status=result,
+        elapsed_ms=round(elapsed * 1000),
+    )
+    return result == 0
+
+
+def _reload(config):
+    result, elapsed = _run([
+        config.rndc, "-k", config.rndc_key, "-s", "127.0.0.1", "-p", "953", "reload",
+    ], RNDC_TIMEOUT)
+    log(
+        "General RNDC reload command succeeded" if result == 0 else "General RNDC reload command failed",
+        detail=result is not None, exit_status=result, elapsed_ms=round(elapsed * 1000),
+        verification="external client resolution not checked",
+    )
+    return result == 0
 
 
 @transaction.atomic
@@ -81,6 +131,19 @@ def publish_dns_zones(expected_revision):
         raise ValidationError("Configure a DNS export directory in Settings before publishing.")
     if not Path(directory).is_absolute() or "\x00" in directory:
         raise ValidationError("The DNS export directory must be an absolute local path.")
+    if not (config.named_checkzone and config.rndc and config.rndc_key):
+        raise ValidationError("Configure named_checkzone, rndc, and rndc_key before publishing DNS zones.")
+    for value in (config.named_checkzone, config.rndc, config.rndc_key):
+        if "\x00" in value or not Path(value).is_absolute():
+            raise ValidationError("BIND validator and RNDC paths must be absolute.")
+    directory_path = Path(directory)
+    try:
+        directory_info = directory_path.lstat()
+        real_directory = directory_path.resolve() == directory_path.absolute()
+    except OSError as error:
+        raise ValidationError("The BIND zone directory must be an existing real directory without symlinks.") from error
+    if not stat.S_ISDIR(directory_info.st_mode) or not real_directory:
+        raise ValidationError("The BIND zone directory must be a real directory without symlinks.")
     track_dns_content(config)
     zones = _dns_zones(config, hosts)
     filenames = [filename for filename, _ in zones.values()]
@@ -93,17 +156,17 @@ def publish_dns_zones(expected_revision):
         raise ValidationError("Invalid DNS zone filename.")
     from .dns_publication import preflight_generation
     preflight_generation(config, zones)
-    written, errors = [], []
+    staged, errors = [], []
     for filename, content in zones.values():
         temporary = None
         try:
-            target = Path(directory) / filename
+            target = directory_path / filename
             try:
                 previous = target.lstat()
             except FileNotFoundError:
                 previous = None
             with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", newline="\n", dir=directory,
+                mode="w", encoding="utf-8", newline="\n", dir=directory_path,
                 prefix=".dnsgrid-", delete=False,
             ) as stream:
                 temporary = stream.name
@@ -116,10 +179,14 @@ def publish_dns_zones(expected_revision):
                         os.fchown(stream.fileno(), -1, previous.st_gid)
                 os.fchmod(stream.fileno(), mode)
                 os.fsync(stream.fileno())
-            os.replace(temporary, target)
-            written.append(filename)
+            zone_origin = VPN_ZONE if filename == f"{VPN_ZONE}.zone" else filename
+            if not _validate_zone(config, zone_origin, temporary):
+                errors.append((filename, "BIND zone validation failed; no zone files were installed."))
+                break
+            staged.append((filename, temporary, target))
+            temporary = None
         except OSError as error:
-            errors.append((filename, str(error)))
+            errors.append((filename, "Could not stage or validate the BIND zone file."))
         finally:
             if temporary is not None:
                 try:
@@ -127,13 +194,48 @@ def publish_dns_zones(expected_revision):
                 except FileNotFoundError:
                     pass
                 except OSError as error:
-                    errors.append((filename, f"Could not remove temporary file: {error}"))
+                    errors.append((filename, "Could not remove a temporary BIND zone file."))
+    written = []
+    if not errors:
+        for index, (filename, temporary, target) in enumerate(staged):
+            try:
+                os.replace(temporary, target)
+                written.append(filename)
+            except OSError:
+                errors.append((filename, "Atomic BIND zone installation failed; RNDC reload skipped."))
+                for _, pending, _ in staged[index + 1:]:
+                    try:
+                        os.unlink(pending)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        errors.append((filename, "Could not remove a temporary BIND zone file."))
+                break
+            finally:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    errors.append((filename, "Could not remove a temporary BIND zone file."))
+    else:
+        for filename, temporary, _ in staged:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                errors.append((filename, "Could not remove a temporary BIND zone file."))
     if not errors:
         from .dns_publication import commit_generation
         try:
             commit_generation(config, zones)
-        except (OSError, ValidationError) as error:
-            errors.append(("generation manifest", str(error)))
+        except ValidationError as error:
+            errors.append(("generation manifest", "; ".join(error.messages)))
+        except OSError:
+            errors.append(("generation manifest", "Could not commit the immutable DNS generation."))
+    if not errors and not _reload(config):
+        errors.append(("RNDC reload", "The general RNDC reload failed or timed out; client resolution was not verified."))
     log("Local publication incomplete" if errors else "Local publication complete",
         generation=f"dnsgrid-{config.soa_serial}", files_written=len(written), failures=len(errors))
     return written, errors
@@ -171,13 +273,5 @@ def build_exports(config=None, hosts=None):
             result[f"dsm-reservations-site-{site.pk}.json"] = json.dumps(
                 reservation_payload(config, site, hosts), indent=2,
             ) + "\n"
-    vpn = [
-        "# DNSGrid application-owned export; do not replace unrelated configuration.",
-    ]
-    vpn.extend(
-        f"{host.vpn_address(config)} {host.vpn_short_name}"
-        for host in hosts if host.vpn
-    )
-    result["vpn.hosts"] = "\n".join(vpn) + "\n"
     result["gandi.json"] = json.dumps(desired_gandi(config, hosts), indent=2) + "\n"
     return result

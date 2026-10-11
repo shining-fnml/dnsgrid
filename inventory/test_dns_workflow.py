@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -24,7 +25,14 @@ class DNSWorkflowTests(TestCase):
         self.path = Path(directory.name)
         Configuration.objects.update(
             dns_export_directory=str(self.path), soa_serial=2026100800,
+            named_checkzone="/usr/bin/named-checkzone",
+            rndc="/usr/bin/rndc", rndc_key="/etc/bind/rndc.key",
         )
+        self.commands = patch(
+            "inventory.exporters.subprocess.run", return_value=SimpleNamespace(returncode=0),
+        )
+        self.commands.start()
+        self.addCleanup(self.commands.stop)
         self.clock = patch("inventory.dns_serial.initial_serial", return_value=2026100800)
         self.clock.start()
         self.addCleanup(self.clock.stop)
@@ -37,7 +45,7 @@ class DNSWorkflowTests(TestCase):
     def test_manifest_hashes_precise_generation_and_noop_is_immutable(self):
         exports = build_exports()
         written, errors = self.publish()
-        self.assertEqual((len(written), errors), (5, []))
+        self.assertEqual((len(written), errors), (6, []))
         config = Configuration.load()
         path, manifest = read_generation(str(self.path), config.dns_published_generation)
         self.assertEqual(manifest["serial"], config.soa_serial)
@@ -90,7 +98,7 @@ class DNSWorkflowTests(TestCase):
 
         def observe(path, data, **kwargs):
             if path.name == "manifest.json":
-                for filename in (Configuration.load().lan_domain, "1.168.192.in-addr.arpa",
+                for filename in (Configuration.load().lan_domain, "vpn.zone", "1.168.192.in-addr.arpa",
                                  "2.168.192.in-addr.arpa", "3.168.192.in-addr.arpa", "4.168.192.in-addr.arpa"):
                     self.assertTrue((path.parent / filename).exists())
             seen.append(path)

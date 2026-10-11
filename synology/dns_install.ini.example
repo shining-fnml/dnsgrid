@@ -1,3 +1,6 @@
+# DEPRECATED for DNS publication: this is only for the legacy NAS-side receiver.
+# dnsgrid now publishes DNS zones locally on the VPN hub; do not schedule this
+# installer for DNS delivery. Configure the hub's paths in dnsgrid Settings.
 # Illustrative paths only: verify paths and ACLs on the installed DSM version.
 # Store the real configuration outside all SFTP-writable directories.
 [dns_install]
