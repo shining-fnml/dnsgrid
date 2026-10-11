@@ -66,7 +66,7 @@ class DNSBaselineTests(TestCase):
                 self.assertEqual(list(Configuration.objects.values()), before)
 
     def test_lowering_preserves_inventory_installer_state_and_immutable_generations(self):
-        directory = tempfile.TemporaryDirectory(dir=Path.cwd(), prefix=".baseline-fixture-")
+        directory = tempfile.TemporaryDirectory(prefix=".baseline-fixture-")
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
         generation = root / "generations" / f"dnsgrid-{self.legacy}"
