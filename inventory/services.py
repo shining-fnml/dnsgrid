@@ -49,7 +49,7 @@ def plan_placement(row, column, exclude_host_id=None):
     return shifts
 
 
-def _claim_revision(expected_revision, changed=True):
+def _claim_revision(expected_revision, changed=True, reset_recovery=False):
     if type(expected_revision) is not int or not 1 <= expected_revision <= MAX_SERIAL:
         raise ValidationError("Invalid or stale configuration revision.")
     if changed and expected_revision == MAX_SERIAL:
@@ -59,6 +59,9 @@ def _claim_revision(expected_revision, changed=True):
     )
     if not updated:
         raise ValidationError("Stale configuration revision. Reload and try again.")
+    if not reset_recovery:
+        from .dns_reset import ensure_ready
+        ensure_ready(Configuration.load().dns_export_directory)
 
 
 def _host_values(host):
@@ -242,8 +245,12 @@ def lower_dns_serial(expected_revision, expected_serial, baseline, confirmed=Fal
         if baseline >= current.soa_serial or baseline > initial_serial():
             raise ValidationError("The baseline must lower the stored serial to a Unix timestamp no later than now.")
         _claim_revision(expected_revision)
-        Configuration.objects.filter(pk=1).update(
-            soa_serial=baseline, dns_content_hash=content_fingerprint(current),
-            dns_published_generation="",
-        )
+        _reset_dns_tracking(current, baseline)
         return Configuration.load()
+
+
+def _reset_dns_tracking(current, baseline):
+    Configuration.objects.filter(pk=1).update(
+        soa_serial=baseline, dns_content_hash=content_fingerprint(current),
+        dns_published_generation="",
+    )

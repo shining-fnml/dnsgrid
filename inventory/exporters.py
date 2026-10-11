@@ -72,6 +72,8 @@ def _dns_zones(config, hosts):
 @transaction.atomic
 def publish_dns_zones(expected_revision):
     config, hosts = _inputs(None, None)
+    from .dns_reset import ensure_ready
+    ensure_ready(config.dns_export_directory)
     if str(config.revision) != expected_revision:
         raise ValidationError("Inventory changed. Reload export previews before publishing.")
     directory = config.dns_export_directory
