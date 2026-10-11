@@ -13,6 +13,7 @@ from django.db.models import F
 from .dsm import reservation_payload
 from .models import Configuration, Host, Site
 from .dns_serial import track_dns_content
+from .dns_diagnostics import log
 
 
 @transaction.atomic
@@ -131,6 +132,8 @@ def publish_dns_zones(expected_revision):
             commit_generation(config, zones)
         except (OSError, ValidationError) as error:
             errors.append(("generation manifest", str(error)))
+    log("Local publication incomplete" if errors else "Local publication complete",
+        generation=f"dnsgrid-{config.soa_serial}", files_written=len(written), failures=len(errors))
     return written, errors
 
 

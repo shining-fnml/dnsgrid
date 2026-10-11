@@ -7,6 +7,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 
 from .dns_serial import validate_serial
+from .dns_diagnostics import capture_output, log, sanitized_output
 
 
 def validate_destination(host, user, port):
@@ -80,7 +82,8 @@ def _arguments(config):
     if ":" in host:
         host = f"[{host}]"
     return [
-        "/usr/bin/sftp", "-F", "/dev/null", "-q", "-b", "-",
+        "/usr/bin/sftp", "-F", "/dev/null",
+        *([] if settings.DNSGRID_DIAGNOSTICS else ["-q"]), "-b", "-",
         "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
         "-o", "IdentitiesOnly=yes", "-o", "GlobalKnownHostsFile=/dev/null",
         "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
@@ -96,11 +99,39 @@ def _run(config, batch, download=False):
     if download:
         # Bound disk consumption as well as duration for an untrusted receipt.
         arguments[1:1] = ["-l", "64"]
-    return subprocess.run(
-        arguments, input=batch.encode("utf-8"),
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        shell=False, timeout=120, check=False,
-    ).returncode
+    if not settings.DNSGRID_DIAGNOSTICS:
+        return subprocess.run(
+            arguments, input=batch.encode("utf-8"),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            shell=False, timeout=120, check=False,
+        ).returncode
+    started = time.monotonic()
+    outcome = "startup failure"
+    code = "unavailable"
+    error_type = ""
+    captured = [[bytearray(), 0], [bytearray(), 0]]
+    identifier = re.search(r"dnsgrid-[0-9]+-[0-9a-f]{32}", batch)
+    try:
+        with capture_output() as (pipes, captured):
+            try:
+                code = subprocess.run(
+                    arguments, input=batch.encode("utf-8"),
+                    stdout=pipes[0], stderr=pipes[1],
+                    shell=False, timeout=120, check=False,
+                ).returncode
+                outcome = "batch confirmed" if code == 0 else "batch unconfirmed"
+                return code
+            except subprocess.TimeoutExpired:
+                outcome = "timeout after 120 seconds; completed steps unknown"
+                raise
+            except OSError as error:
+                error_type = type(error).__name__
+                raise
+    finally:
+        log("SFTP process", detail=True, outcome=outcome, exit_status=code,
+            delivery=identifier.group() if identifier else "unavailable",
+            elapsed_seconds=f"{time.monotonic() - started:.3f}", error_type=error_type,
+            stdout=sanitized_output(*captured[0]), stderr=sanitized_output(*captured[1]))
 
 
 def _unique_object(pairs):
@@ -128,14 +159,31 @@ def deliver(config, path, manifest, delivery):
         f"put {quote(path / 'manifest.json')} {quote(partial + '/manifest.json')}",
         f"rename {quote(partial)} {quote(remote)}",
     ])
+    log("SFTP delivery attempted", detail=True, generation=manifest["generation"],
+        delivery=delivery, host=config.dns_sftp_host, port=config.dns_sftp_port)
+    log("SFTP plan (not yet confirmed)", detail=True, delivery=delivery,
+        step="create partial directory", path=partial)
+    for zone in manifest["zones"]:
+        log("SFTP plan (not yet confirmed)", detail=True, delivery=delivery,
+            step="upload zone", filename=zone["filename"])
+    log("SFTP plan (not yet confirmed)", detail=True, delivery=delivery,
+        step="upload manifest last")
+    log("SFTP plan (not yet confirmed)", detail=True, delivery=delivery,
+        step="atomic final rename", path=remote)
     try:
         code = _run(config, "\n".join(batch) + "\n")
     except subprocess.TimeoutExpired:
+        log("SFTP delivery unconfirmed: timeout; check NAS receipt", delivery=delivery)
         return "unconfirmed", "Delivery unconfirmed: SFTP timed out. Check NAS result before retrying."
     except OSError:
+        log("SFTP delivery failed: unable to start process", delivery=delivery)
         return "failure", "Unable to start SFTP; check local configuration."
     if code:
+        log("SFTP delivery unconfirmed: batch failed; check NAS receipt",
+            delivery=delivery, exit_status=code)
         return "unconfirmed", "Delivery unconfirmed: SFTP interrupted or failed. Check NAS result."
+    log("SFTP batch confirmed: directory, zones, manifest and rename; NAS installation not confirmed",
+        delivery=delivery, generation=manifest["generation"])
     return "delivered", "Delivered, awaiting NAS processing. File installation is not yet confirmed."
 
 
@@ -145,9 +193,14 @@ def read_result(config, delivery, serial):
     with tempfile.TemporaryDirectory(prefix="dnsgrid-result-") as directory:
         path = Path(directory) / "result.json"
         batch = f"get {quote(config.dns_sftp_outbox + '/' + delivery + '.json')} {quote(path)}\n"
+        log("SFTP receipt download planned (not yet confirmed)", detail=True,
+            delivery=delivery, generation=f"dnsgrid-{serial}",
+            host=config.dns_sftp_host, port=config.dns_sftp_port)
         try:
             if _run(config, batch, download=True):
+                log("NAS receipt unavailable; installation not confirmed", delivery=delivery)
                 return "pending", "Result unavailable: delivery completed or unconfirmed, awaiting NAS processing."
+            log("SFTP receipt download confirmed; validation pending", detail=True, delivery=delivery)
             descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(descriptor, "rb") as stream:
                 info = os.fstat(stream.fileno())
@@ -168,10 +221,13 @@ def read_result(config, delivery, serial):
                     or any(ord(char) < 32 or ord(char) == 127 for char in result["summary"])):
                 raise ValueError
         except (subprocess.TimeoutExpired, OSError):
+            log("NAS receipt read unconfirmed; retry check", delivery=delivery)
             return "pending", "NAS result read unconfirmed; retry the check."
         except (ValueError, KeyError, TypeError, AttributeError, UnicodeError, RecursionError):
+            log("Invalid NAS receipt; installation not confirmed", delivery=delivery)
             return "invalid", "Invalid NAS result; no installation confirmed."
     # Never display NAS-provided text, even from a structurally valid result.
+    log("Validated NAS receipt; zone loading not verified", delivery=delivery, status=result["status"])
     return result["status"], {
         "installed": "Files installed on the NAS; zone loading not verified.",
         "already_installed": "Files already installed on the NAS; zone loading not verified.",

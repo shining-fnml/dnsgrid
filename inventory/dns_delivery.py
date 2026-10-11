@@ -13,6 +13,7 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 
 from . import dns_sftp
+from .dns_diagnostics import log
 from .dns_publication import _atomic, _directory, _read, pending_generations, read_generation
 from .exporters import publish_dns_zones
 from .models import Configuration
@@ -111,9 +112,13 @@ def _prepare(config, generation, fresh=False):
 
 
 def _send(config, path, manifest, attempt):
+    log("Delivery attempted", detail=True, generation=manifest["generation"],
+        delivery=attempt["delivery"], host=config.dns_sftp_host, port=config.dns_sftp_port)
     try:
         status, summary = dns_sftp.deliver(config, path, manifest, attempt["delivery"])
     except (ValidationError, OSError):
+        log("Delivery failed: local configuration or filesystem unavailable",
+            generation=manifest["generation"], delivery=attempt["delivery"])
         status, summary = "failure", LABELS["failure"]
     if status not in {"delivered", "unconfirmed", "failure"}:
         status, summary = "unconfirmed", LABELS["unconfirmed"]
@@ -121,6 +126,8 @@ def _send(config, path, manifest, attempt):
         _claim_revision(Configuration.load().revision, changed=False)
         attempt["status"] = status
         _save(path, attempt)
+    log("Delivery outcome; consult matching NAS receipt for installation",
+        generation=manifest["generation"], delivery=attempt["delivery"], status=status)
     return status, summary
 
 
@@ -128,6 +135,8 @@ def publish_and_deliver(expected_revision):
     config = Configuration.load()
     if not enabled(config):
         written, errors = publish_dns_zones(expected_revision)
+        log("Delivery skipped", detail=True, reason="NAS SFTP delivery is disabled",
+            generation=Configuration.load().dns_published_generation or "unavailable")
         return written, errors, "disabled", "Local publication only; NAS SFTP delivery is disabled."
     with _lock(config.dns_export_directory):
         with transaction.atomic():
@@ -137,13 +146,19 @@ def publish_and_deliver(expected_revision):
             written, errors = publish_dns_zones(expected_revision)
             config = Configuration.load()
             if errors:
+                log("Delivery skipped", detail=True, reason="Local publication incomplete",
+                    generation=f"dnsgrid-{config.soa_serial}")
                 return written, errors, "failure", "Local publication incomplete; no SFTP delivery attempted."
             if not enabled(config):
+                log("Delivery skipped", detail=True, reason="NAS SFTP delivery is disabled",
+                    generation=config.dns_published_generation)
                 return written, errors, "disabled", "Local publication only; NAS SFTP delivery is disabled."
             path, manifest, attempt, send = _prepare(config, config.dns_published_generation)
         if send:
             status, summary = _send(config, path, manifest, attempt)
         else:
+            log("Delivery skipped", detail=True, reason="Reusing saved attempt; explicit retry required to resend",
+                generation=manifest["generation"], delivery=attempt["delivery"], status=attempt["status"])
             status, summary = attempt["status"], LABELS[attempt["status"]]
         return written, errors, status, summary
 
@@ -157,6 +172,8 @@ def retry_delivery(expected_revision, generation):
                 raise ValidationError("DNS export directory changed; reload before delivery.")
             config = Configuration.load()
             if not enabled(config):
+                log("Delivery skipped", detail=True, reason="NAS SFTP delivery is disabled",
+                    generation=generation)
                 raise ValidationError("NAS SFTP delivery is disabled.")
             path, manifest, attempt, _ = _prepare(config, generation, fresh=True)
         return _send(config, path, manifest, attempt)
@@ -171,6 +188,8 @@ def check_result(expected_revision, generation, delivery):
                 raise ValidationError("DNS export directory changed; reload before checking.")
             config = Configuration.load()
             if not enabled(config):
+                log("Receipt check skipped", detail=True, reason="NAS SFTP delivery is disabled",
+                    generation=generation, delivery=delivery)
                 raise ValidationError("NAS SFTP delivery is disabled.")
             path, manifest = read_generation(config.dns_export_directory, generation)
             attempt = _attempt(path, manifest)
@@ -180,6 +199,8 @@ def check_result(expected_revision, generation, delivery):
             if attempt["target"] != _target(config):
                 raise ValidationError("NAS delivery destination changed. Deliver to the current destination before checking.")
             if attempt["status"] in CONFIRMED:
+                log("Receipt check skipped", detail=True, reason="Matching installation already confirmed",
+                    generation=generation, delivery=delivery)
                 (path / ".pin").unlink(missing_ok=True)
                 return attempt["status"], LABELS[attempt["status"]]
             _atomic(path / ".pin", b"Awaiting matching NAS installation receipt.\n", mode=0o600)

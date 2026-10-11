@@ -1,4 +1,7 @@
+import fcntl
 import json
+import os
+import runpy
 import subprocess
 import tempfile
 from pathlib import Path
@@ -9,6 +12,7 @@ from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase, override_settings
 
 from .dns_sftp import deliver, quote, read_result, validate_delivery, validate_destination, validate_remote_path
+from .dns_diagnostics import OUTPUT_LIMIT, capture_output, log, sanitized_output
 
 
 @override_settings(DNSGRID_DNS_SFTP_IDENTITY_FILE="/etc/dnsgrid/key",
@@ -226,3 +230,165 @@ class SFTPTests(SimpleTestCase):
             self.assertEqual((destination / "zone.test").read_bytes(), source.read_bytes())
             self.assertEqual((root / "receipt").read_bytes(), source.read_bytes())
             self.assertFalse(partial.exists())
+
+    @override_settings(DNSGRID_DIAGNOSTICS=True)
+    def test_diagnostic_success_logs_plans_and_confirmation_without_quiet_mode(self):
+        def transfer(*args, **kwargs):
+            os.write(kwargs["stdout"], b"sftp> put secret-zone-content\n")
+            os.write(kwargs["stderr"], b"remote banner with ******")
+            return SimpleNamespace(returncode=0)
+
+        with patch("inventory.dns_sftp.subprocess.run", side_effect=transfer) as run:
+            with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
+                status, summary = deliver(self.config, Path("/local"), self.manifest, self.delivery)
+        self.assertEqual(status, "delivered")
+        self.assertIn("not yet confirmed", summary)
+        self.assertNotIn("-q", run.call_args.args[0])
+        self.assertFalse(run.call_args.kwargs["shell"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 120)
+        text = "\n".join(output.output)
+        for expected in (
+            self.delivery, self.manifest["generation"], "nas.example.test", "2222",
+            "create partial directory", "upload zone", "example.test",
+            "upload manifest last", "atomic final rename", "not yet confirmed",
+            "batch confirmed", "exit_status", "elapsed_seconds", "stdout", "stderr",
+            "NAS installation not confirmed", "[redacted]",
+        ):
+            self.assertIn(expected, text)
+        for secret in ("secret-zone-content", "******", "/etc/dnsgrid/key", "/etc/dnsgrid/known_hosts"):
+            self.assertNotIn(secret, text)
+
+    @override_settings(DNSGRID_DIAGNOSTICS=False)
+    @patch("inventory.dns_sftp.subprocess.run", return_value=SimpleNamespace(returncode=0))
+    def test_normal_and_level_one_keep_quiet_transport_and_concise_outcome(self, run):
+        with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
+            deliver(self.config, Path("/local"), self.manifest, self.delivery)
+        self.assertIn("-q", run.call_args.args[0])
+        self.assertEqual(run.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        self.assertEqual(run.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        self.assertEqual(len(output.output), 1)
+        self.assertIn(self.delivery, output.output[0])
+        self.assertNotIn("SFTP plan", output.output[0])
+
+    @override_settings(DNSGRID_DIAGNOSTICS=True)
+    def test_diagnostic_nonzero_timeout_and_startup_failure_are_safe(self):
+        for outcome, expected, status in (
+            (255, "batch unconfirmed", "unconfirmed"),
+            (subprocess.TimeoutExpired("secret-command", 120, output=b"private key",
+                                       stderr=b"raw receipt"), "timeout after 120 seconds", "unconfirmed"),
+            (OSError("credentials=secret"), "startup failure", "failure"),
+        ):
+            def transfer(*args, **kwargs):
+                os.write(kwargs["stderr"], b"\x1b[31mPermission denied (publickey). secret\n")
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return SimpleNamespace(returncode=outcome)
+
+            with self.subTest(outcome=expected):
+                with patch("inventory.dns_sftp.subprocess.run", side_effect=transfer):
+                    with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
+                        result = deliver(self.config, Path("/local"), self.manifest, self.delivery)
+                self.assertEqual(result[0], status)
+                text = "\n".join(output.output)
+                self.assertIn(expected, text)
+                self.assertIn("permission denied", text)
+                self.assertIn(self.delivery, text)
+                self.assertIn("elapsed_seconds", text)
+                self.assertIn('"exit_status": "255"' if outcome == 255 else
+                              '"exit_status": "unavailable"', text)
+                for secret in ("secret", "private key", "raw receipt", "\x1b"):
+                    self.assertNotIn(secret, text)
+                    self.assertNotIn(secret, result[1])
+
+    @override_settings(DNSGRID_DIAGNOSTICS=True)
+    def test_receipt_trace_does_not_log_raw_receipt_or_summary(self):
+        def transfer(*args, **kwargs):
+            batch = kwargs["input"].decode()
+            Path(batch.split('"')[-2]).write_text(json.dumps({
+                "delivery": self.delivery, "serial": 2026100900, "status": "installed",
+                "timestamp": "2026-10-09T23:00:00+00:00", "summary": "private receipt",
+            }))
+            os.write(kwargs["stdout"], b'{"summary":"private receipt"}')
+            return SimpleNamespace(returncode=0)
+
+        with patch("inventory.dns_sftp.subprocess.run", side_effect=transfer):
+            with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
+                status, summary = read_result(self.config, self.delivery, 2026100900)
+        self.assertEqual(status, "installed")
+        text = "\n".join(output.output)
+        self.assertIn("receipt download planned", text)
+        self.assertIn("receipt download confirmed", text)
+        self.assertIn("Validated NAS receipt", text)
+        self.assertNotIn("private receipt", text + summary)
+
+    def test_capture_and_sanitized_output_are_bounded_and_redact_all_arbitrary_text(self):
+        with capture_output() as (pipes, captured):
+            for pipe in pipes:
+                for _ in range(32):
+                    os.write(pipe, b"x" * OUTPUT_LIMIT)
+        for raw, total in captured:
+            self.assertEqual(len(raw), OUTPUT_LIMIT)
+            self.assertEqual(total, OUTPUT_LIMIT * 32)
+            result = sanitized_output(raw, total)
+            self.assertTrue(result["truncated"])
+            self.assertLess(len(str(result)), 1024)
+        raw = (b"-----BEGIN OPENSSH PRIVATE KEY-----\nprivate\n"
+               b"token=secret ****** IN TXT secret\n"
+               b'{"zones": [], "summary": "private receipt"}\x1b[2J\r\n'
+               b"Host key verification failed.")
+        text = str(sanitized_output(raw, len(raw)))
+        self.assertIn("host key verification failed", text)
+        for secret in ("PRIVATE KEY", "private", "secret", "\x1b", "\r", "\n"):
+            self.assertNotIn(secret, text)
+
+    @override_settings(DNSGRID_DIAGNOSTICS=True)
+    def test_terminal_fields_escape_controls_and_are_bounded(self):
+        with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
+            log("test", detail=True, path="\x1b\r\n\u202e" + "x" * 10000)
+        text = output.output[0]
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\u202e", text)
+        self.assertNotIn("\n", text)
+        self.assertIn(r"\u001b", text)
+        self.assertLess(len(text), 1200)
+
+    def test_capture_handles_high_numbered_file_descriptors(self):
+        pipe = os.pipe
+
+        def high_pipe():
+            reader, writer = pipe()
+            try:
+                high_reader = fcntl.fcntl(reader, fcntl.F_DUPFD, 1024)
+            except OSError:
+                os.close(writer)
+                self.skipTest("High-numbered file descriptors unavailable.")
+            finally:
+                os.close(reader)
+            return high_reader, writer
+
+        with patch("inventory.dns_diagnostics.os.pipe", side_effect=high_pipe):
+            with capture_output() as (pipes, captured):
+                for writer in pipes:
+                    os.write(writer, b"Permission denied")
+        for raw, total in captured:
+            self.assertEqual(raw, b"Permission denied")
+            self.assertEqual(total, len(raw))
+
+    def test_debug_levels_and_console_configuration(self):
+        settings_path = Path(__file__).resolve().parent.parent / "dnsgrid" / "settings.py"
+        for level in ("", "1", "2", "unexpected"):
+            with self.subTest(level=level), patch.dict(os.environ, {"DNSGRID_DEBUG": level}):
+                values = runpy.run_path(str(settings_path))
+                self.assertEqual(values["DEBUG"], level == "1")
+                self.assertEqual(values["DNSGRID_DIAGNOSTICS"], level == "2")
+                configuration = values["LOGGING"]
+                self.assertFalse(configuration["disable_existing_loggers"])
+                console = configuration["handlers"]["delivery_console"]
+                self.assertEqual(console["class"], "logging.StreamHandler")
+                self.assertEqual(console["stream"], "ext://sys.stderr")
+                expected = "DEBUG" if level == "2" else "INFO"
+                self.assertEqual(console["level"], expected)
+                logger = configuration["loggers"]["dnsgrid.delivery"]
+                self.assertEqual(logger["level"], expected)
+                self.assertEqual(logger["handlers"], ["delivery_console"])
+                self.assertFalse(logger["propagate"])
