@@ -15,9 +15,10 @@ configuration, not network discovery or monitoring of connected clients.
 How I use it
 ------------
 
-This is the workflow the application supports for my conventions, not a
-description of a particular live deployment. All hosts and domains below
-are fictitious examples.
+This application manages inventory and publishes primary zones on the VPN
+hub. The hub runs BIND, and NAS appliances on the physical LANs act as
+secondaries. Network addresses in configuration examples are placeholders
+and must be replaced with deployment values.
 
 1. Configure the four sites in Settings. Their stable IDs are 1–4; each has
    a distinct third IPv4 octet ``g`` (initially 1–4). The grid is shared
@@ -31,28 +32,21 @@ are fictitious examples.
    flags. LAN DNS covers all inventory hosts; DHCP reservations require a
    MAC. Status is descriptive and does not exclude hosts from exports.
    Review and confirm changes, including any shifted hosts and addresses.
-3. Review Export previews and download the required artifacts for manual
-   validation and deployment. ``vpn.hosts`` supplies local aliases such
-   as ``172.28.1.50 demo-node.vpn`` for every VPN member. Public DNS is
-   separate: only VPN members with public export enabled produce Gandi
-   A records, using the configured VPN domain (for example
-   ``demo-node.vpn.example.tld``) and the computed VPN address. Public DNS
-   publication does not make these private addresses Internet-routable.
-   Neither that FQDN nor the bare name belongs in ``vpn.hosts``: local
-   aliases must not mask whether the public FQDN resolves through DNS.
-   Gandi changes require a separate preview and explicit confirmation.
+3. Review Export previews. Explicit publication validates and installs the
+   ``intranet.linuxcondom.net.`` and ``vpn.`` primary zones and generated LAN
+   reverse zones on the hub. The NAS appliances are secondaries; LAN clients
+   use their local NAS resolvers. Public Gandi records remain a separate,
+   opt-in feature and are not involved in either private zone.
 4. For Synology reservations, configure the site's DSM interface, download
    its JSON, and manually copy it and ``synology/dsm_apply.py`` to the
    target NAS. Preview there before explicitly applying the complete
    interface reservation list. Only this standalone NAS-side operation
    uses sudo; the web application does not apply DSM changes.
-5. On the VPN hub, run the web app as an unprivileged service account with
-   read access to ``/etc/hosts`` and ``/etc/openvpn/ccd`` (or the configured
-   paths). Use VPN report to compare ``name.vpn`` and CCD ``<name>`` files
-   against inventory, including orphans and unreadable sources. Correct
-   discrepancies manually; the report neither writes files nor checks
-   live clients or DNS. The ``vpn.hosts`` download remains available for
-   manual use; review and merge it without replacing unrelated hosts entries.
+4. On the VPN hub, run the web app as an unprivileged service account with
+   access to its local BIND zone directory and read access to the existing
+   narrow ``/etc/hosts`` and ``/etc/openvpn/ccd`` report sources. dnsgrid no
+   longer exports ``/etc/hosts``. The VPN report remains read-only; correct
+   discrepancies manually.
 
 The sections below describe confirmations, exports, and deployment details.
 Before any visibility change, review `PUBLICATION.rst <PUBLICATION.rst>`_:
@@ -158,9 +152,11 @@ Global settings
 The Settings page configures LAN/VPN domains, two-octet IPv4 prefixes,
 the four site names and distinct third octets, ``ttl``, ``soa_ns``,
 ``soa_mailbox``, ``soa_refresh``, ``soa_retry``, ``soa_expire``,
-``soa_minimum``, and the separate zone-apex ``zone_ns``, the Gandi zone,
-and an optional Gandi token. ``soa_ns`` is the SOA primary nameserver;
-``zone_ns`` supplies the zone's NS record.
+``soa_minimum``, the separate zone-apex ``zone_ns``, the BIND zone directory,
+absolute ``named_checkzone``/``rndc`` executable paths, the absolute
+``rndc_key`` path, the Gandi zone, and an optional Gandi token. ``soa_ns`` is
+the SOA primary nameserver; ``zone_ns`` supplies each zone's NS record. The
+three BIND tool/key paths must be configured together and are not archived.
 Each site also has an optional DSM DHCP interface name (for example
 ``ovs_eth0``). Set it to the interface serving that site's LAN subnet
 on its DSM server; leaving it blank disables that site's DSM API exports.
@@ -170,9 +166,9 @@ The persisted SOA serial is separate from the optimistic inventory revision.
 All zones share a Unix timestamp in seconds, an unsigned 32-bit integer
 (``0..4294967295``), not a calendar date or ``YYYYMMDDnn`` counter.
 DNS-changing service mutations compare deterministic zone contents excluding
-the serial: host names/addresses, site subnets, domains, TTL, SOA and NS changes
-advance it, but descriptive metadata, VPN/Gandi-only settings and previews,
-downloads or unchanged republication do not. Allocation uses
+the serial: host names/addresses, VPN membership, site subnets, domains, TTL,
+SOA and NS changes advance it, but descriptive metadata, public-export/Gandi-only
+settings and previews, downloads or unchanged republication do not. Allocation uses
 ``max(now, last + 1)``: same-second edits and clock rollback still advance.
 The timestamp-based serial need not equal the exact wall-clock second:
 rapid edits, clock rollback, or a previously seeded value can keep it ahead.
@@ -197,27 +193,20 @@ Exceptional administrator-confirmed baseline lowering
 Only a superuser (``is_superuser``), not an ordinary staff operator, can
 preview and confirm timestamp baseline lowering from Settings. It is for
 legacy serials that **no DNS server has loaded**, not a way to downgrade
-an installed zone. For example, an uninstalled legacy generation with
-serial ``2026100800`` can be numerically above a NAS's existing timestamp
-serial ``1692746706``. Preserve that NAS state; do not reset the installer.
-Compare the actual proposed baseline with all deployed servers before delivery.
+an installed zone. Compare the actual proposed baseline with the hub primary
+and every secondary before changing it.
 
-First pause the DSM scheduled task and remove legacy deliveries, including
-abandoned partial deliveries and receipts, from the inbox and outbox before
-enabling the new flow. Review the exact old/new serials in the preview and
-check both acknowledgments: no DNS server loaded the legacy serials, and
-the DSM task is paused with legacy inbox/outbox deliveries removed.
-If legacy queued deliveries are not removed, the installer could load them
-and make their higher serial its persistent high-water mark, blocking the
-new timestamp flow.
+Before changing a legacy installation, stop the old DSM DNS installer task
+and quarantine any queued legacy deliveries. Review the exact old/new serials
+and confirm that no DNS server loaded the legacy serials.
 The browser cannot choose an arbitrary baseline. Confirmation requires the
 same inventory revision and current serial, and rejects a preview timestamp
 that is now in the future after clock rollback. A nonce is single-use.
 
-Back up first. No inventory is deleted, no installer state is automatically
+Back up first. No inventory is deleted, no server state is automatically
 reset, and stale immutable generations are preserved. Never retry or deliver
-those legacy generations after lowering. Publish and validate a new generation
-before resuming the task. If any server has already loaded the legacy serial,
+legacy generations after lowering. Publish and validate a new generation
+before updating secondaries. If any server has already loaded the legacy serial,
 **do not lower**: coordinate a migration with authoritative and secondary DNS
 servers, respecting RFC 1982, outside this exceptional web action.
 
@@ -226,21 +215,18 @@ Resetting LOCAL test publication history
 
 For a clean restart when **all managed local generations are test material
 that was NEVER loaded by any DNS server**, use the explicit management command
-instead of manually removing generations, pins, saved attempts or lock files.
+instead of manually removing generations, legacy receipt metadata or lock files.
 The Settings baseline action above deliberately preserves immutable generations;
 the command below invalidates them by moving them to private local quarantine.
-It never contacts the NAS and cannot establish what servers actually loaded.
+It never contacts DNS servers and cannot establish what they actually loaded.
 
 Before acknowledging the reset:
 
-* Pause DSM scheduling and any other installer triggers.
-* Inspect actual installed/served serials on authoritative and secondary servers,
-  and inspect NAS installed state and any outstanding recovery transaction.
-  Do not automatically lower installed serials or erase recovery state.
-* Review and remove or quarantine **only known stale test deliveries** and their
-  matching receipts/partial deliveries under your control. Do not empty arbitrary
-  NAS directories. Leave ``installed.json``, ``transaction.json``, backups and
-  lock files untouched. Never delete an outstanding recovery journal.
+* Stop the retired DSM DNS installer task and any other legacy delivery triggers.
+* Inspect actual served serials on the hub primary and secondaries. Do not
+  automatically lower installed serials or erase server recovery state.
+* Quarantine only known legacy test deliveries and matching receipts. Never
+  delete an outstanding recovery journal or remove unrelated NAS files.
 * Back up the local database and export artifacts. Use a dedicated local export
   directory with trusted ownership; stop external/manual writers during reset.
   This command coordinates dnsgrid writers, not arbitrary filesystem processes.
@@ -266,8 +252,8 @@ contention fails safely: wait for the actual operation to finish and retry; neve
 unlink a lock file. Application revision counters are preserved, not reset or
 incremented; existing web baseline confirmations reject the changed serial.
 
-Under the delivery lock and singleton database write lock, the command validates
-immutable manifests/checksums and saved attempts, rejects symlinks, hard links,
+Under the publication lock and singleton database write lock, the command validates
+immutable manifests/checksums and legacy attempt metadata, rejects symlinks, hard links,
 unexpected generation contents and unsafe paths, and moves only validated managed
 artifacts into ``.dnsgrid-reset-<random-id>`` inside the export directory. It does
 not recursively delete the export directory. Unrelated files remain; loose zone
@@ -280,15 +266,13 @@ copy it back into ``generations``.
 
 The database serial is set to the reviewed timestamp, the published-generation
 reference is cleared, and content tracking is rebuilt from unchanged inventory.
-Inventory, revision counters, users, settings, secrets, SFTP credentials and
-unrelated application archive backups are untouched. The next unchanged publication
-creates a fresh timestamp generation and delivery attempt. Subsequent unchanged
-publication reuses it without automatically resending; explicit retries retain
-the immutable generation and use a new delivery identifier.
+Inventory, revision counters, users, settings, secrets, and unrelated
+application archive backups are untouched. The next unchanged publication
+creates a fresh timestamp generation.
 
 Filesystem moves and the database commit cannot form one atomic transaction.
 A durable ``.dnsgrid-reset.json`` records the exact plan, fingerprints and
-quarantine before any move. While it exists, publication, delivery/retry and
+quarantine before any move. While it exists, publication and
 inventory/configuration mutations are blocked. On failure, **preserve the journal
 and quarantine**, resolve the reported filesystem/database issue, and resume::
 
@@ -304,17 +288,15 @@ is moved to ``completed.json`` in quarantine; repeating recovery is a no-op.
 If a crash occurred before the journal was written, no managed artifacts were moved;
 an empty quarantine may remain and can be reviewed separately.
 
-Publish locally, inspect the new generation/serial and matching NAS result, verify
-actual installed/served DNS state and recovery readiness, then resume DSM scheduling.
-SFTP success alone is not installation or zone-loading verification. No real DSM
-integration verification is implied by the command or its tests.
+Publish locally, inspect the new generation/serial, then verify the hub's
+authoritative answer and secondary transfer separately. No external client
+resolution is implied by a successful RNDC command.
 
-``dns_export_directory`` is an optional absolute path to an existing directory
-on the dnsgrid host. Blank disables directory publishing. Give the application
-account write permission only to the selected directory; the web app needs no
-root access. Restrict target directory access to intended
-application/transfer accounts. This host-specific path is excluded from
-application-data archives and preserved on restore.
+``dns_export_directory`` is an optional absolute path to an existing BIND zone
+directory on the hub. Blank disables publication. Give the application account
+write permission to the selected directory and ensure BIND can read the files.
+The web app needs no root access. The host-specific directory and RNDC tool/key
+paths are excluded from application-data archives and preserved on restore.
 Retired NAS destination fields in older archives are accepted and discarded;
 they never enable remote deployment.
 
@@ -324,44 +306,93 @@ If either nameserver is inside the LAN zone, create its matching inventory host
 so the exported zone contains its A record. Delegate the LAN zone and
 each of the four reverse /24 zones to your authoritative server.
 
-NAS delivery: SFTP and local DSM installation
---------------------------------------------
+Hub-side BIND primary and VPN resolver
+--------------------------------------
 
-The NAS receives files using a non-administrator SFTP account. dnsgrid never
-requests a shell or remote command, and the NAS never connects back to dnsgrid.
-A privileged **local** DSM Task Scheduler task validates and installs files.
-Successful upload means **delivered, awaiting processing**, not installed.
-Successful installation means **files installed**, not that the DNS service
-has loaded them. When ``rndc`` and ``rndc_key`` are configured, the local
-installer performs **one general** ``rndc reload`` after the complete zone set
-is installed (see `General RNDC reload`_). No package restart is performed.
+Configure BIND on the hub to listen on loopback (``lo``) and the VPN
+interface (``tun0``). Replace every angle-bracket placeholder below with the
+addresses and client/secondary networks for the deployment; no subnet or
+host address is built into dnsgrid. The VPN-client ACL is the only ACL granted
+recursive or cache access. Authoritative zone queries and zone transfers are
+separately restricted. The NAS appliances are secondaries, and LAN clients
+should use the NAS resolver on their physical subnet rather than the hub::
 
-In Settings configure ``dns_sftp_host``, ``dns_sftp_user``, ``dns_sftp_port``,
-``dns_sftp_inbox`` and ``dns_sftp_outbox``. Paths must be absolute as seen by
-the SFTP account; a chroot or shared-folder mapping can make these different
-from the installer paths. Leave host/user blank to disable delivery.
-Keep the private key and independently verified NAS host key on the dnsgrid
-host, outside its database, export directories and archives::
+    acl vpn_clients { <VPN_CLIENT_CIDR>; };
+    acl dns_secondaries { <NAS_SECONDARY_ADDRESS_1>; <NAS_SECONDARY_ADDRESS_2>; };
 
-    DNSGRID_DNS_SFTP_IDENTITY_FILE=/etc/dnsgrid/nas_sftp_key
-    DNSGRID_DNS_SFTP_KNOWN_HOSTS=/etc/dnsgrid/nas_known_hosts
+    options {
+        listen-on { 127.0.0.1; <HUB_TUN0_ADDRESS>; };
+        recursion yes;
+        allow-recursion { vpn_clients; };
+        allow-query-cache { vpn_clients; };
+        allow-query { localhost; vpn_clients; dns_secondaries; };
+    };
 
-The application account must be able to read these files; other accounts
-must not be able to replace them. Use an absolute known_hosts path without
-whitespace, quotes or backslashes. Verify the NAS host key fingerprint through
-an independent administrative channel before adding it; merely collecting
-a key from the network does not authenticate it. A nonstandard port needs
-the corresponding known_hosts entry. The client uses key-only batch SFTP,
-strict host-key checking and bounded timeouts; there is no alternate transport.
+    zone "intranet.linuxcondom.net" {
+        type primary;
+        file "<BIND_ZONE_DIRECTORY>/intranet.linuxcondom.net";
+        allow-transfer { dns_secondaries; };
+        also-notify { dns_secondaries; };
+    };
 
-Terminal publication and delivery diagnostics
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    zone "vpn" {
+        type primary;
+        file "<BIND_ZONE_DIRECTORY>/vpn.zone";
+        allow-transfer { dns_secondaries; };
+        also-notify { dns_secondaries; };
+    };
 
-Publication and delivery outcomes are logged through ``dnsgrid.delivery`` to
-the web application's **stderr**, including generation/delivery identifiers.
-SFTP success confirms only the upload batch and final rename, not NAS
-installation. Use **Check NAS result** for the matching validated receipt;
-even an installed receipt does not prove that zones have loaded.
+Add a primary zone stanza for each generated reverse zone as well. Configure
+each NAS with matching ``type secondary`` stanzas and the hub as its primary.
+Restrict transfers to those secondaries (and firewall DNS/RNDC appropriately).
+The angle-bracket values are documentation placeholders, not literal BIND
+syntax. Review the active configuration and ACLs before enabling recursion.
+Set ``lan_domain`` in Settings to ``intranet.linuxcondom.net`` for this
+deployment; the application always generates the private VPN origin as ``vpn.``.
+
+In Settings, ``dns_export_directory`` is the existing local BIND zone
+directory. Set all three tool paths explicitly and absolutely; for example::
+
+    dns_export_directory = /etc/bind/zones
+    named_checkzone = /usr/sbin/named-checkzone
+    rndc = /volume1/@appstore/DNSServer/bin/rndc
+    rndc_key = /volume1/@appstore/DNSServer/named/rndc.key
+
+The RNDC key path is configuration, not the key material; do not copy its
+contents into the database, repository, logs or documentation. Verify that it
+is the key authorized by the running BIND ``controls`` block. On publication,
+dnsgrid validates every staged zone, atomically replaces zone files while
+preserving the existing permission/group model, commits the immutable
+generation, then runs exactly one general command::
+
+    <rndc> -k <rndc_key> -s 127.0.0.1 -p 953 reload
+
+This command uses a fixed argument vector, ``shell=False`` and a bounded
+timeout. It is never run for a preview, validation failure, incomplete file
+installation or incomplete generation commit. If one file fails after others
+were replaced, the operation reports partial installation and skips reload;
+repair and publish again. No per-zone reload or ``systemctl restart`` occurs.
+A successful RNDC exit proves only that the command returned success; dnsgrid
+does not query external clients or claim that their resolution was verified.
+Check the hub and each secondary separately, for example by checking SOA
+serials and the expected records with ``dig``.
+
+The BIND zone directory and command paths are host-local deployment settings
+and are excluded from application archives. The application process needs
+write access to the zone directory and read access to the RNDC key as required
+by the installed BIND package. The validator and RNDC paths are validated as
+absolute paths. The repository does not install or alter BIND configuration,
+ACLs, package ownership, or firewall rules.
+
+Terminal publication diagnostics
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Publication outcomes use the existing ``dnsgrid.delivery`` logger and go to
+the web application's **stderr**. Logs include safe event/status information,
+zone names, serial/generation, elapsed time and exit status, but never raw
+command output, zone contents or RNDC key material. Validation and reload
+commands have bounded timeouts; their stdout/stderr is discarded rather than
+forwarded to a browser or log.
 
 To collect detailed diagnostics, set ``DNSGRID_DEBUG=2`` in the environment of
 your production WSGI/ASGI service and restart its workers. For a local terminal
@@ -369,21 +400,12 @@ session (not a production server), run::
 
     DNSGRID_DEBUG=2 python manage.py runserver 127.0.0.1:8000
 
-Level 2 does **not** enable Django's web DEBUG mode. Level 1 retains its existing
-development behavior and does not enable detailed SFTP tracing. At level 2,
-logs explain attempted/skipped delivery, including disabled configuration,
-incomplete publication and reuse of a saved attempt. They show destination
-host/port, planned directory creation, zone uploads, manifest-last upload,
-atomic rename and receipt download. Plans are explicitly unconfirmed until
-the process succeeds. A failed/timed-out batch cannot establish which steps
-completed; check the receipt before explicitly retrying with a new identifier.
-Logs also show exit status, elapsed time, startup failure and timeout outcomes.
-SFTP quiet mode is disabled, but arbitrary stdout/stderr is never printed:
-only a fixed allowlist of diagnostic phrases is retained, with redaction,
-byte counts and truncation indicators. Capture retains at most 4096 bytes per
-stream while draining/discarding the rest, and terminal fields are bounded
-and control-escaped. Keys, credentials, payload contents, raw receipts and
-remote summaries are not logged or included in browser responses.
+Level 2 does **not** enable Django's web DEBUG mode; it enables terminal
+diagnostics only. Level 1 retains its existing development behavior. Level 2
+adds publication events such as validation/reload outcome, elapsed time,
+generation and sanitized failure status. These diagnostics do not prove
+external resolution. No raw process output, credentials, key material or
+zone contents are logged. The ``--insecure`` static-file behavior is unchanged.
 
 This repository does not supply a service unit or a fixed deployment log
 path. Find logs on the **dnsgrid host**, not in the NAS inbox:
@@ -398,22 +420,21 @@ path. Find logs on the **dnsgrid host**, not in the NAS inbox:
   stdout/stderr files; ensure stderr is collected, not discarded. There is
   no automatic ``dnsgrid.log`` file.
 
-Restrict access to service logs: they include destination metadata and zone
-filenames. Remove level 2 and restart workers after diagnosis. The privileged
-DSM installer runs separately: consult the NAS Task Scheduler's configured
-task output/log collection for its local errors. Web-service diagnostics
-cannot verify DSM authentication, ACLs, scheduling or actual BIND zone loading;
-these require testing on the deployed DSM version.
+Restrict access to service logs: they include zone names and generation
+metadata. Remove level 2 and restart workers after diagnosis. Web-service
+diagnostics cannot verify actual hub or secondary answers; test those directly.
 
-DSM setup (manual, version-specific)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Retired NAS DNS SFTP installer (legacy only)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Check SFTP service availability, public-key authentication and shared-folder
-ACL behavior on **your installed DSM version**. Do not add the SFTP account
-to administrators or give it access to the DNS master directory. This flow
-does not require changing the account shell, passwd or sshd configuration.
-If the installed DSM version cannot offer the required isolation using its
-supported configuration, stop and resolve that deployment prerequisite.
+**Do not use the DNS SFTP delivery/DSM scheduled-installer workflow below.**
+It is retained only as historical migration and recovery documentation; the
+application routes and Export page no longer provide DNS zone delivery or
+receipt/retry actions. Keep any old DSM task stopped and retire its credentials
+and queued deliveries after verifying they are not used by another service.
+Use the hub-side publication workflow above. The standalone
+``synology/dns_install.py`` remains in the repository for legacy recovery only
+and is not part of active DNS publication.
 
 Provision separate paths, for example:
 
@@ -657,21 +678,18 @@ inventory revisions.
 Migrating an existing deployment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Back up the database, exported zones and installed master files first.
-Apply the new migrations; historical migrations are not rewritten.
-Old NAS destination settings are removed, and legacy archive fields are
-discarded rather than reactivating deployment. Configure the new SFTP fields
-explicitly. Verify permissions, validator and serial baseline before enabling
-the scheduler and delivering a generation.
+Back up the database, current hub zones and BIND configuration first. Apply the
+new migrations; historical migrations are not rewritten. Configure the local
+BIND zone directory and all three explicit tool/key paths in Settings. Verify
+directory permissions, BIND ACLs, zone stanzas, secondary transfers and the
+serial baseline before publishing.
 
-The administrator must retire the old forced-command authorized_keys entry,
-pull wrapper/script/configuration, NAS-to-hub private key and its corresponding
-hub authorization, old SSH credential environment settings and any old task
-or service invocation. Remove obsolete access grants after verifying they
-are not shared by another service. Reassess any previous service-shell or
-administrator-group changes using supported DSM administration. dnsgrid does
-**not** revoke credentials or modify account/service settings automatically.
-These references describe dismission only, not an alternate supported flow.
+Stop and retire the old DSM DNS task, SFTP inbox/outbox, receipt polling,
+authorized_keys entries, pull wrappers and credentials after verifying that
+they are not shared by another service. Old SFTP destination fields may remain
+in an upgraded database for compatibility, but are not editable or used by the
+active DNS workflow. dnsgrid does **not** revoke credentials or alter NAS,
+account, service, firewall or BIND configuration automatically.
 
 Prefer supplying ``DNSGRID_GANDI_TOKEN`` through your deployment's secret
 manager; it overrides the saved token. A token entered in Settings is
@@ -691,7 +709,12 @@ Download links are tied to the preview's inventory revision; regenerate
 the preview if inventory changes instead of mixing different revisions.
 
 ``forward.zone``
-    One LAN BIND zone with SOA, NS, and A records for every inventory host.
+    Preview/download artifact for the configured LAN BIND zone with SOA, NS,
+    and A records for every inventory host. Its installed filename is the zone
+    name (for example ``intranet.linuxcondom.net``).
+``vpn.zone``
+    Private ``vpn.`` BIND zone with A records for VPN members only. It is
+    independent of the public VPN/Gandi domain and installs as ``vpn.zone``.
 ``reverse-<g>.zone``
     One BIND /24 reverse zone per site, with LAN FQDN PTR records.
 ``dsm-reservations-site-<id>.json``
@@ -703,10 +726,6 @@ the preview if inventory changes instead of mixing different revisions.
     order. Invalid nonempty MACs abort export rather than silently omitting
     reservations. The JSON export alone does not apply changes; it is input
     to the local NAS-side utility described below.
-``vpn.hosts``
-    One ``ip name.vpn`` line per VPN member, including those not publicly
-    exported, for example ``172.28.1.50 alpha.vpn``. It contains neither
-    the public VPN FQDN (``alpha.vpn.example.tld``) nor the bare host name.
 ``gandi.json``
     Desired LiveDNS A record sets for hosts with both VPN membership
     and public export enabled. Names are relative to the configured
@@ -723,32 +742,28 @@ multiline SOA. A and PTR records have explicit FQDN owners and TTLs, sorted
 alphabetically by hostname; PTR targets are full LAN FQDNs. Each zone ends
 with its zone-apex NS record, configured separately from the SOA nameserver.
 
-After reviewing the preview, use the local publication action to write zones,
-or the publication-and-SFTP action to publish and deliver them to the NAS.
-This is an explicit CSRF-protected POST to ``dns-publish`` carrying the preview's
-``revision``; stale revisions are rejected. The configured
-``dns_export_directory`` is displayed on the page. Saving hosts or Settings,
-downloads, and archive download/restore never implicitly write zones.
-Deposited filenames are the zone names, without a ``.zone`` suffix:
-``lan_domain`` for the forward zone and
+After reviewing the preview, use the explicit CSRF-protected ``dns-publish``
+POST carrying the preview's ``revision``; stale revisions are rejected.
+Previews, GET requests, downloads, saving hosts/Settings, and archive
+download/restore never install zones or reload BIND. Installed filenames are
+the configured LAN zone name, ``vpn.zone``, and
 ``<g>.<second>.<first>.in-addr.arpa`` for each reverse zone (the latter two
-octets come from ``lan_prefix``). Download names remain ``forward.zone`` and
-``reverse-<g>.zone``.
+octets come from ``lan_prefix``). Download names are ``forward.zone``,
+``vpn.zone``, and ``reverse-<g>.zone``.
 
-Each zone is written to a temporary file in the destination directory and
-atomically replaced with ``os.replace``. Existing matching files are overwritten
-without a prompt; no backups are made and no unrelated files are deleted.
-Existing regular zone files retain their read/write permission bits and group
-ownership; new zones use mode 0644 (readable DNS data). The application owns the
-newly replaced inode. Symlink destinations are replaced, not followed. If
-preserving an existing group is unauthorized, a per-file error is reported and
-the original file stays unchanged; no root access is needed.
-The entire set is **not atomic**: per-file errors are reported, and some zones
-may already have been replaced when another fails. Review errors and retry
-after correcting permissions or other failures. Any partial failure does not
-commit a new generation manifest. This directory is on the dnsgrid host,
-not the NAS master directory. Verify zone loading on the NAS separately after
-the local DSM installer reports that files were installed.
+All generated zones are staged in the configured BIND directory and validated
+with the explicit ``named_checkzone`` executable before any replacement. Each
+target is atomically replaced with ``os.replace``. Existing regular files
+retain their read/write permission bits and group ownership; new zones use
+mode 0644. The app owns each new inode. Symlink destinations are replaced,
+not followed. If a later replacement fails, some files may be new on disk,
+but the generation is not committed and RNDC is not invoked. Review and repair
+before retrying.
+
+Only after every zone is installed and the immutable generation manifest is
+committed does dnsgrid invoke one general RNDC reload. This is not a
+whole-zone-set atomic transaction and does not claim external resolution.
+Inspect the hub and secondaries directly after publication.
 
 Immutable local generations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -760,8 +775,7 @@ The manifest contains version 1, generation, serial, UTC publication time and
 zone name/filename/byte-size/SHA-256 entries. The generation identifier is
 exactly ``dnsgrid-`` plus the canonical decimal uint32 serial, without leading
 zeroes (including ``dnsgrid-0``). Limits are 256 zones,
-4 MiB per zone and 128 KiB per manifest. The root ``manifest.json`` is a latest
-copy for inspection only; local-only publication does not update a remote server.
+4 MiB per zone and 128 KiB per manifest. The root ``manifest.json`` is a latest copy for inspection only.
 ``manifest.json`` is a reserved filename and cannot be a managed zone name.
 Same-serial files must be byte-identical; collisions require a seed that
 advances under RFC 1982.
@@ -774,9 +788,9 @@ Pruning never traverses symlinks or removes unidentified directories/files,
 the current generation, or existing ``.pin``-marked generations.
 Inventory's singleton write lock covers publication and pruning. Existing pins
 remain protected and can fill retention and block new generation commits.
-The SFTP workflow creates pins and clears them only after matching successful
-receipts; the local-only publication action never creates or clears pins.
-An administrator must review unresolved pins before manual removal. Incomplete or
+Old DNS SFTP deliveries may have left pinned generations; those pins are
+legacy metadata, not part of the active publisher. An administrator must
+review unresolved pins before manual removal. Incomplete or
 unidentified crash remnants are not pruned automatically; an administrator
 must inspect them before removal. No other hub files are deleted.
 
@@ -886,8 +900,8 @@ the downloaded files with your existing tools, for example::
 For planned moves, reduce TTL sufficiently ahead of time, wait out the
 previous TTL, publish forward/reverse records together, refresh DHCP,
 and coordinate client renewals and routing. Negative DNS caches can also
-delay new names. VPN hosts-file changes require reloading the relevant
-dnsmasq/resolver configuration on the VPN center.
+delay new names. VPN member DNS records are published in the private
+``vpn.`` primary zone and transferred to the NAS secondaries.
 
 VPN alignment report
 --------------------
@@ -897,9 +911,9 @@ dnsgrid's VPN members with that machine's ``/etc/hosts`` and
 ``/etc/openvpn/ccd/`` and lists discrepancies. **It is strictly
 read-only**: it only opens files for reading and lists the directory; it
 never writes, corrects, or deletes ``/etc/hosts``, CCD files, or service
-files and never reloads OpenVPN or resolvers. Fix reported items manually.
-The ``vpn.hosts`` download on Export previews is unchanged and remains the
-way to obtain the expected hosts lines.
+files and never reloads OpenVPN or resolvers. dnsgrid no longer generates or
+exports a hosts file; keep ``/etc/hosts`` to its existing narrow local use and
+fix report discrepancies manually.
 
 For every host with VPN membership (every status) it checks that:
 

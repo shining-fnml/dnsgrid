@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
@@ -32,7 +33,14 @@ class DNSResetTests(TestCase):
             dns_export_directory=str(self.root), soa_serial=2026101004,
             dns_sftp_host="nas.example.test", dns_sftp_user="dns",
             dns_sftp_inbox="/inbox", dns_sftp_outbox="/outbox",
+            named_checkzone="/usr/bin/named-checkzone",
+            rndc="/usr/bin/rndc", rndc_key="/etc/bind/rndc.key",
         )
+        self.bind_commands = patch(
+            "inventory.exporters.subprocess.run", return_value=SimpleNamespace(returncode=0),
+        )
+        self.bind_commands.start()
+        self.addCleanup(self.bind_commands.stop)
         self.clock = patch("inventory.dns_reset.initial_serial", return_value=self.timestamp)
         self.clock.start()
         self.addCleanup(self.clock.stop)
@@ -272,8 +280,13 @@ class DNSResetConcurrencyTests(TransactionTestCase):
         for index in range(1, 5):
             Site.objects.update_or_create(pk=index, defaults={"name": f"Site{index}", "g": index})
         with tempfile.TemporaryDirectory() as directory:
-            Configuration.objects.update(dns_export_directory=directory, soa_serial=2026101004)
-            publish_dns_zones("1")
+            Configuration.objects.update(
+                dns_export_directory=directory, soa_serial=2026101004,
+                named_checkzone="/usr/bin/named-checkzone",
+                rndc="/usr/bin/rndc", rndc_key="/etc/bind/rndc.key",
+            )
+            with patch("inventory.exporters.subprocess.run", return_value=SimpleNamespace(returncode=0)):
+                publish_dns_zones("1")
             entered, release = Event(), Event()
             original = dns_reset._finish
 

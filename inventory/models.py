@@ -143,6 +143,9 @@ class Configuration(models.Model):
     )
     dns_sftp_inbox = models.CharField(max_length=4096, blank=True, default="")
     dns_sftp_outbox = models.CharField(max_length=4096, blank=True, default="")
+    named_checkzone = models.CharField(max_length=4096, blank=True, default="")
+    rndc = models.CharField(max_length=4096, blank=True, default="")
+    rndc_key = models.CharField(max_length=4096, blank=True, default="")
     dns_published_generation = models.CharField(max_length=32, blank=True, default="", editable=False)
     revision = models.PositiveBigIntegerField(
         default=1, validators=[MinValueValidator(1), MaxValueValidator(MAX_SERIAL)]
@@ -182,7 +185,16 @@ class Configuration(models.Model):
         if self.dns_export_directory and (
             "\x00" in self.dns_export_directory or not Path(self.dns_export_directory).is_absolute()
         ):
-            errors["dns_export_directory"] = "Enter an absolute directory on the dnsgrid host."
+            errors["dns_export_directory"] = "Enter an absolute BIND zone directory on the dnsgrid host."
+        tool_fields = ("named_checkzone", "rndc", "rndc_key")
+        for field in tool_fields:
+            value = getattr(self, field)
+            if value and ("\x00" in value or not Path(value).is_absolute()):
+                errors[field] = "Enter an absolute path."
+        if any(getattr(self, field) for field in tool_fields) and not all(
+            getattr(self, field) for field in tool_fields
+        ):
+            errors["named_checkzone"] = "Configure named_checkzone, rndc, and rndc_key together."
         from .dns_sftp import validate_destination, validate_remote_path
         try:
             validate_destination(self.dns_sftp_host, self.dns_sftp_user, self.dns_sftp_port)

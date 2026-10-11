@@ -28,9 +28,10 @@ class ExportTests(TestCase):
         self.assertNotIn("dhcpd.conf", output)
         self.assertNotIn("dhcpd-dsm.conf", output)
         self.assertFalse(any(name.endswith(".form") for name in output))
-        vpn_lines = output["vpn.hosts"].splitlines()
-        self.assertEqual(vpn_lines[1:], ["172.28.1.50 alpha.vpn"])
-        self.assertNotIn("vpn.example.tld", output["vpn.hosts"])
+        self.assertIn("$ORIGIN vpn.", output["vpn.zone"])
+        self.assertIn("alpha.vpn. 300 A 172.28.1.50", output["vpn.zone"])
+        self.assertNotIn("vpn.example.tld", output["vpn.zone"])
+        self.assertNotIn("vpn.hosts", output)
         for group in range(1, 5):
             self.assertIn(f"reverse-{group}.zone", output)
         self.assertEqual(json.loads(output["gandi.json"]), [{
@@ -39,6 +40,14 @@ class ExportTests(TestCase):
         }])
         self.assertNotIn("PRIVATE-NOTE", "".join(output.values()))
         self.assertNotIn(self.host.status, "".join(output.values()))
+
+    def test_hub_private_zone_origins_are_configured_lan_and_vpn(self):
+        self.config.lan_domain = "intranet.linuxcondom.net"
+        output = build_exports(self.config, [self.host])
+        self.assertIn("$ORIGIN intranet.linuxcondom.net.", output["forward.zone"])
+        self.assertIn("alpha.intranet.linuxcondom.net. 300 A 192.168.1.50", output["forward.zone"])
+        self.assertIn("$ORIGIN vpn.", output["vpn.zone"])
+        self.assertIn("alpha.vpn. 300 A 172.28.1.50", output["vpn.zone"])
 
     def test_every_status_is_exported(self):
         original = build_exports(self.config, [self.host])
@@ -60,7 +69,7 @@ class ExportTests(TestCase):
                 self.host.vpn, self.host.public_export = vpn, public
                 self.host.mac = ""
                 output = build_exports(self.config, [self.host])
-                self.assertEqual("172.28.1.50 alpha.vpn\n" in output["vpn.hosts"], vpn)
+                self.assertEqual("alpha.vpn. 300 A 172.28.1.50\n" in output["vpn.zone"], vpn)
                 self.assertEqual(len(desired_gandi(self.config, [self.host])), int(vpn and public))
                 self.assertEqual(json.loads(output["dsm-reservations-site-1.json"])["reservationData"], [])
                 self.assertIn("alpha.intranet.example.tld. 300 A", output["forward.zone"])
@@ -92,8 +101,8 @@ class ExportTests(TestCase):
         self.assertNotIn(" PTR ", output["reverse-1.zone"])
         self.assertTrue(output["forward.zone"].endswith("lan.other.test. NS dns.other.test.\n"))
         self.assertTrue(output["reverse-4.zone"].endswith("4.24.10.in-addr.arpa. NS dns.other.test.\n"))
-        self.assertIn("10.29.4.50 alpha.vpn\n", output["vpn.hosts"])
-        self.assertNotIn("vpn.other.test", output["vpn.hosts"])
+        self.assertIn("alpha.vpn. 600 A 10.29.4.50\n", output["vpn.zone"])
+        self.assertNotIn("vpn.other.test", output["vpn.zone"])
         self.assertEqual(json.loads(output["dsm-reservations-site-4.json"])["reservationData"][0]["ip"], "10.24.4.50")
         self.assertEqual(desired_gandi(self.config, [self.host])[0]["rrset_values"], ["10.29.4.50"])
 

@@ -31,7 +31,14 @@ class DNSDeliveryTests(TestCase):
             dns_export_directory=str(self.path), soa_serial=2026100800,
             dns_sftp_host="nas.example.test", dns_sftp_user="dns",
             dns_sftp_inbox="/inbox", dns_sftp_outbox="/outbox",
+            named_checkzone="/usr/bin/named-checkzone",
+            rndc="/usr/bin/rndc", rndc_key="/etc/bind/rndc.key",
         )
+        self.bind_commands = patch(
+            "inventory.exporters.subprocess.run", return_value=SimpleNamespace(returncode=0),
+        )
+        self.bind_commands.start()
+        self.addCleanup(self.bind_commands.stop)
         self.clock = patch("inventory.dns_serial.initial_serial", return_value=2026100800)
         self.clock.start()
         self.addCleanup(self.clock.stop)
@@ -71,14 +78,10 @@ class DNSDeliveryTests(TestCase):
         self.assertEqual((path / "manifest.json").read_bytes(), raw)
         self.assertEqual(Configuration.load().soa_serial, manifest["serial"])
         response = self.client.get(reverse("exports"))
-        for label in (
-            "<button>Check NAS result</button>",
-            "<button>Publish locally and deliver via SFTP</button>",
-            "<button>Retry NAS delivery with new identifier</button>",
-            "SFTP success means only delivered, awaiting NAS processing.",
-            "NAS results are read only when requested; installed files do not prove zones loaded.",
-        ):
-            self.assertContains(response, label)
+        self.assertNotContains(response, "Check NAS result")
+        self.assertNotContains(response, "Retry NAS delivery")
+        self.assertNotContains(response, "/exports/deliver-dns/")
+        self.assertNotContains(response, "/exports/retry-dns-delivery/")
 
     def test_unix_timestamp_retry_preserves_generation_and_bytes(self):
         Configuration.objects.update(soa_serial=1692746706)
@@ -110,10 +113,10 @@ class DNSDeliveryTests(TestCase):
                     "Delivery skipped", reason=expected, generation=attempt["generation"],
                     delivery=attempt["delivery"], status=status,
                 )
-                response = self.client.post(reverse("dns-deliver"), {
+                response = self.client.post("/exports/deliver-dns/", {
                     "revision": Configuration.load().revision,
                 }, follow=True)
-                self.assertContains(response, expected)
+                self.assertEqual(response.status_code, 404)
                 self.deliver.assert_not_called()
 
     def test_actual_transfer_reports_actual_outcome_in_browser_and_log(self):
@@ -124,11 +127,7 @@ class DNSDeliveryTests(TestCase):
                 # A changed serial ensures this is a new attempt, not saved state.
                 Configuration.objects.update(soa_serial=Configuration.load().soa_serial + 1)
                 with patch("inventory.dns_delivery.log") as diagnostics:
-                    response = self.client.post(reverse("dns-deliver"), {
-                        "revision": Configuration.load().revision,
-                    }, follow=True)
-                self.assertContains(response, LABELS[status])
-                self.assertNotContains(response, "No SFTP transfer attempted")
+                    self.assertEqual(self.publish()[2], status)
                 self.deliver.assert_called_once()
                 self.assertTrue(any(
                     call.args[0] == "Delivery outcome; consult matching NAS receipt for installation"
@@ -160,7 +159,7 @@ class DNSDeliveryTests(TestCase):
                 attempt["status"] = status
                 (path / ".delivery.json").write_text(json.dumps(attempt))
                 self.assertEqual(delivery_states(Configuration.load())[0]["summary"], help_text)
-                self.assertContains(self.client.get(reverse("exports")), help_text)
+                self.assertNotContains(self.client.get(reverse("exports")), help_text)
 
     def test_timeout_receipt_retry_exact_generation_and_old_result_rejected(self):
         self.deliver.return_value = ("unconfirmed", "timeout")
@@ -225,14 +224,8 @@ class DNSDeliveryTests(TestCase):
         self.receipt.assert_not_called()
         Configuration.objects.update(dns_sftp_inbox="")
         response = self.client.get(reverse("exports"))
-        self.assertContains(response, attempt["delivery"])
-        self.assertContains(response, "delivered")
-        for label in (
-            "<button>Check NAS result</button>",
-            "<button>Publish locally and deliver via SFTP</button>",
-            "<button>Retry NAS delivery with new identifier</button>",
-        ):
-            self.assertNotContains(response, label)
+        self.assertNotContains(response, attempt["delivery"])
+        self.assertNotContains(response, "delivered")
 
     def test_destination_changes_do_not_reuse_or_confirm_another_nas_attempt(self):
         sites = list(Site.objects.values("id", "name", "g", "dsm_ifname"))
@@ -247,7 +240,7 @@ class DNSDeliveryTests(TestCase):
                 if confirmed:
                     self.receipt.return_value = ("installed", "done")
                     check_result(Configuration.load().revision, manifest["generation"], attempt["delivery"])
-                update_settings({field: value}, sites, Configuration.load().revision)
+                Configuration.objects.filter(pk=1).update(**{field: value})
                 with self.assertRaisesMessage(ValidationError, "destination changed"):
                     check_result(Configuration.load().revision, manifest["generation"], attempt["delivery"])
                 self.deliver.reset_mock()
@@ -263,31 +256,20 @@ class DNSDeliveryTests(TestCase):
                     "dns_sftp_host": "nas.example.test", "dns_sftp_user": "dns",
                     "dns_sftp_port": 22, "dns_sftp_inbox": "/inbox", "dns_sftp_outbox": "/outbox",
                 }[field]
-                update_settings({field: original}, sites, Configuration.load().revision)
+                Configuration.objects.filter(pk=1).update(**{field: original})
 
     def test_auth_csrf_revision_and_generation_delivery_guards(self):
         self.publish()
         _, manifest, attempt = self.state()
         data = {"revision": 1, "generation": manifest["generation"], "delivery": attempt["delivery"]}
-        for name in ("dns-deliver", "dns-retry-delivery", "dns-result"):
-            url = reverse(name)
-            self.assertEqual(self.client.get(url).status_code, 405)
-            self.assertEqual(Client().post(url, data).status_code, 302)
-            csrf = Client(enforce_csrf_checks=True)
-            csrf.force_login(self.user)
-            self.assertEqual(csrf.post(url, data).status_code, 403)
-            self.user.is_staff = False
-            self.user.save()
-            self.assertEqual(self.client.post(url, data).status_code, 403)
-            self.user.is_staff = True
-            self.user.save()
+        for url in ("/exports/deliver-dns/", "/exports/retry-dns-delivery/",
+                    "/exports/check-dns-result/"):
+            self.assertEqual(self.client.get(url).status_code, 404)
+            self.assertEqual(Client().post(url, data).status_code, 404)
         self.deliver.reset_mock()
-        for name in ("dns-deliver", "dns-retry-delivery", "dns-result"):
-            response = self.client.post(reverse(name), {**data, "revision": 2}, follow=True)
-            self.assertContains(response, "Stale configuration revision")
-        for changes in ({"generation": "../escape"}, {"delivery": "invalid"},
-                        {"generation": "dnsgrid-2026100801"}):
-            self.client.post(reverse("dns-result"), {**data, **changes})
+        response = self.client.get(reverse("exports"))
+        self.assertNotContains(response, "Retry NAS delivery")
+        self.assertNotContains(response, "/exports/deliver-dns/")
         self.receipt.assert_not_called()
         self.deliver.assert_not_called()
 
@@ -337,7 +319,10 @@ class DNSDeliveryTests(TestCase):
         publish_dns_zones("1")
         self.deliver.assert_not_called()
         data = snapshot()
-        for field in ("dns_sftp_host", "dns_sftp_user", "dns_sftp_port", "dns_sftp_inbox", "dns_sftp_outbox"):
+        for field in (
+            "dns_sftp_host", "dns_sftp_user", "dns_sftp_port", "dns_sftp_inbox",
+            "dns_sftp_outbox", "named_checkzone", "rndc", "rndc_key",
+        ):
             self.assertNotIn(field, data["configuration"])
         legacy = copy.deepcopy(data)
         legacy["configuration"].update(dns_nas_host="retired", dns_nas_user="old", dns_nas_port=22)
@@ -356,7 +341,7 @@ class DNSDeliveryTests(TestCase):
             with self.assertRaises(ValidationError):
                 update_settings(fields, sites, 1)
         response = self.client.get(reverse("configuration"))
-        self.assertContains(response, "dns_sftp_inbox")
+        self.assertNotContains(response, "dns_sftp_inbox")
         self.assertNotContains(response, "DNSGRID_DNS_SFTP_IDENTITY_FILE")
 
     @override_settings(DNSGRID_DIAGNOSTICS=True)
@@ -398,21 +383,12 @@ class DNSDeliveryTests(TestCase):
         self.assertIn("No SFTP transfer attempted", "\n".join(output.output))
 
     @override_settings(DNSGRID_DIAGNOSTICS=True)
-    def test_remote_diagnostics_stay_out_of_browser_responses(self):
-        # Exercise the real delivery code and diagnostic pipe capture.
+    def test_legacy_dns_delivery_route_is_inactive(self):
         self.send.stop()
-        with override_settings(DNSGRID_DNS_SFTP_IDENTITY_FILE="/etc/dnsgrid/key",
-                               DNSGRID_DNS_SFTP_KNOWN_HOSTS="/etc/dnsgrid/known_hosts"):
-            def transfer(*args, **kwargs):
-                os.write(kwargs["stderr"], b"Permission denied (publickey). private remote text")
-                return SimpleNamespace(returncode=255)
-            with patch("inventory.dns_sftp.subprocess.run", side_effect=transfer):
-                with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
-                    response = self.client.post(reverse("dns-deliver"), {"revision": 1}, follow=True)
-        self.assertIn("permission denied", "\n".join(output.output))
-        self.assertNotContains(response, "permission denied")
-        self.assertNotContains(response, "private remote text")
-        self.assertContains(response, "Delivery unconfirmed")
+        with patch("inventory.dns_sftp.subprocess.run") as transfer:
+            response = self.client.post("/exports/deliver-dns/", {"revision": 1}, follow=True)
+        self.assertEqual(response.status_code, 404)
+        transfer.assert_not_called()
 
 
 class DNSDeliveryTransactionTests(TransactionTestCase):
@@ -425,6 +401,8 @@ class DNSDeliveryTransactionTests(TransactionTestCase):
                 dns_export_directory=directory, soa_serial=2026100800,
                 dns_sftp_host="nas.example.test", dns_sftp_user="dns",
                 dns_sftp_inbox="/inbox", dns_sftp_outbox="/outbox",
+                named_checkzone="/usr/bin/named-checkzone",
+                rndc="/usr/bin/rndc", rndc_key="/etc/bind/rndc.key",
             )
             def send(config, path, manifest, delivery):
                 self.assertFalse(connection.in_atomic_block)
@@ -432,9 +410,10 @@ class DNSDeliveryTransactionTests(TransactionTestCase):
                 self.assertEqual(json.loads((path / ".delivery.json").read_text())["delivery"], delivery)
                 save_host(Host(name="concurrent", site_id=1, row=1, column=0), config.revision)
                 return "delivered", "waiting"
-            with patch("inventory.dns_serial.initial_serial", return_value=2026100800):
-                with patch("inventory.dns_delivery.dns_sftp.deliver", side_effect=send):
-                    self.assertEqual(publish_and_deliver("1")[2], "delivered")
+            with patch("inventory.exporters.subprocess.run", return_value=SimpleNamespace(returncode=0)):
+                with patch("inventory.dns_serial.initial_serial", return_value=2026100800):
+                    with patch("inventory.dns_delivery.dns_sftp.deliver", side_effect=send):
+                        self.assertEqual(publish_and_deliver("1")[2], "delivered")
             self.assertEqual(Configuration.load().revision, 2)
             self.assertEqual(Configuration.load().soa_serial, 2026100801)
 
@@ -446,8 +425,9 @@ class DNSDeliveryTransactionTests(TransactionTestCase):
                 self.assertTrue((path / ".pin").exists())
                 save_host(Host(name="during-check", site_id=1, row=2, column=0), config.revision)
                 return "installed", "done"
-            with patch("inventory.dns_serial.initial_serial", return_value=2026100800):
-                with patch("inventory.dns_delivery.dns_sftp.read_result", side_effect=receipt):
-                    self.assertEqual(check_result(config.revision, manifest["generation"], attempt["delivery"])[0], "installed")
+            with patch("inventory.exporters.subprocess.run", return_value=SimpleNamespace(returncode=0)):
+                with patch("inventory.dns_serial.initial_serial", return_value=2026100800):
+                    with patch("inventory.dns_delivery.dns_sftp.read_result", side_effect=receipt):
+                        self.assertEqual(check_result(config.revision, manifest["generation"], attempt["delivery"])[0], "installed")
             self.assertEqual(Configuration.load().revision, 3)
             self.assertFalse((path / ".pin").exists())
