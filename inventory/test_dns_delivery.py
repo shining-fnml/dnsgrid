@@ -142,8 +142,11 @@ class DNSDeliveryTests(TestCase):
             "delivered": "Delivered via SFTP, awaiting NAS processing.",
             "unconfirmed": "SFTP delivery unconfirmed; check NAS result.",
             "failure": "SFTP delivery failed; no installation confirmed.",
-            "installed": "Files installed on the NAS; zone loading not verified.",
-            "already_installed": "Files already installed on the NAS; zone loading not verified.",
+            "installed": "Files installed on the NAS; no RNDC reload reported, so zones are not confirmed loaded.",
+            "already_installed": "Files already installed on the NAS; no RNDC reload reported, so zones are not confirmed loaded.",
+            "reloaded": "Files installed on the NAS and general RNDC reload succeeded; serving of the new records not verified.",
+            "reload_failed": "Files installed on the NAS, but the general RNDC reload failed or is unconfirmed; the NAS installer retries it. Zones not confirmed loaded.",
+            "superseded": "Files installed on the NAS, then superseded by a newer installation before a successful reload.",
             "failed": "NAS installation failed; consult local diagnostics.",
             "pending": "Result unavailable, awaiting NAS processing.",
             "invalid": "Invalid NAS result; no installation confirmed.",
@@ -192,6 +195,28 @@ class DNSDeliveryTests(TestCase):
         self.deliver.reset_mock()
         self.publish()
         self.deliver.assert_not_called()
+
+    def test_failed_reload_keeps_pin_and_can_be_checked_again(self):
+        self.publish()
+        path, manifest, attempt = self.state()
+        self.receipt.return_value = ("reload_failed", "reload failed")
+        self.assertEqual(check_result(1, manifest["generation"], attempt["delivery"])[0], "reload_failed")
+        self.assertTrue((path / ".pin").exists())
+        self.assertEqual(self.state()[2]["status"], "reload_failed")
+        self.receipt.return_value = ("reloaded", "reloaded")
+        self.assertEqual(check_result(1, manifest["generation"], attempt["delivery"])[0], "reloaded")
+        self.assertFalse((path / ".pin").exists())
+        self.assertEqual(self.receipt.call_count, 2)
+        self.assertEqual(check_result(1, manifest["generation"], attempt["delivery"]),
+                         ("reloaded", LABELS["reloaded"]))
+        self.assertEqual(self.receipt.call_count, 2)
+
+    def test_superseded_reload_receipt_releases_pin(self):
+        self.publish()
+        path, manifest, attempt = self.state()
+        self.receipt.return_value = ("superseded", "superseded")
+        self.assertEqual(check_result(1, manifest["generation"], attempt["delivery"])[0], "superseded")
+        self.assertFalse((path / ".pin").exists())
 
     def test_receipt_is_checked_on_demand_and_disabled_ui_retains_saved_state(self):
         self.publish()

@@ -187,6 +187,16 @@ def deliver(config, path, manifest, delivery):
     return "delivered", "Delivered, awaiting NAS processing. File installation is not yet confirmed."
 
 
+RESULT_LABELS = {
+    "installed": "Files installed on the NAS; no RNDC reload reported, so zones are not confirmed loaded.",
+    "already_installed": "Files already installed on the NAS; no RNDC reload reported, so zones are not confirmed loaded.",
+    "reloaded": "Files installed on the NAS and general RNDC reload succeeded; serving of the new records not verified.",
+    "reload_failed": "Files installed on the NAS, but the general RNDC reload failed or is unconfirmed; the NAS installer retries it. Zones not confirmed loaded.",
+    "superseded": "Files installed on the NAS, then superseded by a newer installation before a successful reload.",
+    "failed": "NAS installation failed; consult protected local diagnostics.",
+}
+
+
 def read_result(config, delivery, serial):
     validate_delivery(delivery, serial)
     validate_remote_path(config.dns_sftp_outbox)
@@ -212,10 +222,15 @@ def read_result(config, delivery, serial):
             result = json.loads(raw, object_pairs_hook=_unique_object)
             timestamp = datetime.fromisoformat(result["timestamp"])
             if (type(result) is not dict
-                    or set(result) != {"delivery", "serial", "status", "timestamp", "summary"}
+                    or set(result) - {"reload"} != {"delivery", "serial", "status", "timestamp", "summary"}
                     or result["delivery"] != delivery or type(result["serial"]) is not int
                     or result["serial"] != serial
                     or result["status"] not in ("installed", "already_installed", "failed")
+                    # Legacy receipts have no reload field; new ones report it only
+                    # for installed files.
+                    or ("reload" in result and (
+                        result["reload"] not in ("succeeded", "failed", "superseded")
+                        or result["status"] == "failed"))
                     or timestamp.utcoffset() is None or timestamp.utcoffset().total_seconds() != 0
                     or not isinstance(result["summary"], str) or len(result["summary"]) > 512
                     or any(ord(char) < 32 or ord(char) == 127 for char in result["summary"])):
@@ -227,9 +242,9 @@ def read_result(config, delivery, serial):
             log("Invalid NAS receipt; installation not confirmed", delivery=delivery)
             return "invalid", "Invalid NAS result; no installation confirmed."
     # Never display NAS-provided text, even from a structurally valid result.
-    log("Validated NAS receipt; zone loading not verified", delivery=delivery, status=result["status"])
-    return result["status"], {
-        "installed": "Files installed on the NAS; zone loading not verified.",
-        "already_installed": "Files already installed on the NAS; zone loading not verified.",
-        "failed": "NAS installation failed; consult protected local diagnostics.",
-    }[result["status"]]
+    status = {
+        None: result["status"], "succeeded": "reloaded",
+        "failed": "reload_failed", "superseded": "superseded",
+    }[result.get("reload")]
+    log("Validated NAS receipt; zone loading not verified", delivery=delivery, status=status)
+    return status, RESULT_LABELS[status]

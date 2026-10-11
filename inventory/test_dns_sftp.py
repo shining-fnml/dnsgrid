@@ -148,8 +148,8 @@ class SFTPTests(SimpleTestCase):
 
         with patch("inventory.dns_sftp._run", side_effect=transfer):
             for status, summary in (
-                ("installed", "Files installed on the NAS; zone loading not verified."),
-                ("already_installed", "Files already installed on the NAS; zone loading not verified."),
+                ("installed", "Files installed on the NAS; no RNDC reload reported, so zones are not confirmed loaded."),
+                ("already_installed", "Files already installed on the NAS; no RNDC reload reported, so zones are not confirmed loaded."),
                 ("failed", "NAS installation failed; consult protected local diagnostics."),
                 ("invalid", "Invalid NAS result; no installation confirmed."),
             ):
@@ -167,6 +167,36 @@ class SFTPTests(SimpleTestCase):
                     run.side_effect = outcome if isinstance(outcome, Exception) else None
                     run.return_value = outcome
                     self.assertEqual(read_result(self.config, self.delivery, 2026100900), ("pending", summary))
+
+    def test_reload_outcome_receipts_are_distinct_and_legacy_receipts_remain_valid(self):
+        result = {
+            "delivery": self.delivery, "serial": 2026100900, "status": "installed",
+            "timestamp": "2026-10-09T23:00:00+00:00", "summary": "<secret>",
+        }
+
+        def transfer(config, batch, download=False):
+            Path(batch.split('"')[-2]).write_text(json.dumps(result))
+            return 0
+
+        with patch("inventory.dns_sftp._run", side_effect=transfer):
+            self.assertEqual(read_result(self.config, self.delivery, 2026100900)[0], "installed")
+            for status, reload, expected, summary in (
+                ("installed", "succeeded", "reloaded",
+                 "Files installed on the NAS and general RNDC reload succeeded; serving of the new records not verified."),
+                ("already_installed", "succeeded", "reloaded",
+                 "Files installed on the NAS and general RNDC reload succeeded; serving of the new records not verified."),
+                ("installed", "failed", "reload_failed",
+                 "Files installed on the NAS, but the general RNDC reload failed or is unconfirmed; "
+                 "the NAS installer retries it. Zones not confirmed loaded."),
+                ("already_installed", "superseded", "superseded",
+                 "Files installed on the NAS, then superseded by a newer installation before a successful reload."),
+                ("failed", "succeeded", "invalid", "Invalid NAS result; no installation confirmed."),
+                ("installed", "restarted", "invalid", "Invalid NAS result; no installation confirmed."),
+                ("installed", ["succeeded"], "invalid", "Invalid NAS result; no installation confirmed."),
+            ):
+                with self.subTest(status=status, reload=reload):
+                    result.update(status=status, reload=reload)
+                    self.assertEqual(read_result(self.config, self.delivery, 2026100900), (expected, summary))
 
     @patch("inventory.dns_sftp.subprocess.run", return_value=SimpleNamespace(returncode=1))
     def test_receipt_download_has_bandwidth_and_time_bounds(self, run):

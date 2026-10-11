@@ -21,16 +21,21 @@ from .services import _claim_revision
 
 STATUSES = {
     "inflight", "delivered", "unconfirmed", "failure",
-    "installed", "already_installed", "failed", "pending", "invalid",
+    "installed", "already_installed", "reloaded", "reload_failed", "superseded",
+    "failed", "pending", "invalid",
 }
-CONFIRMED = {"installed", "already_installed"}
+# A failed/unconfirmed reload keeps the pin so the result can be checked again.
+CONFIRMED = {"installed", "already_installed", "reloaded", "superseded"}
 LABELS = {
     "inflight": "Delivery in progress, awaiting NAS processing.",
     "delivered": "Delivered via SFTP, awaiting NAS processing.",
     "unconfirmed": "SFTP delivery unconfirmed; check NAS result.",
     "failure": "SFTP delivery failed; no installation confirmed.",
-    "installed": "Files installed on the NAS; zone loading not verified.",
-    "already_installed": "Files already installed on the NAS; zone loading not verified.",
+    "installed": "Files installed on the NAS; no RNDC reload reported, so zones are not confirmed loaded.",
+    "already_installed": "Files already installed on the NAS; no RNDC reload reported, so zones are not confirmed loaded.",
+    "reloaded": "Files installed on the NAS and general RNDC reload succeeded; serving of the new records not verified.",
+    "reload_failed": "Files installed on the NAS, but the general RNDC reload failed or is unconfirmed; the NAS installer retries it. Zones not confirmed loaded.",
+    "superseded": "Files installed on the NAS, then superseded by a newer installation before a successful reload.",
     "failed": "NAS installation failed; consult local diagnostics.",
     "pending": "Result unavailable, awaiting NAS processing.",
     "invalid": "Invalid NAS result; no installation confirmed.",
@@ -215,7 +220,8 @@ def check_result(expected_revision, generation, delivery):
             status, summary = dns_sftp.read_result(config, delivery, manifest["serial"])
         except (ValidationError, OSError):
             status, summary = "invalid", LABELS["invalid"]
-        if status not in {"installed", "already_installed", "failed", "pending", "invalid"}:
+        if status not in {"installed", "already_installed", "reloaded", "reload_failed",
+                          "superseded", "failed", "pending", "invalid"}:
             status, summary = "invalid", LABELS["invalid"]
         with transaction.atomic():
             _claim_revision(Configuration.load().revision, changed=False)

@@ -939,5 +939,416 @@ class DNSInstallTests(unittest.TestCase):
         self.assertEqual(self.result()["status"], "installed")
 
 
+class DNSInstallReloadTests(unittest.TestCase):
+    """General RNDC reload after complete installation; RNDC is always mocked."""
+
+    setUp = DNSInstallTests.setUp
+    zone = DNSInstallTests.zone
+    publish = DNSInstallTests.publish
+    result = DNSInstallTests.result
+    assert_empty_install = DNSInstallTests.assert_empty_install
+
+    SECRET = "c2VjcmV0LWtleS1tYXRlcmlhbA=="
+
+    def configure_reload(self):
+        self.calls_log = self.root / "rndc-calls"
+        self.exit_file = self.root / "rndc-exit"
+        self.exit_file.write_text("0")
+        self.rndc = self.root / "rndc"
+        count = self.root / "rndc-count"
+        self.rndc.write_text(
+            "#!/bin/sh\n"
+            + f"printf '%s\\n' \"$@\" >> '{self.calls_log}'\n"
+            + f"echo call >> '{count}'\n"
+            + "printf 'rndc: \\033[31mreload output\\007\\n'\n"
+            + f"exit $(cat '{self.exit_file}')\n")
+        self.rndc.chmod(0o700)
+        self.key = self.root / "rndc.key"
+        self.key.write_text('key "rndc-key" { algorithm hmac-sha256; secret "%s"; };\n' % self.SECRET)
+        self.key.chmod(0o600)
+        self.base_config = self.config_path.read_text()
+        self.config_path.write_text(self.base_config + f"rndc = {self.rndc}\nrndc_key = {self.key}\n")
+        self.config = installer.load_config(self.config_path)
+
+    def invoke(self, dry_run=False):
+        stderr = StringIO()
+        with patch("sys.stderr", stderr), patch.object(installer, "__file__", str(self.script)):
+            code = installer.main(["--config", str(self.config_path)] + (["--dry-run"] if dry_run else []))
+        self.stderr = stderr.getvalue()
+        self.assertNotIn(self.SECRET, self.stderr)
+        return code
+
+    def rndc_calls(self):
+        path = self.root / "rndc-count"
+        return len(path.read_text().splitlines()) if path.exists() else 0
+
+    def pending_path(self):
+        return self.paths["state"] / installer.RELOAD_NAME
+
+    def assert_receipts_safe(self):
+        for path in self.paths["outbox"].iterdir():
+            self.assertNotIn(self.SECRET, path.read_text())
+            self.assertNotIn(str(self.key), path.read_text())
+
+    def test_reload_configuration_parsing_and_validation(self):
+        self.configure_reload()
+        self.assertEqual(self.config["rndc"], self.rndc)
+        self.assertEqual(self.config["rndc_key"], self.key)
+        self.assertEqual(self.config["named_checkzone"], self.validator)
+        self.config_path.write_text(self.base_config)
+        self.assertNotIn("rndc", installer.load_config(self.config_path))
+        for text, message in (
+            (self.base_config + f"rndc = {self.rndc}\n", "configured together"),
+            (self.base_config + f"rndc_key = {self.key}\n", "configured together"),
+            (self.base_config + f"rndc = bin/rndc\nrndc_key = {self.key}\n", "absolute"),
+            (self.base_config + f"rndc = {self.rndc}\nrndc_key = {self.root}/../rndc.key\n", "absolute"),
+            (self.base_config + f"rndc = {self.rndc}\nrndc_key = {self.paths['state']}/rndc.key\n", "outside"),
+            (self.base_config + f"rndc = {self.paths['inbox']}/rndc\nrndc_key = {self.key}\n", "outside"),
+            (self.base_config + f"rndc = {self.rndc}\nrndc_key = {self.rndc}\n", "distinct"),
+            (self.base_config + f"utils_bin = {self.root}\n", "Invalid configuration"),
+            (self.base_config + f"utils_bin = {self.root}\nrndc = {self.rndc}\nrndc_key = {self.key}\n",
+             "Invalid configuration"),
+            (self.base_config.replace(f"named_checkzone = {self.validator}\n", "")
+             + f"rndc = {self.rndc}\nrndc_key = {self.key}\n", "Invalid configuration"),
+        ):
+            with self.subTest(text=text):
+                self.config_path.write_text(text)
+                with self.assertRaises(installer.InstallError) as raised:
+                    installer.load_config(self.config_path)
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(message, str(raised.exception))
+
+    def test_example_configuration_uses_verified_separate_paths(self):
+        text = (Path(installer.__file__).parent / "dns_install.ini.example").read_text()
+        self.assertIn("named_checkzone = /volume1/@appstore/DNSServer/bin/named-checkzone\n", text)
+        self.assertIn("rndc = /volume1/@appstore/DNSServer/bin/rndc\n", text)
+        self.assertIn("rndc_key = /volume1/@appstore/DNSServer/named/rndc.key\n", text)
+        self.assertNotIn("utils_bin", text)
+        self.assertNotIn("saver.intranet", text)
+
+    def test_exact_general_reload_argv_once_after_complete_installation(self):
+        self.configure_reload()
+        self.publish(suffix="b")
+        original = subprocess.run
+        calls = []
+        def checked(args, **kwargs):
+            calls.append((list(args), kwargs))
+            if args[0] == str(self.rndc):
+                self.assertFalse((self.paths["state"] / installer.JOURNAL_NAME).exists())
+                for name in self.names:
+                    self.assertEqual((self.paths["destination"] / name).read_bytes(), self.zone(self.serial))
+            return original(args, **kwargs)
+        with patch.object(installer.subprocess, "run", side_effect=checked):
+            self.assertEqual(self.invoke(), 0)
+        reloads = [(args, kwargs) for args, kwargs in calls if args[0] == str(self.rndc)]
+        self.assertEqual(len(reloads), 1)
+        args, kwargs = reloads[0]
+        self.assertEqual(args, [str(self.rndc), "-k", str(self.key), "-s", "127.0.0.1",
+                                "-p", "953", "reload"])
+        self.assertEqual(installer.reload_command(self.config), args)
+        self.assertFalse(kwargs["shell"])
+        self.assertEqual(kwargs["timeout"], installer.RELOAD_TIMEOUT)
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertFalse(any(name in args for name in self.names))
+        self.assertFalse(any("systemctl" in str(a) or "restart" in str(a)
+                             for call_args, _ in calls for a in call_args))
+        self.assertEqual(self.calls_log.read_text().splitlines(),
+                         ["-k", str(self.key), "-s", "127.0.0.1", "-p", "953", "reload"])
+        self.assertEqual(calls[-1][0][0], str(self.rndc))
+
+    def test_successful_reload_receipts_and_pending_cleared(self):
+        self.configure_reload()
+        second = self.publish(suffix="b")
+        self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.rndc_calls(), 1)
+        first = self.result()
+        self.assertEqual((first["status"], first["reload"]), ("installed", "succeeded"))
+        self.assertIn("Serving of the new records not verified", first["summary"])
+        other = self.result(second.name)
+        self.assertEqual((other["status"], other["reload"]), ("already_installed", "succeeded"))
+        self.assertFalse(self.pending_path().exists())
+        self.assertIn("General RNDC reload succeeded", self.stderr)
+        self.assert_receipts_safe()
+        self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.rndc_calls(), 1)
+
+    def test_nonzero_exit_then_retry_without_resend_or_reinstall(self):
+        self.configure_reload()
+        self.exit_file.write_text("1")
+        self.assertEqual(self.invoke(), 8)
+        receipt = self.result()
+        self.assertEqual((receipt["status"], receipt["reload"]), ("installed", "failed"))
+        self.assertIn("exit status 1", self.stderr)
+        self.assertIn("reload output", self.stderr)
+        self.assertNotIn("\x1b", self.stderr)
+        self.assert_receipts_safe()
+        for name in self.names:
+            self.assertEqual((self.paths["destination"] / name).read_bytes(), self.zone(self.serial))
+        state = (self.paths["state"] / installer.STATE_NAME).read_bytes()
+        self.assertTrue(self.pending_path().exists())
+        self.assertFalse((self.paths["state"] / installer.JOURNAL_NAME).exists())
+        # Still failing: retried every run, receipt stays failed, nothing reinstalled.
+        with patch.object(installer, "snapshot") as snapshot, \
+                patch.object(installer, "install") as install:
+            self.assertEqual(self.invoke(), 8)
+            snapshot.assert_not_called()
+            install.assert_not_called()
+        self.assertEqual(self.rndc_calls(), 2)
+        # The delivery may even disappear from the inbox: the durable record drives the retry.
+        source = self.paths["inbox"] / self.delivery
+        source.rename(self.root / "removed-delivery")
+        self.exit_file.write_text("0")
+        with patch.object(installer, "snapshot") as snapshot, \
+                patch.object(installer, "install") as install:
+            self.assertEqual(self.invoke(), 0)
+            snapshot.assert_not_called()
+            install.assert_not_called()
+        self.assertEqual(self.rndc_calls(), 3)
+        receipt = self.result()
+        self.assertEqual((receipt["status"], receipt["reload"]), ("installed", "succeeded"))
+        self.assertFalse(self.pending_path().exists())
+        self.assertEqual((self.paths["state"] / installer.STATE_NAME).read_bytes(), state)
+
+    def test_timeout_and_startup_errors_are_reload_failures(self):
+        self.configure_reload()
+        original = subprocess.run
+        for error in (subprocess.TimeoutExpired("rndc", installer.RELOAD_TIMEOUT),
+                      PermissionError("cannot execute"), FileNotFoundError("vanished")):
+            with self.subTest(error=type(error).__name__):
+                def fail(args, **kwargs):
+                    if args[0] == str(self.rndc):
+                        raise error
+                    return original(args, **kwargs)
+                with patch.object(installer.subprocess, "run", side_effect=fail):
+                    self.assertEqual(self.invoke(), 8)
+                self.assertEqual(self.result()["reload"], "failed")
+                self.assertTrue(self.pending_path().exists())
+                self.assertIn("timed out" if isinstance(error, subprocess.TimeoutExpired)
+                              else "could not be started", self.stderr)
+        self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.result()["reload"], "succeeded")
+
+    def test_missing_or_unsafe_key_or_binary_installs_nothing(self):
+        self.configure_reload()
+        cases = []
+        def key_mode(mode):
+            def apply():
+                self.key.chmod(mode)
+            return apply
+        cases.extend(("key mode %o" % mode, key_mode(mode)) for mode in (0o644, 0o604, 0o620, 0o666))
+        cases.append(("key missing", lambda: self.key.rename(self.root / "moved.key")))
+        def key_symlink():
+            self.key.rename(self.root / "real.key")
+            self.key.symlink_to(self.root / "real.key")
+        cases.append(("key symlink", key_symlink))
+        def key_hardlink():
+            os.link(self.key, self.root / "linked.key")
+        cases.append(("key hardlink", key_hardlink))
+        cases.append(("key directory", lambda: (self.key.unlink(), self.key.mkdir(mode=0o700))))
+        cases.append(("rndc missing", lambda: self.rndc.unlink()))
+        cases.append(("rndc writable", lambda: self.rndc.chmod(0o722)))
+        cases.append(("rndc not executable", lambda: self.rndc.chmod(0o600)))
+        for label, mutate in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self.configure_reload()
+                mutate()
+                self.assertEqual(self.invoke(), 2)
+                self.assert_empty_install()
+                self.assertEqual(list(self.paths["outbox"].iterdir()), [])
+                self.assertEqual(self.rndc_calls(), 0)
+                self.assertFalse(self.pending_path().exists())
+
+    def test_dry_run_never_reloads(self):
+        self.configure_reload()
+        self.assertEqual(self.invoke(True), 0)
+        self.assertEqual(self.rndc_calls(), 0)
+        self.assert_empty_install()
+        self.assertFalse(self.pending_path().exists())
+        self.assertEqual(list(self.paths["outbox"].iterdir()), [])
+        self.exit_file.write_text("1")
+        self.assertEqual(self.invoke(), 8)
+        pending = self.pending_path().read_bytes()
+        self.assertEqual(self.invoke(True), 0)
+        self.assertIn("dry run does not reload", self.stderr)
+        self.assertEqual(self.rndc_calls(), 1)
+        self.assertEqual(self.pending_path().read_bytes(), pending)
+
+    def test_failed_or_incomplete_installation_never_reloads(self):
+        self.configure_reload()
+        self.validator.write_text("#!/bin/sh\nexit 1\n")
+        self.assertEqual(self.invoke(), 5)
+        self.assertEqual(self.rndc_calls(), 0)
+        self.assertNotIn("reload", self.result())
+        self.validator.write_text("#!/bin/sh\nexit 0\n")
+        original = installer.atomic_write
+        def fail(fd, filename, data, mode=0o600, **kwargs):
+            if filename == installer.STATE_NAME:
+                raise OSError("install failed")
+            return original(fd, filename, data, mode, **kwargs)
+        with patch.object(installer, "atomic_write", side_effect=fail):
+            self.assertEqual(self.invoke(), 6)
+        self.assertEqual(self.rndc_calls(), 0)
+        self.assertEqual(self.result()["status"], "failed")
+        self.assertNotIn("reload", self.result())
+        self.assert_empty_install()
+        self.assertFalse(self.pending_path().exists())
+
+    def test_incomplete_rollback_defers_pending_reload(self):
+        self.configure_reload()
+        self.exit_file.write_text("1")
+        self.assertEqual(self.invoke(), 8)
+        self.exit_file.write_text("0")
+        self.publish(self.serial + 1, "b")
+        original = installer.atomic_write
+        fail_recovery = False
+        def fail(fd, filename, data, mode=0o600, **kwargs):
+            nonlocal fail_recovery
+            if filename == installer.STATE_NAME:
+                fail_recovery = True
+                raise OSError("install failed")
+            if fail_recovery and filename in self.names:
+                raise OSError("rollback failed")
+            return original(fd, filename, data, mode, **kwargs)
+        with patch.object(installer, "atomic_write", side_effect=fail):
+            self.assertEqual(self.invoke(), 7)
+        self.assertEqual(self.rndc_calls(), 1)
+        self.assertTrue((self.paths["state"] / installer.JOURNAL_NAME).exists())
+        self.assertTrue(self.pending_path().exists())
+        # Recovery first restores the complete previous set; the failed newer
+        # delivery is retried, then ONE general reload covers the complete set.
+        self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.rndc_calls(), 2)
+        self.assertFalse((self.paths["state"] / installer.JOURNAL_NAME).exists())
+        self.assertEqual(self.result()["reload"], "superseded")
+        self.assertEqual(self.result(f"dnsgrid-{self.serial + 1}-" + "b" * 32)["reload"], "succeeded")
+
+    def test_superseded_and_already_installed_do_not_bypass_pending_reload(self):
+        self.configure_reload()
+        self.exit_file.write_text("1")
+        self.assertEqual(self.invoke(), 8)
+        same = self.publish(suffix="c")
+        self.assertEqual(self.invoke(), 8)
+        self.assertEqual((self.result(same.name)["status"], self.result(same.name)["reload"]),
+                         ("already_installed", "failed"))
+        newer = self.publish(self.serial + 1, "b")
+        self.exit_file.write_text("0")
+        before = self.rndc_calls()
+        self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.rndc_calls(), before + 1)
+        self.assertEqual(self.result()["reload"], "superseded")
+        self.assertEqual(self.result(same.name)["reload"], "superseded")
+        self.assertEqual((self.result(newer.name)["status"], self.result(newer.name)["reload"]),
+                         ("installed", "succeeded"))
+        for name in self.names:
+            self.assertEqual((self.paths["destination"] / name).read_bytes(), self.zone(self.serial + 1))
+        self.assertFalse(self.pending_path().exists())
+
+    def test_crash_after_install_before_pending_record_reloads_on_next_run(self):
+        self.configure_reload()
+        with patch.object(installer, "write_pending", side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                self.invoke()
+        self.assertEqual(self.rndc_calls(), 0)
+        self.assertEqual(list(self.paths["outbox"].iterdir()), [])
+        self.assertTrue((self.paths["state"] / installer.STATE_NAME).exists())
+        self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.rndc_calls(), 1)
+        self.assertEqual((self.result()["status"], self.result()["reload"]), ("already_installed", "succeeded"))
+
+    def test_crash_after_reload_before_receipts_repeats_idempotent_reload(self):
+        self.configure_reload()
+        with patch.object(installer, "result", side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                self.invoke()
+        self.assertEqual(self.rndc_calls(), 1)
+        self.assertTrue(self.pending_path().exists())
+        self.assertEqual(list(self.paths["outbox"].iterdir()), [])
+        with patch.object(installer, "snapshot") as snapshot:
+            self.assertEqual(self.invoke(), 0)
+            snapshot.assert_not_called()
+        self.assertEqual(self.rndc_calls(), 2)
+        self.assertEqual((self.result()["status"], self.result()["reload"]), ("installed", "succeeded"))
+        self.assertFalse(self.pending_path().exists())
+        original = installer.write_pending
+        def crash_on_clear(state, entries):
+            if not entries:
+                raise KeyboardInterrupt()
+            return original(state, entries)
+        self.publish(self.serial + 1, "b")
+        with patch.object(installer, "write_pending", side_effect=crash_on_clear):
+            with self.assertRaises(KeyboardInterrupt):
+                self.invoke()
+        self.assertTrue(self.pending_path().exists())
+        self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.rndc_calls(), 4)
+        self.assertFalse(self.pending_path().exists())
+
+    def test_pending_limit_defers_delivery_without_receipt(self):
+        self.configure_reload()
+        self.exit_file.write_text("1")
+        with patch.object(installer, "MAX_PENDING", 1):
+            self.assertEqual(self.invoke(), 8)
+            later = self.publish(suffix="b")
+            self.assertEqual(self.invoke(), 8)
+            self.assertIn("deferred", self.stderr)
+            self.assertFalse((self.paths["outbox"] / (later.name + ".json")).exists())
+            self.exit_file.write_text("0")
+            self.assertEqual(self.invoke(), 0)
+            self.assertFalse((self.paths["outbox"] / (later.name + ".json")).exists())
+            self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.result(later.name)["reload"], "succeeded")
+
+    def test_invalid_pending_reload_state_blocks_installation(self):
+        self.configure_reload()
+        for content in ("{}", "not json", json.dumps({"version": 1, "deliveries": [
+                {"delivery": "dnsgrid-1-" + "a" * 32, "serial": 2, "status": "installed",
+                 "fingerprint": "0" * 64}]})):
+            with self.subTest(content=content):
+                self.pending_path().write_text(content)
+                self.pending_path().chmod(0o600)
+                self.assertEqual(self.invoke(), 7)
+                self.assert_empty_install()
+                self.assertEqual(self.rndc_calls(), 0)
+
+    def test_receipt_schema_accepts_reload_field_and_legacy_receipts(self):
+        self.configure_reload()
+        self.assertEqual(self.invoke(), 0)
+        path = self.paths["outbox"] / (self.delivery + ".json")
+        receipt = json.loads(path.read_text())
+        self.assertEqual(set(receipt), {"delivery", "serial", "status", "timestamp", "summary", "reload"})
+        outbox = os.open(self.paths["outbox"], os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, outbox)
+        self.assertTrue(installer.completed_result(outbox, self.delivery, self.serial))
+        legacy = {key: value for key, value in receipt.items() if key != "reload"}
+        path.write_text(json.dumps(legacy))
+        self.assertTrue(installer.completed_result(outbox, self.delivery, self.serial))
+        for bad in ({**receipt, "reload": "maybe"}, {**receipt, "status": "failed"}):
+            path.write_text(json.dumps(bad))
+            with self.assertRaises(installer.InstallError):
+                installer.completed_result(outbox, self.delivery, self.serial)
+
+    def test_legacy_configuration_installs_without_reload_and_says_so(self):
+        self.assertEqual(self.invoke(), 0)
+        receipt = self.result()
+        self.assertEqual(set(receipt), {"delivery", "serial", "status", "timestamp", "summary"})
+        self.assertEqual(receipt["status"], "installed")
+        self.assertIn("RNDC reload not configured", receipt["summary"])
+        self.assertIn("not confirmed loaded", self.stderr)
+        self.assertFalse(self.pending_path().exists())
+
+    def test_copied_script_reloads_with_stdlib_only(self):
+        self.configure_reload()
+        copied = self.root / "dns_install.py"
+        copied.write_bytes(Path(installer.__file__).read_bytes())
+        copied.chmod(0o700)
+        process = subprocess.run([sys.executable, "-I", "-S", str(copied), "--config", str(self.config_path)],
+                                 cwd=self.root, capture_output=True, text=True, timeout=15)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertNotIn(self.SECRET, process.stdout + process.stderr)
+        self.assertEqual(self.result()["reload"], "succeeded")
+        self.assertEqual(self.rndc_calls(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -332,7 +332,9 @@ requests a shell or remote command, and the NAS never connects back to dnsgrid.
 A privileged **local** DSM Task Scheduler task validates and installs files.
 Successful upload means **delivered, awaiting processing**, not installed.
 Successful installation means **files installed**, not that the DNS service
-has loaded them. No package restart or reload command is supplied.
+has loaded them. When ``rndc`` and ``rndc_key`` are configured, the local
+installer performs **one general** ``rndc reload`` after the complete zone set
+is installed (see `General RNDC reload`_). No package restart is performed.
 
 In Settings configure ``dns_sftp_host``, ``dns_sftp_user``, ``dns_sftp_port``,
 ``dns_sftp_inbox`` and ``dns_sftp_outbox``. Paths must be absolute as seen by
@@ -456,7 +458,8 @@ alone cannot establish that isolation. Do not change DSM package ownership
 or permissions to enable this flow.
 
 Copy ``synology/dns_install.py`` by itself to an administrator-owned location.
-Python 3 and a working ``named-checkzone`` are prerequisites. Copy and edit
+Python 3 and a working ``named-checkzone`` are prerequisites; ``rndc`` with
+a working control-channel key is needed for the optional general reload. Copy and edit
 ``synology/dns_install.ini.example`` as a protected local INI configuration,
 for example ``/etc/dnsgrid-dns-install.ini``. Configure exact authorized
 zone names (the LAN zone and all four reverse zones), verified master and
@@ -482,6 +485,104 @@ installed DSM release. Choose an operationally suitable interval; there is
 no guaranteed minimum interval. Expected latency is up to the chosen interval
 plus validation/install time and scheduler delays. A second concurrent run
 exits busy. Monitor task exit status and protected local diagnostics.
+
+General RNDC reload
+~~~~~~~~~~~~~~~~~~~
+
+Running ``named`` does not serve newly installed zone files until it reloads
+them. Configure two separate, explicit settings next to the existing
+``named_checkzone`` (there is no shared binary-directory setting)::
+
+    named_checkzone = /volume1/@appstore/DNSServer/bin/named-checkzone
+    rndc = /volume1/@appstore/DNSServer/bin/rndc
+    rndc_key = /volume1/@appstore/DNSServer/named/rndc.key
+
+These paths were verified on one DSM DNS Server package (BIND 9.16.34) whose
+active ``named.conf`` controls listen on ``127.0.0.1`` port ``953`` and
+authorize key ``rndc-key`` (``hmac-sha256``). ``rndc_key`` must be the key file
+authorized by the active ``controls`` block, **not** a zone, transfer or
+dynamic-update key such as ``named/etc/key/<zone>-key`` (using one causes
+``bad auth`` in the ``named`` log). Verify on your DSM version.
+
+Both settings must be configured together as absolute normalized paths,
+outside inbox, outbox, state and destination; one without the other is a
+configuration error. The INI contains only the key **path**, never the secret.
+``rndc`` is checked like ``named-checkzone`` (regular, single-link, executable,
+not group/world writable, symlink-free protected ancestors; package-owned only
+inside a configured ``package_root``). ``rndc_key`` must be a regular,
+single-link file owned by root, the task user or (inside ``package_root``) the
+package account, with no group write and **no world access** (for example mode
+``0600`` or ``0640``). The installer checks this metadata but never reads,
+logs or copies the key. Check without printing contents::
+
+    stat -c '%U:%G %a %h %F' /volume1/@appstore/DNSServer/named/rndc.key
+
+If the key or executable is missing or unsafe, the installer exits with
+configuration status 2 **before installing any file**. It does not generate
+keys, edit ``named`` controls/configuration, or restart the package. If an
+``/etc/rndc.conf`` exists, ``rndc`` may prefer it over ``-k``; verify the manual
+commands below with the same identity as the scheduled task.
+
+After **every** zone in the run's deliveries has been validated and the
+installation transaction has committed (journal resolved), the installer runs
+exactly one general reload, with ``shell=False``, a fixed argument vector, a
+60 second timeout and no zone argument::
+
+    <rndc> -k <rndc_key> -s 127.0.0.1 -p 953 reload
+
+It never reloads after mere SFTP transfer, during ``--dry-run``, after a
+rejected or failed delivery that was rolled back without other pending work,
+or while recovery is incomplete. Exit status 0 within the timeout is the only
+success. Nonzero exit, startup failure or timeout is a reload failure: the
+task exits with status **8**, and bounded, control-character-free ``rndc``
+output (never the key) is printed to the task's local stderr only.
+
+State ordering for crash safety: files are installed under the existing
+journal; once committed, the delivery is recorded in the private
+``state/reload.json`` pending-reload record; only then is the reload run and
+receipts written; the record is removed only after every receipt is durable.
+A crash before the record leaves no receipt, so the next run reprocesses the
+delivery as ``already_installed`` and reloads. A crash after the reload
+repeats the idempotent general reload. While a pending record exists, every
+non-dry run retries the reload **without resending, reinstalling or lowering
+serials**; a later ``already_installed`` delivery joins the pending record and
+cannot bypass it. An invalid record blocks installation (status 7) for
+administrator review; do not delete it to bypass a reload.
+
+Rollback interaction: rollback only happens before the journal is resolved,
+which is always before the reload, so ``named`` never loads a partially
+installed or rolled-back set from this installer. If an administrator later
+restores master files manually, disk restoration alone does **not** change the
+zones held in memory: reload ``named`` manually afterwards.
+
+Without ``rndc``/``rndc_key`` (legacy INI), files are installed with the
+previous behavior, receipts carry no reload field, their summary states that
+reload is not configured, and stderr notes that zones are not confirmed
+loaded. Installation without reload does **not** imply the zones are loaded.
+After enabling reload for an existing installation, run a manual reload once
+or redeliver the current generation (it is processed as ``already_installed``
+and reloaded).
+
+Manual diagnostics on the NAS (run as the task user; never print the key)::
+
+    /volume1/@appstore/DNSServer/bin/rndc -k /volume1/@appstore/DNSServer/named/rndc.key -s 127.0.0.1 -p 953 status
+    /volume1/@appstore/DNSServer/bin/rndc -k /volume1/@appstore/DNSServer/named/rndc.key -s 127.0.0.1 -p 953 reload
+    journalctl -u pkg-DNSServer.service --since "10 minutes ago" --no-pager
+
+Distinguish the outcomes:
+
+* **delivered**: SFTP upload completed; nothing installed yet.
+* **installed**: files validated and atomically replaced; ``named`` may still
+  serve old data.
+* **reload requested**: the installer ran the general ``rndc reload``.
+* **reload succeeded**: ``rndc`` exited 0. This does not prove each zone
+  loaded or serves the intended records (a zone can still fail to load).
+* **serving verified**: only an explicit query, for example
+  ``dig @127.0.0.1 <zone> SOA +short`` showing the new serial, verifies it.
+  dnsgrid does not perform this check.
+
+Only the operator's manual ``rndc ... status`` on one DSM system has been
+verified live; the automated reload is tested with a mocked ``rndc``.
 
 Delivery, receipts and retries
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -528,8 +629,17 @@ previous installer before upgrading; do not delete the journal to bypass it.
 
 The installer atomically writes ``outbox/<attempt>.json`` with delivery ID,
 serial, status ``installed``, ``already_installed`` or ``failed``, UTC timestamp
-and a limited non-secret summary. dnsgrid displays its own bounded messages,
-not arbitrary remote diagnostics. Use **Check NAS result** to retrieve the
+and a limited non-secret summary. With reload configured, successful receipts
+are written after the reload attempt and add ``reload``: ``succeeded``,
+``failed`` (retried by the NAS; the receipt is rewritten after a later
+success) or ``superseded`` (a newer installation replaced these files before
+a successful reload). Receipts without ``reload`` (legacy or not configured)
+remain valid and mean no reload was reported. dnsgrid shows these as
+``installed``/``already_installed``, ``reloaded``, ``reload_failed`` and
+``superseded``; ``reload_failed`` keeps the generation pinned so **Check NAS
+result** can be repeated. Update dnsgrid before enabling reload on the NAS:
+older dnsgrid versions reject the extra field as an invalid result.
+dnsgrid displays its own bounded messages, not arbitrary remote diagnostics. Use **Check NAS result** to retrieve the
 current attempt's receipt. This is an explicit bounded network request, not
 continuous polling and not a wait for the next scheduler run.
 Until a valid matching receipt is read, installation remains unconfirmed.
