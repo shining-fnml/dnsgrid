@@ -92,6 +92,50 @@ class DNSDeliveryTests(TestCase):
         self.assertEqual((path / "manifest.json").read_bytes(), raw)
         self.assertEqual(Configuration.load().soa_serial, 1692746706)
 
+    def test_saved_status_reports_no_transfer_in_service_browser_and_log(self):
+        self.publish()
+        path, _, attempt = self.state()
+        for status in STATUSES:
+            with self.subTest(status=status):
+                attempt["status"] = status
+                (path / ".delivery.json").write_text(json.dumps(attempt))
+                self.deliver.reset_mock()
+                expected = (
+                    "No SFTP transfer attempted: reusing a saved delivery attempt "
+                    f"(status: {status}). Check the NAS result or explicitly retry delivery."
+                )
+                with patch("inventory.dns_delivery.log") as diagnostics:
+                    self.assertEqual(self.publish()[2:], (status, expected))
+                diagnostics.assert_any_call(
+                    "Delivery skipped", reason=expected, generation=attempt["generation"],
+                    delivery=attempt["delivery"], status=status,
+                )
+                response = self.client.post(reverse("dns-deliver"), {
+                    "revision": Configuration.load().revision,
+                }, follow=True)
+                self.assertContains(response, expected)
+                self.deliver.assert_not_called()
+
+    def test_actual_transfer_reports_actual_outcome_in_browser_and_log(self):
+        for status in ("delivered", "unconfirmed", "failure"):
+            with self.subTest(status=status):
+                self.deliver.return_value = (status, LABELS[status])
+                self.deliver.reset_mock()
+                # A changed serial ensures this is a new attempt, not saved state.
+                Configuration.objects.update(soa_serial=Configuration.load().soa_serial + 1)
+                with patch("inventory.dns_delivery.log") as diagnostics:
+                    response = self.client.post(reverse("dns-deliver"), {
+                        "revision": Configuration.load().revision,
+                    }, follow=True)
+                self.assertContains(response, LABELS[status])
+                self.assertNotContains(response, "No SFTP transfer attempted")
+                self.deliver.assert_called_once()
+                self.assertTrue(any(
+                    call.args[0] == "Delivery outcome; consult matching NAS receipt for installation"
+                    and call.kwargs["status"] == status
+                    for call in diagnostics.call_args_list
+                ))
+
     def test_all_delivery_status_help_is_english_and_displayed(self):
         expected = {
             "inflight": "Delivery in progress, awaiting NAS processing.",
@@ -311,13 +355,13 @@ class DNSDeliveryTests(TestCase):
         with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
             self.publish()
         text = "\n".join(output.output)
-        self.assertIn("Reusing saved attempt", text)
+        self.assertIn("reusing a saved delivery attempt", text)
         self.assertIn(manifest["generation"], text)
         self.assertIn(attempt["delivery"], text)
         self.deliver.assert_called_once()
 
     @override_settings(DNSGRID_DIAGNOSTICS=False)
-    def test_normal_logs_include_outcome_and_no_detailed_skip_trace(self):
+    def test_normal_logs_include_actual_and_skipped_outcomes(self):
         with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
             self.publish()
         text = "\n".join(output.output)
@@ -326,7 +370,7 @@ class DNSDeliveryTests(TestCase):
         self.assertIn("consult matching NAS receipt", text)
         with self.assertLogs("dnsgrid.delivery", level="DEBUG") as output:
             self.publish()
-        self.assertNotIn("Delivery skipped", "\n".join(output.output))
+        self.assertIn("No SFTP transfer attempted", "\n".join(output.output))
 
     @override_settings(DNSGRID_DIAGNOSTICS=True)
     def test_remote_diagnostics_stay_out_of_browser_responses(self):

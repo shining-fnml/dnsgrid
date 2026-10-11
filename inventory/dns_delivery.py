@@ -50,7 +50,7 @@ def _target(config):
 
 
 @contextmanager
-def _lock(directory):
+def _lock(directory, recovery=False):
     parent = _directory(Path(directory))
     descriptor = os.open(
         parent / ".dnsgrid-delivery.lock",
@@ -63,6 +63,9 @@ def _lock(directory):
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise ValidationError("Another DNS delivery or result check is running; retry later.") from error
+        if not recovery:
+            from .dns_reset import ensure_ready
+            ensure_ready(directory)
         yield
     finally:
         os.close(descriptor)
@@ -157,9 +160,13 @@ def publish_and_deliver(expected_revision):
         if send:
             status, summary = _send(config, path, manifest, attempt)
         else:
-            log("Delivery skipped", detail=True, reason="Reusing saved attempt; explicit retry required to resend",
-                generation=manifest["generation"], delivery=attempt["delivery"], status=attempt["status"])
-            status, summary = attempt["status"], LABELS[attempt["status"]]
+            status = attempt["status"]
+            summary = (
+                "No SFTP transfer attempted: reusing a saved delivery attempt "
+                f"(status: {status}). Check the NAS result or explicitly retry delivery."
+            )
+            log("Delivery skipped", reason=summary,
+                generation=manifest["generation"], delivery=attempt["delivery"], status=status)
         return written, errors, status, summary
 
 

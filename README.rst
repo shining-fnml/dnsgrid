@@ -221,6 +221,94 @@ before resuming the task. If any server has already loaded the legacy serial,
 **do not lower**: coordinate a migration with authoritative and secondary DNS
 servers, respecting RFC 1982, outside this exceptional web action.
 
+Resetting LOCAL test publication history
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For a clean restart when **all managed local generations are test material
+that was NEVER loaded by any DNS server**, use the explicit management command
+instead of manually removing generations, pins, saved attempts or lock files.
+The Settings baseline action above deliberately preserves immutable generations;
+the command below invalidates them by moving them to private local quarantine.
+It never contacts the NAS and cannot establish what servers actually loaded.
+
+Before acknowledging the reset:
+
+* Pause DSM scheduling and any other installer triggers.
+* Inspect actual installed/served serials on authoritative and secondary servers,
+  and inspect NAS installed state and any outstanding recovery transaction.
+  Do not automatically lower installed serials or erase recovery state.
+* Review and remove or quarantine **only known stale test deliveries** and their
+  matching receipts/partial deliveries under your control. Do not empty arbitrary
+  NAS directories. Leave ``installed.json``, ``transaction.json``, backups and
+  lock files untouched. Never delete an outstanding recovery journal.
+* Back up the local database and export artifacts. Use a dedicated local export
+  directory with trusted ownership; stop external/manual writers during reset.
+  This command coordinates dnsgrid writers, not arbitrary filesystem processes.
+
+Run from the project directory using the same environment and account as dnsgrid::
+
+    python manage.py reset_dns_publication
+
+The default is read-only: it displays the configured export directory, the exact
+old/new serial, every managed generation/file affected, known loose zone artifacts
+and a preview token. It creates no lock file and changes no database values.
+Review that list. The printed execution command requires ``--confirm``,
+``--timestamp`` and ``--preview-token``, plus **both** noninteractive acknowledgments::
+
+    python manage.py reset_dns_publication --confirm --timestamp <preview-seconds> \
+        --preview-token <preview-token> --ack-never-loaded --ack-nas-handled
+
+Do not supply those acknowledgments unless the conditions above are true.
+The timestamp is the current Unix time in whole seconds captured in the preview,
+not zero; previews expire after 15 minutes and reject clock rollback. Configuration,
+inventory DNS content, serial and artifact changes invalidate the token. Lock
+contention fails safely: wait for the actual operation to finish and retry; never
+unlink a lock file. Application revision counters are preserved, not reset or
+incremented; existing web baseline confirmations reject the changed serial.
+
+Under the delivery lock and singleton database write lock, the command validates
+immutable manifests/checksums and saved attempts, rejects symlinks, hard links,
+unexpected generation contents and unsafe paths, and moves only validated managed
+artifacts into ``.dnsgrid-reset-<random-id>`` inside the export directory. It does
+not recursively delete the export directory. Unrelated files remain; loose zone
+filenames are handled only when known from current configuration, valid generations,
+or historical ``forward.zone`` / ``reverse-<0..255>.zone`` names.
+Malformed artifacts require administrator review/manual quarantine, not a force
+flag. The quarantine includes pins and saved attempts, so old test generations
+are no longer available to retry/reuse. Keep it as an audit/recovery record; do not
+copy it back into ``generations``.
+
+The database serial is set to the reviewed timestamp, the published-generation
+reference is cleared, and content tracking is rebuilt from unchanged inventory.
+Inventory, revision counters, users, settings, secrets, SFTP credentials and
+unrelated application archive backups are untouched. The next unchanged publication
+creates a fresh timestamp generation and delivery attempt. Subsequent unchanged
+publication reuses it without automatically resending; explicit retries retain
+the immutable generation and use a new delivery identifier.
+
+Filesystem moves and the database commit cannot form one atomic transaction.
+A durable ``.dnsgrid-reset.json`` records the exact plan, fingerprints and
+quarantine before any move. While it exists, publication, delivery/retry and
+inventory/configuration mutations are blocked. On failure, **preserve the journal
+and quarantine**, resolve the reported filesystem/database issue, and resume::
+
+    python manage.py reset_dns_publication --recover --confirm \
+        --ack-never-loaded --ack-nas-handled
+
+Recovery validates the original plan, recognizes completed moves and a database
+commit that already succeeded, and rolls forward; it never reactivates old attempts.
+It refuses missing, changed, duplicated or malformed artifacts/configuration and
+requires administrator investigation in those cases. Do not bypass that refusal by
+deleting the journal or changing configuration directly. After commit the journal
+is moved to ``completed.json`` in quarantine; repeating recovery is a no-op.
+If a crash occurred before the journal was written, no managed artifacts were moved;
+an empty quarantine may remain and can be reviewed separately.
+
+Publish locally, inspect the new generation/serial and matching NAS result, verify
+actual installed/served DNS state and recovery readiness, then resume DSM scheduling.
+SFTP success alone is not installation or zone-loading verification. No real DSM
+integration verification is implied by the command or its tests.
+
 ``dns_export_directory`` is an optional absolute path to an existing directory
 on the dnsgrid host. Blank disables directory publishing. Give the application
 account write permission only to the selected directory; the web app needs no
