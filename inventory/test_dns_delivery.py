@@ -13,7 +13,7 @@ from django.test import Client, TestCase, TransactionTestCase
 from django.urls import reverse
 
 from .archives import restore, snapshot, validate
-from .dns_delivery import check_result, delivery_states, publish_and_deliver, retry_delivery
+from .dns_delivery import LABELS, STATUSES, check_result, delivery_states, publish_and_deliver, retry_delivery
 from .dns_publication import read_generation
 from .exporters import publish_dns_zones
 from .models import Configuration, Host, Site
@@ -68,7 +68,38 @@ class DNSDeliveryTests(TestCase):
         self.assertEqual(self.state()[2]["delivery"], attempt["delivery"])
         self.assertEqual((path / "manifest.json").read_bytes(), raw)
         self.assertEqual(Configuration.load().soa_serial, manifest["serial"])
-        self.assertContains(self.client.get(reverse("exports")), "Controlla esito NAS")
+        response = self.client.get(reverse("exports"))
+        for label in (
+            "<button>Check NAS result</button>",
+            "<button>Publish locally and deliver via SFTP</button>",
+            "<button>Retry NAS delivery with new identifier</button>",
+            "SFTP success means only delivered, awaiting NAS processing.",
+            "NAS results are read only when requested; installed files do not prove zones loaded.",
+        ):
+            self.assertContains(response, label)
+
+    def test_all_delivery_status_help_is_english_and_displayed(self):
+        expected = {
+            "inflight": "Delivery in progress, awaiting NAS processing.",
+            "delivered": "Delivered via SFTP, awaiting NAS processing.",
+            "unconfirmed": "SFTP delivery unconfirmed; check NAS result.",
+            "failure": "SFTP delivery failed; no installation confirmed.",
+            "installed": "Files installed on the NAS; zone loading not verified.",
+            "already_installed": "Files already installed on the NAS; zone loading not verified.",
+            "failed": "NAS installation failed; consult local diagnostics.",
+            "pending": "Result unavailable, awaiting NAS processing.",
+            "invalid": "Invalid NAS result; no installation confirmed.",
+        }
+        self.assertEqual(set(expected), STATUSES)
+        self.assertEqual(LABELS, expected)
+        self.publish()
+        path, _, attempt = self.state()
+        for status, help_text in expected.items():
+            with self.subTest(status=status):
+                attempt["status"] = status
+                (path / ".delivery.json").write_text(json.dumps(attempt))
+                self.assertEqual(delivery_states(Configuration.load())[0]["summary"], help_text)
+                self.assertContains(self.client.get(reverse("exports")), help_text)
 
     def test_timeout_receipt_retry_exact_generation_and_old_result_rejected(self):
         self.deliver.return_value = ("unconfirmed", "timeout")
@@ -113,7 +144,12 @@ class DNSDeliveryTests(TestCase):
         response = self.client.get(reverse("exports"))
         self.assertContains(response, attempt["delivery"])
         self.assertContains(response, "delivered")
-        self.assertNotContains(response, "<button>Controlla esito NAS</button>")
+        for label in (
+            "<button>Check NAS result</button>",
+            "<button>Publish locally and deliver via SFTP</button>",
+            "<button>Retry NAS delivery with new identifier</button>",
+        ):
+            self.assertNotContains(response, label)
 
     def test_destination_changes_do_not_reuse_or_confirm_another_nas_attempt(self):
         sites = list(Site.objects.values("id", "name", "g", "dsm_ifname"))

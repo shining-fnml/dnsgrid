@@ -5,12 +5,14 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import pwd
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from synology import dns_install as installer
 
@@ -87,6 +89,210 @@ class DNSInstallTests(unittest.TestCase):
         manifest = json.loads(path.read_text())
         mutate(manifest)
         path.write_text(json.dumps(manifest))
+
+    def configure_package(self, owner=None):
+        package = self.root / "package"
+        package.mkdir(mode=0o755)
+        self.paths["destination"].rename(package / "master")
+        self.paths["destination"] = package / "master"
+        self.validator.rename(package / "named-checkzone")
+        self.validator = package / "named-checkzone"
+        account = pwd.getpwnam(owner) if owner else pwd.getpwuid(os.geteuid())
+        self.package_identity = (account.pw_uid, account.pw_gid)
+        text = self.config_path.read_text()
+        text = text.replace(str(self.root / "destination"), str(self.paths["destination"]))
+        text = text.replace(str(self.root / "named-checkzone"), str(self.validator))
+        self.config_path.write_text(
+            text + f"package_root = {package}\npackage_owner = {account.pw_name}\n")
+        self.config = installer.load_config(self.config_path)
+        return package
+
+    def test_package_configuration_requires_account_and_bounded_root(self):
+        package = self.configure_package()
+        self.assertEqual(self.config["package_identity"], self.package_identity)
+        valid = self.config_path.read_text()
+        for text in (
+            valid.replace(f"package_owner = {self.config['package_owner']}",
+                          "package_owner = dnsgrid-nonexistent-account"),
+            valid.replace(f"package_root = {package}", f"package_root = {package / 'other'}"),
+            valid.replace(f"package_root = {package}", f"package_root = {self.root}"),
+            valid.replace(f"package_root = {package}\n", ""),
+        ):
+            with self.subTest(text=text):
+                self.config_path.write_text(text)
+                with self.assertRaises(installer.InstallError):
+                    installer.load_config(self.config_path)
+
+    def test_package_directory_trust_is_scoped_and_rejects_unsafe_metadata(self):
+        package = self.configure_package()
+        account = pwd.getpwnam("nobody")
+        self.package_identity = (account.pw_uid, account.pw_gid)
+        self.config["package_identity"] = self.package_identity
+        original = installer.os.fstat
+        inodes = {path.stat().st_ino for path in (package, self.paths["destination"])}
+        def package_owned(fd):
+            info = original(fd)
+            if info.st_ino in inodes:
+                values = list(info)
+                values[4], values[5] = self.package_identity
+                return os.stat_result(values)
+            return info
+        with patch.object(installer.os, "fstat", side_effect=package_owned):
+            fd = installer.open_directory(self.paths["destination"], config=self.config)
+            os.close(fd)
+            with self.assertRaisesRegex(installer.InstallError, r"package.*uid=.*gid=.*mode=0755"):
+                installer.open_directory(self.paths["destination"])
+            for mode in (0o775, 0o777, 0o1777):
+                package.chmod(mode)
+                with self.assertRaises(installer.InstallError):
+                    installer.open_directory(self.paths["destination"], config=self.config)
+        package.chmod(0o755)
+        self.package_identity = (self.package_identity[0] + 1, self.package_identity[1])
+        with patch.object(installer.os, "fstat", side_effect=package_owned):
+            with self.assertRaises(installer.InstallError):
+                installer.open_directory(self.paths["destination"], config=self.config)
+
+    def test_package_directory_and_validator_symlinks_rejected(self):
+        package = self.configure_package()
+        real = package.with_name("real-package")
+        package.rename(real)
+        package.symlink_to(real)
+        self.assertEqual(self.invoke(), 2)
+        package.unlink()
+        real.rename(package)
+        saved = self.validator.with_name("real-validator")
+        self.validator.rename(saved)
+        self.validator.symlink_to(saved)
+        self.assertEqual(self.invoke(), 5)
+        self.assert_empty_install()
+
+    def test_package_zone_metadata_policy(self):
+        self.configure_package()
+        zone = self.paths["destination"] / sorted(self.names)[0]
+        zone.write_bytes(self.zone(self.serial - 1))
+        zone.chmod(0o666)
+        original = installer.os.fstat
+        inode = zone.stat().st_ino
+        uid, gid = self.package_identity
+        def metadata(fd):
+            info = original(fd)
+            if info.st_ino == inode:
+                return SimpleNamespace(
+                    st_uid=uid, st_gid=gid, st_mode=info.st_mode, st_nlink=info.st_nlink,
+                    st_size=info.st_size, st_mtime_ns=info.st_mtime_ns, st_ctime_ns=info.st_ctime_ns)
+            return info
+        with patch.object(installer.os, "fstat", side_effect=metadata):
+            self.assertEqual(self.invoke(True), 0)
+            uid += 1
+            self.assertEqual(self.invoke(True), 5)
+        zone.unlink()
+        zone.symlink_to(self.config_path)
+        self.assertEqual(self.invoke(True), 5)
+        zone.unlink()
+        zone.mkdir()
+        self.assertEqual(self.invoke(True), 5)
+        zone.rmdir()
+        zone.write_bytes(self.zone(self.serial - 1))
+        zone.chmod(0o644)
+        os.link(zone, self.root / "hardlink")
+        self.assertEqual(self.invoke(True), 5)
+
+    def test_package_validator_unexpected_owner_and_write_bits_rejected(self):
+        self.configure_package()
+        original = installer.os.fstat
+        inode = self.validator.stat().st_ino
+        def unexpected_owner(fd):
+            info = original(fd)
+            if info.st_ino == inode:
+                values = list(info)
+                values[4] = self.package_identity[0] + 1
+                return os.stat_result(values)
+            return info
+        with patch.object(installer.os, "fstat", side_effect=unexpected_owner):
+            self.assertEqual(self.invoke(True), 5)
+        self.validator.chmod(0o775)
+        self.assertEqual(self.invoke(True), 5)
+        self.assert_empty_install()
+
+    @unittest.skipUnless(os.geteuid() == 0, "Real package ownership requires root")
+    def test_real_package_install_normalizes_and_leaves_other_zones_untouched(self):
+        package = self.configure_package("nobody")
+        for path in (package, self.paths["destination"], self.validator):
+            os.chown(path, *self.package_identity)
+            path.chmod(0o755)
+        for name in sorted(self.names)[:1]:
+            path = self.paths["destination"] / name
+            path.write_bytes(self.zone(self.serial - 1))
+            os.chown(path, *self.package_identity)
+            path.chmod(0o666)
+        unrelated = self.paths["destination"] / "unconfigured.zone"
+        unrelated.write_bytes(b"must not be read")
+        os.chown(unrelated, *self.package_identity)
+        unrelated.chmod(0o000)
+        before = unrelated.stat()
+        (self.paths["destination"] / "@eaDir").mkdir()
+        (self.paths["destination"] / "unconfigured-link").symlink_to(self.config_path)
+        self.assertEqual(self.invoke(), 0)
+        for name in self.names:
+            info = (self.paths["destination"] / name).stat()
+            self.assertEqual((info.st_uid, info.st_gid), self.package_identity)
+            self.assertEqual(stat.S_IMODE(info.st_mode), 0o644)
+        self.assertEqual(unrelated.stat(), before)
+        self.assertEqual(unrelated.read_bytes(), b"must not be read")
+        self.assertTrue((self.paths["destination"] / "@eaDir").is_dir())
+        for path in (self.paths["outbox"], self.paths["state"]):
+            os.chown(path, *self.package_identity)
+            self.assertEqual(self.invoke(), 2)
+            os.chown(path, 0, 0)
+
+    @unittest.skipUnless(os.geteuid() == 0, "Real package ownership requires root")
+    def test_real_package_crash_rollback_restores_exact_metadata(self):
+        package = self.configure_package("nobody")
+        for path in (package, self.paths["destination"], self.validator):
+            os.chown(path, *self.package_identity)
+            path.chmod(0o755)
+        originals = {}
+        for index, name in enumerate(sorted(self.names)):
+            path = self.paths["destination"] / name
+            path.write_bytes(self.zone(self.serial - 1))
+            os.chown(path, self.package_identity[0], self.package_identity[1] + index)
+            path.chmod(0o666 if index else 0o640)
+            originals[name] = path.stat()
+        original = installer.atomic_write
+        def crash(fd, filename, data, mode=0o600, **kwargs):
+            original(fd, filename, data, mode, **kwargs)
+            if filename == installer.STATE_NAME:
+                raise KeyboardInterrupt()
+        with patch.object(installer, "atomic_write", side_effect=crash):
+            with self.assertRaises(KeyboardInterrupt):
+                self.invoke()
+        journal = json.loads((self.paths["state"] / installer.JOURNAL_NAME).read_bytes())
+        self.assertEqual(journal["version"], 2)
+        source = self.paths["inbox"] / self.delivery
+        source.rename(source.with_name(self.delivery + ".partial"))
+        self.assertEqual(self.invoke(), 0)
+        for name, before in originals.items():
+            path = self.paths["destination"] / name
+            after = path.stat()
+            self.assertEqual((after.st_uid, after.st_gid, after.st_mode),
+                             (before.st_uid, before.st_gid, before.st_mode))
+            self.assertEqual(path.read_bytes(), self.zone(self.serial - 1))
+
+    def test_legacy_and_unconfigured_zone_journals_block_without_modification(self):
+        state = self.paths["state"] / installer.JOURNAL_NAME
+        state.write_text(json.dumps({"backup": "backup-" + "a" * 32, "entries": [],
+                                     "previous_state": None}))
+        state.chmod(0o600)
+        self.assertEqual(self.invoke(), 7)
+        self.assert_empty_install()
+        entry = {"name": "unconfigured.zone", "present": False, "mode": 0o644,
+                 "uid": os.geteuid(), "gid": os.getegid()}
+        state.write_text(json.dumps({"version": 2, "backup": "backup-" + "a" * 32,
+                                     "entries": [entry], "previous_state": None}))
+        unrelated = self.paths["destination"] / entry["name"]
+        unrelated.write_text("keep")
+        self.assertEqual(self.invoke(), 7)
+        self.assertEqual(unrelated.read_text(), "keep")
 
     def test_install_result_and_canonical_retry(self):
         self.assertEqual(self.invoke(), 0)
@@ -456,12 +662,12 @@ class DNSInstallTests(unittest.TestCase):
         unrelated.write_text("keep")
         original = installer.atomic_write
         failed = False
-        def fail(fd, filename, data, mode=0o600):
+        def fail(fd, filename, data, mode=0o600, **kwargs):
             nonlocal failed
             if filename == installer.STATE_NAME and not failed:
                 failed = True
                 raise OSError("hostile leaked message")
-            return original(fd, filename, data, mode)
+            return original(fd, filename, data, mode, **kwargs)
         with patch.object(installer, "atomic_write", side_effect=fail):
             self.assertEqual(self.invoke(), 6)
         self.assertEqual(existing.read_bytes(), self.zone(self.serial - 1))
@@ -479,14 +685,14 @@ class DNSInstallTests(unittest.TestCase):
             (self.paths["destination"] / name).chmod(0o644)
         original = installer.atomic_write
         fail_recovery = False
-        def fail(fd, filename, data, mode=0o600):
+        def fail(fd, filename, data, mode=0o600, **kwargs):
             nonlocal fail_recovery
             if filename == installer.STATE_NAME:
                 fail_recovery = True
                 raise OSError("install failed")
             if fail_recovery and filename in self.names:
                 raise OSError("rollback failed")
-            return original(fd, filename, data, mode)
+            return original(fd, filename, data, mode, **kwargs)
         with patch.object(installer, "atomic_write", side_effect=fail):
             self.assertEqual(self.invoke(), 7)
         self.assertTrue((self.paths["state"] / installer.JOURNAL_NAME).exists())
@@ -504,12 +710,12 @@ class DNSInstallTests(unittest.TestCase):
             (self.paths["destination"] / name).write_bytes(self.zone(self.serial - 1))
             (self.paths["destination"] / name).chmod(0o644)
         original = installer.atomic_write
-        def crash(fd, filename, data, mode=0o600):
+        def crash(fd, filename, data, mode=0o600, **kwargs):
             if filename in self.names and data == self.zone(self.serial):
                 self.assertTrue((self.paths["state"] / installer.JOURNAL_NAME).exists())
-                original(fd, filename, data, mode)
+                original(fd, filename, data, mode, **kwargs)
                 raise KeyboardInterrupt()
-            return original(fd, filename, data, mode)
+            return original(fd, filename, data, mode, **kwargs)
         with patch.object(installer, "atomic_write", side_effect=crash):
             with self.assertRaises(KeyboardInterrupt):
                 self.invoke()

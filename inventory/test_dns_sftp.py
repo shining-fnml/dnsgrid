@@ -99,6 +99,55 @@ class SFTPTests(SimpleTestCase):
     def test_missing_result_remains_pending(self, run):
         self.assertEqual(read_result(self.config, self.delivery, 2026100900)[0], "pending")
 
+    @patch("inventory.dns_sftp._run")
+    def test_all_delivery_status_messages_are_english(self, run):
+        for outcome, status, summary in (
+            (0, "delivered", "Delivered, awaiting NAS processing. File installation is not yet confirmed."),
+            (255, "unconfirmed", "Delivery unconfirmed: SFTP interrupted or failed. Check NAS result."),
+            (subprocess.TimeoutExpired("sftp", 120), "unconfirmed",
+             "Delivery unconfirmed: SFTP timed out. Check NAS result before retrying."),
+            (OSError("secret"), "failure", "Unable to start SFTP; check local configuration."),
+        ):
+            with self.subTest(outcome=outcome):
+                run.side_effect = outcome if isinstance(outcome, Exception) else None
+                run.return_value = outcome
+                self.assertEqual(
+                    deliver(self.config, Path("/local"), self.manifest, self.delivery),
+                    (status, summary),
+                )
+
+    def test_all_result_status_messages_are_english(self):
+        result = {
+            "delivery": self.delivery, "serial": 2026100900, "status": "installed",
+            "timestamp": "2026-10-09T23:00:00+00:00", "summary": "<secret>",
+        }
+
+        def transfer(config, batch, download=False):
+            Path(batch.split('"')[-2]).write_text(json.dumps(result))
+            return 0
+
+        with patch("inventory.dns_sftp._run", side_effect=transfer):
+            for status, summary in (
+                ("installed", "Files installed on the NAS; zone loading not verified."),
+                ("already_installed", "Files already installed on the NAS; zone loading not verified."),
+                ("failed", "NAS installation failed; consult protected local diagnostics."),
+                ("invalid", "Invalid NAS result; no installation confirmed."),
+            ):
+                with self.subTest(status=status):
+                    result["status"] = status
+                    self.assertEqual(read_result(self.config, self.delivery, 2026100900), (status, summary))
+
+        with patch("inventory.dns_sftp._run") as run:
+            for outcome, summary in (
+                (1, "Result unavailable: delivery completed or unconfirmed, awaiting NAS processing."),
+                (subprocess.TimeoutExpired("sftp", 120), "NAS result read unconfirmed; retry the check."),
+                (OSError("secret"), "NAS result read unconfirmed; retry the check."),
+            ):
+                with self.subTest(outcome=outcome):
+                    run.side_effect = outcome if isinstance(outcome, Exception) else None
+                    run.return_value = outcome
+                    self.assertEqual(read_result(self.config, self.delivery, 2026100900), ("pending", summary))
+
     @patch("inventory.dns_sftp.subprocess.run", return_value=SimpleNamespace(returncode=1))
     def test_receipt_download_has_bandwidth_and_time_bounds(self, run):
         self.assertEqual(read_result(self.config, self.delivery, 2026100900)[0], "pending")

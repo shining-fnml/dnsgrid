@@ -3,6 +3,8 @@
 Administrator-owned INI [dns_install] requires inbox_directory,
 outbox_directory, destination_directory, state_directory, allowed_zones
 (comma separated), and named_checkzone (absolute executable).
+Optional package_owner and package_root together trust a local DSM package
+account within that root only; its UID and primary GID are resolved locally.
 
 The SFTP account may write only the inbox, not its parent, outbox, state,
 destination, script, or configuration. State and backup directories are 0700.
@@ -21,6 +23,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import stat
 import subprocess
@@ -52,6 +55,22 @@ def protected(info):
     return info.st_uid in {0, os.geteuid()} and not info.st_mode & 0o022
 
 
+def package_protected(info, config):
+    return (info.st_uid in {0, config["package_identity"][0]}
+            and not info.st_mode & 0o022)
+
+
+def validation_error(path, info, summary="Unsafe filesystem object.", code=2):
+    return InstallError(
+        f"{summary} Path/component {str(path)!r}: uid={info.st_uid}, "
+        f"gid={info.st_gid}, mode={stat.S_IMODE(info.st_mode):04o}.", code)
+
+
+def in_package(path, config):
+    return (config and "package_identity" in config
+            and (path == config["package_root"] or config["package_root"] in path.parents))
+
+
 def absolute(value):
     if (not isinstance(value, str) or not value.startswith("/")
             or str(Path(value)) != value or ".." in Path(value).parts
@@ -60,29 +79,39 @@ def absolute(value):
     return Path(value)
 
 
-def open_directory(path, inbox=False):
+def open_directory(path, inbox=False, config=None):
     """Walk with openat; no checked path is subsequently reopened by pathname."""
     path = absolute(str(path))
     fd = os.open("/", DIR_FLAGS)
     try:
         parts = path.parts[1:]
         for index, part in enumerate(parts):
+            parent_path = Path("/", *parts[:index])
+            child_path = parent_path / part
             parent = os.fstat(fd)
             # A root-owned sticky shared ancestor cannot rename the protected,
             # administrator-owned next component (e.g. a private test root).
-            sticky = parent.st_uid == 0 and parent.st_mode & stat.S_ISVTX
-            if not protected(parent) and not sticky:
-                raise InstallError("Unprotected directory ancestor.", 2)
-            child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            package_parent = in_package(parent_path, config)
+            sticky = not package_parent and parent.st_uid == 0 and parent.st_mode & stat.S_ISVTX
+            safe = package_protected(parent, config) if package_parent else protected(parent)
+            if not safe and not sticky:
+                raise validation_error(parent_path, parent, "Unprotected directory ancestor.")
+            try:
+                child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            except OSError:
+                info = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                raise validation_error(child_path, info, "Cannot open directory safely.") from None
             os.close(fd)
             fd = child
             info = os.fstat(fd)
             intermediate_sticky = (
                 index < len(parts) - 1 and info.st_uid == 0
                 and bool(info.st_mode & stat.S_ISVTX)
+                and not in_package(child_path, config)
             )
-            if (index != len(parts) - 1 or not inbox) and not protected(info) and not intermediate_sticky:
-                raise InstallError("Unprotected directory.", 2)
+            safe = package_protected(info, config) if in_package(child_path, config) else protected(info)
+            if (index != len(parts) - 1 or not inbox) and not safe and not intermediate_sticky:
+                raise validation_error(child_path, info, "Unprotected directory.")
         if not parts and inbox:
             raise InstallError("Invalid inbox.", 2)
         return fd
@@ -91,18 +120,25 @@ def open_directory(path, inbox=False):
         raise
 
 
-def read_file(directory, name, limit, trusted=False, missing=False):
+def read_file(directory, name, limit, trusted=False, missing=False, package=None, path=None):
     try:
         fd = os.open(name, FILE_FLAGS, dir_fd=directory)
     except FileNotFoundError:
         if missing:
             return None
         raise
+    except OSError:
+        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        raise validation_error(path or name, info, "Cannot open file safely.", 5) from None
+    before = os.fstat(fd)
+    safe = (before.st_uid == package["package_identity"][0]
+            or (before.st_uid == 0 and not before.st_mode & 0o022)
+            if package and "package_identity" in package else protected(before))
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            or before.st_size > limit or (trusted and not safe)):
+        os.close(fd)
+        raise validation_error(path or name, before, "Untrusted file.", 5)
     with os.fdopen(fd, "rb") as stream:
-        before = os.fstat(stream.fileno())
-        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
-                or before.st_size > limit or (trusted and not protected(before))):
-            raise InstallError()
         data = stream.read(limit + 1)
         after = os.fstat(stream.fileno())
         if (len(data) != before.st_size or len(data) > limit
@@ -117,7 +153,7 @@ def trusted_file(path):
     path = absolute(str(path))
     fd = open_directory(path.parent)
     try:
-        data, _ = read_file(fd, path.name, MAX_MANIFEST, trusted=True)
+        data, _ = read_file(fd, path.name, MAX_MANIFEST, trusted=True, path=path)
         return data
     finally:
         os.close(fd)
@@ -137,16 +173,23 @@ def load_config(path):
         if parser.defaults() or parser.sections() != ["dns_install"]:
             raise ValueError
         values = dict(parser["dns_install"])
-        if set(values) != {"inbox_directory", "outbox_directory",
-                           "destination_directory", "state_directory",
-                           "allowed_zones", "named_checkzone"}:
+        required = {"inbox_directory", "outbox_directory",
+                    "destination_directory", "state_directory",
+                    "allowed_zones", "named_checkzone"}
+        if set(values) not in (required, required | {"package_owner", "package_root"}):
             raise ValueError
+        if "package_owner" in values:
+            try:
+                account = pwd.getpwnam(values["package_owner"])
+            except KeyError:
+                raise InstallError("Unknown configured package_owner account.", 2) from None
+            values["package_identity"] = (account.pw_uid, account.pw_gid)
         zones = [name.strip() for name in values["allowed_zones"].split(",")]
         if (not 1 <= len(zones) <= MAX_ZONES or len(set(zones)) != len(zones)
                 or not all(valid_zone(name) for name in zones)):
             raise ValueError
         values["allowed_zones"] = set(zones)
-        for key in set(values) - {"allowed_zones"}:
+        for key in set(values) - {"allowed_zones", "package_owner", "package_identity"}:
             values[key] = absolute(values[key])
         directories = [values[key] for key in values if key.endswith("_directory")]
         for left in directories:
@@ -155,6 +198,14 @@ def load_config(path):
                     raise ValueError
         if len(set(directories)) != 4:
             raise ValueError
+        if "package_identity" in values:
+            root = values["package_root"]
+            if any(root not in values[key].parents
+                   for key in ("destination_directory", "named_checkzone")):
+                raise ValueError
+            if any(in_package(values[key], values) or values[key] in root.parents
+                   for key in ("inbox_directory", "outbox_directory", "state_directory")):
+                raise ValueError
         return values
     except (ValueError, UnicodeError, configparser.Error):
         raise InstallError("Invalid configuration.", 2) from None
@@ -285,7 +336,7 @@ def soa_serial(data):
     return tokens[0]
 
 
-def atomic_write(directory, name, data, mode=0o600):
+def atomic_write(directory, name, data, mode=0o600, owner=None):
     temporary = ".installer-" + uuid.uuid4().hex
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                  mode, dir_fd=directory)
@@ -293,6 +344,8 @@ def atomic_write(directory, name, data, mode=0o600):
         with os.fdopen(fd, "wb") as stream:
             stream.write(data)
             stream.flush()
+            if owner is not None:
+                os.fchown(stream.fileno(), *owner)
             os.fchmod(stream.fileno(), mode)
             os.fsync(stream.fileno())
         os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
@@ -310,14 +363,20 @@ def json_bytes(value):
 
 def check_zone(config, name, path, stage):
     try:
-        fd = open_directory(config["named_checkzone"].parent)
+        fd = open_directory(config["named_checkzone"].parent, config=config)
         try:
-            executable = os.open(config["named_checkzone"].name, FILE_FLAGS, dir_fd=fd)
+            try:
+                executable = os.open(config["named_checkzone"].name, FILE_FLAGS, dir_fd=fd)
+            except OSError:
+                info = os.stat(config["named_checkzone"].name, dir_fd=fd, follow_symlinks=False)
+                raise validation_error(config["named_checkzone"], info, "Unsafe validator.", 5) from None
             try:
                 info = os.fstat(executable)
+                safe = (package_protected(info, config) if in_package(config["named_checkzone"], config)
+                        else protected(info))
                 if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                        or not protected(info) or not info.st_mode & 0o111):
-                    raise InstallError("Zone validation failed.")
+                        or not safe or not info.st_mode & 0o111):
+                    raise validation_error(config["named_checkzone"], info, "Unsafe validator.", 5)
             finally:
                 os.close(executable)
         finally:
@@ -374,10 +433,11 @@ def read_state(state):
     return data
 
 
-def check_existing_baseline(destination, stage, names, serial):
+def check_existing_baseline(destination, stage, names, serial, config=None):
     """Bootstrap safely when no durable installer high-water mark exists."""
     for name in sorted(names):
-        existing = read_file(destination, name, MAX_ZONE, trusted=True, missing=True)
+        existing = read_file(destination, name, MAX_ZONE, trusted=True, missing=True,
+                             package=config, path=config["destination_directory"] / name if config else name)
         if existing is None:
             continue
         previous_serial = soa_serial(existing[0])
@@ -386,31 +446,44 @@ def check_existing_baseline(destination, stage, names, serial):
             raise InstallError("Serial reuse or regression rejected.")
 
 
-def recover(state, destination):
+def recover(state, destination, names=None):
     raw = read_file(state, JOURNAL_NAME, MAX_MANIFEST, trusted=True, missing=True)
     if raw is None:
         return
+    legacy_message = "Legacy journal requires recovery with the previous installer."
     try:
         journal = decode_json(raw[0])
+        if type(journal) is dict and "version" not in journal:
+            raise InstallError(legacy_message, 7)
         if (type(journal) is not dict
-                or set(journal) != {"backup", "entries", "previous_state"}
+                or set(journal) != {"version", "backup", "entries", "previous_state"}
+                or type(journal["version"]) is not int or journal["version"] != 2
                 or not isinstance(journal["backup"], str)
                 or not re.fullmatch("backup-[0-9a-f]{32}", journal["backup"])
                 or type(journal["entries"]) is not list
                 or not 1 <= len(journal["entries"]) <= MAX_ZONES):
             raise InstallError()
+        seen = set()
+        for entry in journal["entries"]:
+            if (type(entry) is not dict or set(entry) != {"name", "present", "mode", "uid", "gid"}
+                    or not valid_zone(entry["name"]) or entry["name"] in seen
+                    or (names is not None and entry["name"] not in names)
+                    or type(entry["present"]) is not bool
+                    or type(entry["mode"]) is not int or entry["mode"] & ~0o7777
+                    or any(type(entry[key]) is not int or not 0 <= entry[key] < 2**32 - 1
+                           for key in ("uid", "gid"))):
+                raise InstallError()
+            seen.add(entry["name"])
         backup = os.open(journal["backup"], DIR_FLAGS, dir_fd=state)
         try:
-            if not protected(os.fstat(backup)) or stat.S_IMODE(os.fstat(backup).st_mode) != 0o700:
-                raise InstallError()
+            info = os.fstat(backup)
+            if not protected(info) or stat.S_IMODE(info.st_mode) != 0o700:
+                raise validation_error(journal["backup"], info, "Unprotected backup.", 7)
             for entry in journal["entries"]:
-                if (type(entry) is not dict or set(entry) != {"name", "present", "mode"}
-                        or not valid_zone(entry["name"]) or type(entry["present"]) is not bool
-                        or type(entry["mode"]) is not int or entry["mode"] & ~0o777):
-                    raise InstallError()
                 if entry["present"]:
                     data, _ = read_file(backup, entry["name"], MAX_ZONE, trusted=True)
-                    atomic_write(destination, entry["name"], data, entry["mode"])
+                    atomic_write(destination, entry["name"], data, entry["mode"],
+                                 owner=(entry["uid"], entry["gid"]))
                 else:
                     try:
                         os.unlink(entry["name"], dir_fd=destination)
@@ -430,33 +503,42 @@ def recover(state, destination):
             os.close(backup)
         os.unlink(JOURNAL_NAME, dir_fd=state)
         os.fsync(state)
-    except (OSError, InstallError, ValueError, TypeError, KeyError):
+    except InstallError as error:
+        if str(error) == legacy_message:
+            raise
+        raise InstallError(f"Recovery incomplete; installation blocked. {error}", 7) from None
+    except (OSError, ValueError, TypeError, KeyError):
         raise InstallError("Recovery incomplete; installation blocked.", 7) from None
 
 
-def install(state, destination, stage, names, next_state, previous):
+def install(state, destination, stage, names, next_state, previous, config=None):
     backup_name = "backup-" + uuid.uuid4().hex
     os.mkdir(backup_name, mode=0o700, dir_fd=state)
     backup = os.open(backup_name, DIR_FLAGS, dir_fd=state)
     entries = []
     try:
         for name in sorted(names):
-            old = read_file(destination, name, MAX_ZONE, trusted=True, missing=True)
+            old = read_file(destination, name, MAX_ZONE, trusted=True, missing=True,
+                            package=config, path=config["destination_directory"] / name if config else name)
             mode = stat.S_IMODE(old[1].st_mode) if old else 0o644
             if old:
                 atomic_write(backup, name, old[0])
-            entries.append({"name": name, "present": old is not None, "mode": mode})
+            entries.append({"name": name, "present": old is not None, "mode": mode,
+                            "uid": old[1].st_uid if old else os.geteuid(),
+                            "gid": old[1].st_gid if old else os.getegid()})
         os.fsync(backup)
         os.fsync(state)
     finally:
         os.close(backup)
     journal_bytes = json_bytes({
-        "backup": backup_name, "entries": entries, "previous_state": previous,
+        "version": 2, "backup": backup_name, "entries": entries, "previous_state": previous,
     })
     atomic_write(state, JOURNAL_NAME, journal_bytes)
     try:
         for entry in entries:
-            atomic_write(destination, entry["name"], (stage / entry["name"]).read_bytes(), entry["mode"])
+            owner = config.get("package_identity") if config else None
+            atomic_write(destination, entry["name"], (stage / entry["name"]).read_bytes(),
+                         0o644, **({"owner": owner} if owner else {}))
         atomic_write(state, STATE_NAME, json_bytes(next_state))
         os.unlink(JOURNAL_NAME, dir_fd=state)
         os.fsync(state)
@@ -468,7 +550,7 @@ def install(state, destination, stage, names, next_state, previous):
                 atomic_write(state, JOURNAL_NAME, journal_bytes)
         except (OSError, InstallError):
             raise InstallError("Recovery incomplete; installation blocked.", 7) from None
-        recover(state, destination)
+        recover(state, destination, names)
         raise InstallError("Installation failed; previous files restored.", 6) from None
 
 
@@ -510,18 +592,26 @@ def run(config, dry_run=False):
     with ExitStack() as stack:
         directories = {}
         for key in ("inbox_directory", "outbox_directory", "destination_directory", "state_directory"):
-            fd = open_directory(config[key], inbox=key == "inbox_directory")
+            fd = open_directory(config[key], inbox=key == "inbox_directory",
+                                config=config if key == "destination_directory" else None)
             stack.callback(os.close, fd)
             directories[key] = fd
         state = directories["state_directory"]
         if stat.S_IMODE(os.fstat(state).st_mode) != 0o700:
-            raise InstallError("State directory must be private.", 2)
-        lock = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-                       0o600, dir_fd=state)
+            raise validation_error(config["state_directory"], os.fstat(state),
+                                   "State directory must be private.")
+        try:
+            lock = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                           0o600, dir_fd=state)
+        except OSError:
+            info = os.stat(LOCK_NAME, dir_fd=state, follow_symlinks=False)
+            raise validation_error(config["state_directory"] / LOCK_NAME, info,
+                                   "Cannot open installer lock safely.") from None
         stack.callback(os.close, lock)
         info = os.fstat(lock)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not protected(info):
-            raise InstallError("Invalid installer lock.", 2)
+            raise validation_error(config["state_directory"] / LOCK_NAME, info,
+                                   "Invalid installer lock.")
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -531,7 +621,7 @@ def run(config, dry_run=False):
             if read_file(state, JOURNAL_NAME, MAX_MANIFEST, trusted=True, missing=True):
                 raise InstallError("Recovery required before dry run.", 7)
         else:
-            recover(state, destination)
+            recover(state, destination, config["allowed_zones"])
         previous = read_state(state)
         inbox = directories["inbox_directory"]
         code = 0
@@ -548,21 +638,22 @@ def run(config, dry_run=False):
                     serial, fingerprint = snapshot(config, inbox, delivery, stage)
                     current = {"serial": serial, "fingerprint": fingerprint}
                     if previous is None:
-                        check_existing_baseline(destination, stage, config["allowed_zones"], serial)
+                        check_existing_baseline(destination, stage, config["allowed_zones"], serial, config)
                     if previous and (serial < previous["serial"]
                                      or (serial == previous["serial"] and current != previous)):
                         raise InstallError("Serial reuse or regression rejected.")
                     status = "already_installed" if current == previous else "installed"
                     if not dry_run:
                         if status == "installed":
-                            install(state, destination, stage, config["allowed_zones"], current, previous)
+                            install(state, destination, stage, config["allowed_zones"], current, previous, config)
                             previous = current
             except (OSError, InstallError):
                 error = sys.exc_info()[1]
                 failure = error if isinstance(error, InstallError) else InstallError("Delivery processing failed.", 6)
+                print(str(failure), file=sys.stderr)
                 code = max(code, failure.code)
                 if not dry_run:
-                    result(directories["outbox_directory"], delivery, serial, "failed", str(failure))
+                    result(directories["outbox_directory"], delivery, serial, "failed", str(failure)[:256])
                 if failure.code == 7:
                     break
             else:

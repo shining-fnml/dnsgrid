@@ -250,8 +250,9 @@ Provision separate paths, for example:
 * ``/volume1/dnsgrid-private/state``: installer-owned mode 0700; stores the
   lock, persistent serial/content identity, transaction journal, private
   validation copies and backups.
-* The existing DNS package master directory, script, configuration and
-  validator executable: writable only by their privileged administrators.
+* The existing DNS package master directory and validator executable:
+  protected administrator or explicitly trusted DSM package-owned paths.
+  Keep the script and configuration administrator-owned.
 
 These are examples, not verified DSM paths. Check ownership **and DSM ACLs**,
 including inherited ACLs and ancestor permissions, from the SFTP account.
@@ -261,6 +262,24 @@ rights to outbox, state, backups, script, configuration, validator, master
 files and their parent directories. The task user must own these protected
 paths or they must be root-owned, with no group/world write access.
 The inbox itself is the only deliberately untrusted writable directory.
+If DSM owns the DNS Server package as ``DNSServer:DNSServer``, optionally set
+**both** ``package_owner = DNSServer`` and ``package_root`` to the verified
+package installation root (for example ``/volume1/@appstore/DNSServer``).
+The account's UID and primary GID are resolved locally, never hardcoded.
+Both ``destination_directory`` and ``named_checkzone`` must be descendants
+of this root; inbox, outbox and state must be outside it, not its ancestors.
+Only within that subtree may directory components and the validator be
+root-owned or owned by the configured package account. Symlinks and any
+group/world-writable directories or validator are still rejected.
+Ancestors outside the subtree retain administrator-only checks.
+
+This explicitly trusts the package account to control the validator and
+master directory, including code executed by the privileged installer:
+a compromised package account can compromise the installer. Run this mode
+as root to set file ownership and restore backups. Keep the SFTP account
+separate from the package account and verify DSM ACL isolation; POSIX checks
+alone cannot establish that isolation. Do not change DSM package ownership
+or permissions to enable this flow.
 
 Copy ``synology/dns_install.py`` by itself to an administrator-owned location.
 Python 3 and a working ``named-checkzone`` are prerequisites. Copy and edit
@@ -269,7 +288,8 @@ for example ``/etc/dnsgrid-dns-install.ini``. Configure exact authorized
 zone names (the LAN zone and all four reverse zones), verified master and
 validator paths, inbox, outbox and state. Provision directories in advance;
 state and backups must be private. All configured directories are distinct
-and must not be nested inside one another.
+and must not be nested inside one another (the optional package root is the
+explicit exception containing the master directory and validator).
 
 Test locally with the Python executable and paths actually available on DSM::
 
@@ -319,10 +339,22 @@ master files are not deleted. Inspect and retain protected backups according
 to local policy; there is no automatic NAS backup/inbox/outbox cleanup.
 Budget space for deliveries, private copies and backups.
 
+Only ``allowed_zones`` are read or replaced in the master directory; other
+zones and DSM metadata directories such as ``@eaDir`` are left untouched.
+Existing allowed zone files must be regular, single-link, non-symlink files
+with administrator or configured package ownership. Package-owned legacy
+files may have mode ``0666`` for baseline validation and backup. Every newly
+installed zone is normalized to ``0644`` and, when configured, to the package
+account's UID/primary GID before atomic replacement. Rollback restores each
+original UID, GID and mode exactly, including legacy writable modes.
+Journals now use explicit schema version 2 with ownership metadata. A pending
+legacy unversioned journal blocks this installer: complete recovery using the
+previous installer before upgrading; do not delete the journal to bypass it.
+
 The installer atomically writes ``outbox/<attempt>.json`` with delivery ID,
 serial, status ``installed``, ``already_installed`` or ``failed``, UTC timestamp
 and a limited non-secret summary. dnsgrid displays its own bounded messages,
-not arbitrary remote diagnostics. Use **Controlla esito NAS** to retrieve the
+not arbitrary remote diagnostics. Use **Check NAS result** to retrieve the
 current attempt's receipt. This is an explicit bounded network request, not
 continuous polling and not a wait for the next scheduler run.
 Until a valid matching receipt is read, installation remains unconfirmed.
