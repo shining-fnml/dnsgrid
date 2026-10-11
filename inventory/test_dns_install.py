@@ -1284,6 +1284,21 @@ class DNSInstallReloadTests(unittest.TestCase):
         self.assertEqual(self.rndc_calls(), 4)
         self.assertFalse(self.pending_path().exists())
 
+    def test_pending_limit_defers_delivery_without_receipt(self):
+        self.configure_reload()
+        self.exit_file.write_text("1")
+        with patch.object(installer, "MAX_PENDING", 1):
+            self.assertEqual(self.invoke(), 8)
+            later = self.publish(suffix="b")
+            self.assertEqual(self.invoke(), 8)
+            self.assertIn("deferred", self.stderr)
+            self.assertFalse((self.paths["outbox"] / (later.name + ".json")).exists())
+            self.exit_file.write_text("0")
+            self.assertEqual(self.invoke(), 0)
+            self.assertFalse((self.paths["outbox"] / (later.name + ".json")).exists())
+            self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.result(later.name)["reload"], "succeeded")
+
     def test_invalid_pending_reload_state_blocks_installation(self):
         self.configure_reload()
         for content in ("{}", "not json", json.dumps({"version": 1, "deliveries": [

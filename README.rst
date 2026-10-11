@@ -638,8 +638,8 @@ remain valid and mean no reload was reported. dnsgrid shows these as
 ``installed``/``already_installed``, ``reloaded``, ``reload_failed`` and
 ``superseded``; ``reload_failed`` keeps the generation pinned so **Check NAS
 result** can be repeated. Update dnsgrid before enabling reload on the NAS:
-older dnsgrid versions reject the extra field as an invalid result. dnsgrid displays its own bounded messages,
-not arbitrary remote diagnostics. Use **Check NAS result** to retrieve the
+older dnsgrid versions reject the extra field as an invalid result.
+dnsgrid displays its own bounded messages, not arbitrary remote diagnostics. Use **Check NAS result** to retrieve the
 current attempt's receipt. This is an explicit bounded network request, not
 continuous polling and not a wait for the next scheduler run.
 Until a valid matching receipt is read, installation remains unconfirmed.

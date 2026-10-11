@@ -863,6 +863,11 @@ def run(config, dry_run=False):
                 serial_value(match[1], f"delivery serial in {delivery!r}")
                 if not dry_run and (delivery in waiting or completed_result(outbox, delivery, serial)):
                     continue
+                if not dry_run and reload_enabled and len(pending) >= MAX_PENDING:
+                    # Left without a receipt: processed after the pending reload resolves.
+                    print(f"Delivery {delivery!r} deferred: too many deliveries await a "
+                          "general RNDC reload.", file=sys.stderr)
+                    continue
                 with tempfile.TemporaryDirectory(prefix=".stage-", dir=config["state_directory"]) as folder:
                     stage = Path(folder)
                     serial, fingerprint = snapshot(config, inbox, delivery, stage)
@@ -876,13 +881,9 @@ def run(config, dry_run=False):
                                 f"Serial reuse or regression rejected for installer state: "
                                 f"candidate {serial}, installed {previous['serial']}.")
                     status = "already_installed" if current == previous else "installed"
-                    if not dry_run:
-                        if reload_enabled and len(pending) >= MAX_PENDING:
-                            raise InstallError("Too many deliveries awaiting a general RNDC reload; "
-                                               "resolve the pending reload first.", 6)
-                        if status == "installed":
-                            install(state, destination, stage, config["allowed_zones"], current, previous, config)
-                            previous = current
+                    if not dry_run and status == "installed":
+                        install(state, destination, stage, config["allowed_zones"], current, previous, config)
+                        previous = current
             except (OSError, InstallError):
                 error = sys.exc_info()[1]
                 failure = error if isinstance(error, InstallError) else InstallError(
