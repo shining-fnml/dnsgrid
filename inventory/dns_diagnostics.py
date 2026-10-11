@@ -3,7 +3,7 @@
 import json
 import logging
 import os
-import select
+import selectors
 import threading
 import time
 from contextlib import contextmanager
@@ -54,22 +54,23 @@ def capture_output():
     def drain(reader, retained):
         deadline = None
         try:
-            while True:
-                if stop.is_set():
-                    if deadline is None:
-                        deadline = time.monotonic() + 0.2
-                    if time.monotonic() >= deadline:
-                        break
-                ready, _, _ = select.select([reader], [], [], 0.1)
-                if not ready:
+            with selectors.DefaultSelector() as selector:
+                selector.register(reader, selectors.EVENT_READ)
+                while True:
                     if stop.is_set():
+                        if deadline is None:
+                            deadline = time.monotonic() + 0.2
+                        if time.monotonic() >= deadline:
+                            break
+                    if not selector.select(timeout=0.1):
+                        if stop.is_set():
+                            break
+                        continue
+                    chunk = os.read(reader, OUTPUT_LIMIT)
+                    if not chunk:
                         break
-                    continue
-                chunk = os.read(reader, OUTPUT_LIMIT)
-                if not chunk:
-                    break
-                retained[1] += len(chunk)
-                retained[0].extend(chunk[:max(0, OUTPUT_LIMIT - len(retained[0]))])
+                    retained[1] += len(chunk)
+                    retained[0].extend(chunk[:max(0, OUTPUT_LIMIT - len(retained[0]))])
         finally:
             os.close(reader)
 

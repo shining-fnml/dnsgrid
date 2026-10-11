@@ -1,3 +1,4 @@
+import fcntl
 import json
 import os
 import runpy
@@ -350,6 +351,28 @@ class SFTPTests(SimpleTestCase):
         self.assertNotIn("\n", text)
         self.assertIn(r"\u001b", text)
         self.assertLess(len(text), 1200)
+
+    def test_capture_handles_high_numbered_file_descriptors(self):
+        pipe = os.pipe
+
+        def high_pipe():
+            reader, writer = pipe()
+            try:
+                high_reader = fcntl.fcntl(reader, fcntl.F_DUPFD, 1024)
+            except OSError:
+                os.close(writer)
+                self.skipTest("High-numbered file descriptors unavailable.")
+            finally:
+                os.close(reader)
+            return high_reader, writer
+
+        with patch("inventory.dns_diagnostics.os.pipe", side_effect=high_pipe):
+            with capture_output() as (pipes, captured):
+                for writer in pipes:
+                    os.write(writer, b"Permission denied")
+        for raw, total in captured:
+            self.assertEqual(raw, b"Permission denied")
+            self.assertEqual(total, len(raw))
 
     def test_debug_levels_and_console_configuration(self):
         settings_path = Path(__file__).resolve().parent.parent / "dnsgrid" / "settings.py"
