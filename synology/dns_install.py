@@ -5,14 +5,22 @@ outbox_directory, destination_directory, state_directory, allowed_zones
 (comma separated), and named_checkzone (absolute executable).
 Optional package_owner and package_root together trust a local DSM package
 account within that root only; its UID and primary GID are resolved locally.
+Optional rndc (absolute executable) and rndc_key (absolute key file path)
+together enable ONE general reload per run, after the complete zone set was
+validated and installed: rndc -k <rndc_key> -s 127.0.0.1 -p 953 reload.
+Without both settings no reload is performed and installed files are not
+confirmed loaded by named.
 
 The SFTP account may write only the inbox, not its parent, outbox, state,
 destination, script, or configuration. State and backup directories are 0700.
-No network access, DNS restart, or reload is performed. Replacements are atomic
-per file, not across the zone set. A durable journal permits rollback after a
-crash; incomplete rollback blocks installation until recovery succeeds.
+No network access other than the local RNDC control channel and no DNS
+restart are performed. Replacements are atomic per file, not across the zone
+set. A durable journal permits rollback after a crash; incomplete rollback
+blocks installation until recovery succeeds. A durable pending-reload record
+keeps a failed or interrupted reload retryable on later runs without resending.
 Exit codes: 0 success, 2 configuration, 3 busy, 5 rejected delivery,
-6 installation failure, 7 incomplete recovery.
+6 installation failure, 7 incomplete recovery, 8 files installed but the
+general RNDC reload failed (retried on the next run).
 """
 
 import argparse
@@ -40,6 +48,13 @@ TIMEOUT = 120
 STATE_NAME = "installed.json"
 JOURNAL_NAME = "transaction.json"
 LOCK_NAME = "installer.lock"
+RELOAD_NAME = "reload.json"
+RELOAD_TIMEOUT = 60
+RELOAD_OUTPUT = 200
+RELOAD_RESULTS = {"succeeded", "failed", "superseded"}
+MAX_PENDING = 64
+RNDC_SERVER = "127.0.0.1"
+RNDC_PORT = "953"
 DELIVERY = re.compile(r"dnsgrid-(0|[1-9][0-9]{0,9})-[0-9a-f]{32}")
 MAX_SERIAL = 0xFFFFFFFF
 HALF_SERIAL = 0x80000000
@@ -178,7 +193,10 @@ def load_config(path):
         required = {"inbox_directory", "outbox_directory",
                     "destination_directory", "state_directory",
                     "allowed_zones", "named_checkzone"}
-        if set(values) not in (required, required | {"package_owner", "package_root"}):
+        reload_keys = {"rndc", "rndc_key"}
+        if len(reload_keys & set(values)) == 1:
+            raise InstallError("Invalid configuration: rndc and rndc_key must be configured together.", 2)
+        if set(values) - reload_keys not in (required, required | {"package_owner", "package_root"}):
             raise ValueError
         if "package_owner" in values:
             try:
@@ -191,6 +209,12 @@ def load_config(path):
                 or not all(valid_zone(name) for name in zones)):
             raise ValueError
         values["allowed_zones"] = set(zones)
+        for key in sorted(reload_keys & set(values)):
+            try:
+                absolute(values[key])
+            except InstallError:
+                raise InstallError(
+                    f"Invalid configuration: {key} must be an absolute normalized path.", 2) from None
         for key in set(values) - {"allowed_zones", "package_owner", "package_identity"}:
             values[key] = absolute(values[key])
         directories = [values[key] for key in values if key.endswith("_directory")]
@@ -200,6 +224,13 @@ def load_config(path):
                     raise ValueError
         if len(set(directories)) != 4:
             raise ValueError
+        if "rndc" in values:
+            if values["rndc"] == values["rndc_key"] or any(
+                    directory == values[key] or directory in values[key].parents
+                    for directory in directories for key in ("rndc", "rndc_key")):
+                raise InstallError(
+                    "Invalid configuration: rndc and rndc_key must be distinct absolute "
+                    "paths outside the inbox, outbox, state and destination directories.", 2)
         if "package_identity" in values:
             root = values["package_root"]
             if any(root not in values[key].parents
@@ -378,32 +409,117 @@ def json_bytes(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
 
 
+def check_executable(config, key, summary, code):
+    """Validate a configured executable through anchored descriptors."""
+    path = config[key]
+    fd = open_directory(path.parent, config=config)
+    try:
+        try:
+            executable = os.open(path.name, FILE_FLAGS, dir_fd=fd)
+        except OSError:
+            info = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+            raise validation_error(path, info, summary, code) from None
+        try:
+            info = os.fstat(executable)
+            safe = package_protected(info, config) if in_package(path, config) else protected(info)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or not safe or not info.st_mode & 0o111):
+                raise validation_error(path, info, summary, code)
+        finally:
+            os.close(executable)
+    finally:
+        os.close(fd)
+
+
 def check_zone(config, name, path, stage):
     try:
-        fd = open_directory(config["named_checkzone"].parent, config=config)
-        try:
-            try:
-                executable = os.open(config["named_checkzone"].name, FILE_FLAGS, dir_fd=fd)
-            except OSError:
-                info = os.stat(config["named_checkzone"].name, dir_fd=fd, follow_symlinks=False)
-                raise validation_error(config["named_checkzone"], info, "Unsafe validator.", 5) from None
-            try:
-                info = os.fstat(executable)
-                safe = (package_protected(info, config) if in_package(config["named_checkzone"], config)
-                        else protected(info))
-                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                        or not safe or not info.st_mode & 0o111):
-                    raise validation_error(config["named_checkzone"], info, "Unsafe validator.", 5)
-            finally:
-                os.close(executable)
-        finally:
-            os.close(fd)
+        check_executable(config, "named_checkzone", "Unsafe validator.", 5)
         subprocess.run([str(config["named_checkzone"]), name, str(path)],
                        cwd=stage, stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        timeout=TIMEOUT, check=True, shell=False)
     except (OSError, subprocess.SubprocessError):
         raise InstallError(f"Zone validation failed for {name!r} at {str(path)!r}.") from None
+
+
+def check_rndc(config):
+    """Validate the RNDC executable and key file metadata; never read the key."""
+    try:
+        check_executable(config, "rndc", "Unsafe RNDC executable.", 2)
+        path = config["rndc_key"]
+        fd = open_directory(path.parent, config=config)
+        try:
+            try:
+                key = os.open(path.name, FILE_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                raise InstallError(f"Configured rndc_key {str(path)!r} is missing.", 2) from None
+            except OSError:
+                info = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+                raise validation_error(path, info, "Unsafe RNDC key file.", 2) from None
+            try:
+                info = os.fstat(key)
+                owners = {0, os.geteuid()}
+                if in_package(path, config):
+                    owners.add(config["package_identity"][0])
+                # Group read is allowed; group write and any world access are not.
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or info.st_uid not in owners or info.st_mode & 0o027):
+                    raise validation_error(path, info, "Unsafe RNDC key file.", 2)
+            finally:
+                os.close(key)
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        raise InstallError("Configured RNDC executable or key path is missing.", 2) from None
+    except OSError:
+        raise InstallError("Configured RNDC executable or key path is unavailable.", 2) from None
+
+
+def reload_command(config):
+    """Fixed argv for ONE general reload: no zone argument, local control channel only."""
+    return [str(config["rndc"]), "-k", str(config["rndc_key"]),
+            "-s", RNDC_SERVER, "-p", RNDC_PORT, "reload"]
+
+
+def sanitized(data):
+    text = "".join(c if 32 <= ord(c) < 127 else " " for c in data.decode("ascii", "replace"))
+    return " ".join(text.split())[:RELOAD_OUTPUT]
+
+
+def general_reload(config):
+    """Run one general RNDC reload; True only for exit status 0 within the timeout.
+
+    Output is captured in a private temporary file, bounded and sanitized, and
+    written only to local stderr diagnostics, never to receipts.
+    """
+    try:
+        check_rndc(config)
+    except InstallError as error:
+        print(f"General RNDC reload not attempted: {error}", file=sys.stderr)
+        return False
+    try:
+        with tempfile.TemporaryFile(dir=config["state_directory"]) as output:
+            process = subprocess.run(
+                reload_command(config), cwd="/", stdin=subprocess.DEVNULL,
+                stdout=output, stderr=subprocess.STDOUT,
+                timeout=RELOAD_TIMEOUT, check=False, shell=False)
+            output.seek(0)
+            detail = sanitized(output.read(RELOAD_OUTPUT * 2))
+    except subprocess.TimeoutExpired:
+        print(f"General RNDC reload timed out after {RELOAD_TIMEOUT} seconds; "
+              "zones not confirmed loaded.", file=sys.stderr)
+        return False
+    except (OSError, subprocess.SubprocessError):
+        print("General RNDC reload could not be started; zones not confirmed loaded.",
+              file=sys.stderr)
+        return False
+    if process.returncode != 0:
+        print(f"General RNDC reload failed with exit status {process.returncode}; "
+              f"zones not confirmed loaded. rndc output: {detail!r}", file=sys.stderr)
+        return False
+    print("General RNDC reload succeeded; serving of the new records is not verified.",
+          file=sys.stderr)
+    return True
 
 
 def snapshot(config, inbox, delivery, stage):
@@ -591,12 +707,74 @@ def install(state, destination, stage, names, next_state, previous, config=None)
         raise InstallError("Installation failed; previous files restored.", 6) from None
 
 
-def result(outbox, delivery, serial, status, summary):
-    atomic_write(outbox, delivery + ".json", json_bytes({
+def result(outbox, delivery, serial, status, summary, reload=None):
+    receipt = {
         "delivery": delivery, "serial": serial, "status": status,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "summary": summary,
-    }), 0o644)
+    }
+    if reload is not None:
+        receipt["reload"] = reload
+    atomic_write(outbox, delivery + ".json", json_bytes(receipt), 0o644)
+
+
+RELOAD_SUMMARIES = {
+    ("installed", "succeeded"):
+        "Files installed; general RNDC reload succeeded. Serving of the new records not verified.",
+    ("already_installed", "succeeded"):
+        "Already installed; general RNDC reload succeeded. Serving of the new records not verified.",
+    ("installed", "failed"):
+        "Files installed; general RNDC reload failed or unconfirmed. The installer retries it.",
+    ("already_installed", "failed"):
+        "Already installed; general RNDC reload failed or unconfirmed. The installer retries it.",
+    ("installed", "superseded"):
+        "Files installed, then superseded by a newer installation before a successful reload.",
+    ("already_installed", "superseded"):
+        "Already installed, then superseded by a newer installation before a successful reload.",
+}
+
+
+def read_pending(state):
+    """Deliveries whose files were installed and still await a general reload."""
+    value = read_file(state, RELOAD_NAME, MAX_MANIFEST, trusted=True, missing=True)
+    if value is None:
+        return []
+    try:
+        data = decode_json(value[0], f"pending reload state {RELOAD_NAME!r}")
+        if (type(data) is not dict or set(data) != {"version", "deliveries"}
+                or type(data["version"]) is not int or data["version"] != 1
+                or type(data["deliveries"]) is not list
+                or not 1 <= len(data["deliveries"]) <= MAX_PENDING):
+            raise ValueError
+        seen = set()
+        for entry in data["deliveries"]:
+            if (type(entry) is not dict
+                    or set(entry) != {"delivery", "serial", "status", "fingerprint"}
+                    or not isinstance(entry["delivery"], str) or entry["delivery"] in seen
+                    or entry["status"] not in {"installed", "already_installed"}
+                    or not isinstance(entry["fingerprint"], str)
+                    or not re.fullmatch("[0-9a-f]{64}", entry["fingerprint"])):
+                raise ValueError
+            match = DELIVERY.fullmatch(entry["delivery"])
+            if (not match or type(entry["serial"]) is not int
+                    or serial_value(match[1]) != entry["serial"]):
+                raise ValueError
+            seen.add(entry["delivery"])
+        return data["deliveries"]
+    except (InstallError, ValueError, TypeError):
+        raise InstallError(f"Invalid pending reload state {RELOAD_NAME!r}; "
+                           "administrator review required.", 7) from None
+
+
+def write_pending(state, entries):
+    if entries:
+        atomic_write(state, RELOAD_NAME, json_bytes({"version": 1, "deliveries": entries}))
+    else:
+        try:
+            os.unlink(RELOAD_NAME, dir_fd=state)
+        except FileNotFoundError:
+            pass
+        os.fsync(state)
 
 
 def completed_result(outbox, delivery, serial):
@@ -607,7 +785,10 @@ def completed_result(outbox, delivery, serial):
     receipt = decode_json(raw[0])
     try:
         if (type(receipt) is not dict
-                or set(receipt) != {"delivery", "serial", "status", "timestamp", "summary"}
+                or set(receipt) - {"reload"} != {"delivery", "serial", "status", "timestamp", "summary"}
+                or ("reload" in receipt and (
+                    receipt["reload"] not in RELOAD_RESULTS
+                    or receipt["status"] not in {"installed", "already_installed"}))
                 or receipt["delivery"] != delivery
                 or type(receipt["serial"]) is not int or receipt["serial"] != serial
                 or receipt["status"] not in {"installed", "already_installed", "failed"}
@@ -660,8 +841,19 @@ def run(config, dry_run=False):
         else:
             recover(state, destination, config["allowed_zones"])
         previous = read_state(state)
+        pending = read_pending(state)
+        reload_enabled = "rndc" in config
+        if reload_enabled:
+            # Refuse to install files that could not be activated as configured.
+            check_rndc(config)
+        elif pending:
+            print("Pending RNDC reload recorded, but rndc/rndc_key are not configured; "
+                  "zones not confirmed loaded.", file=sys.stderr)
+        waiting = {entry["delivery"] for entry in pending}
+        outbox = directories["outbox_directory"]
         inbox = directories["inbox_directory"]
         code = 0
+        installed_without_reload = False
         for delivery in sorted(os.listdir(inbox)):
             match = DELIVERY.fullmatch(delivery)
             if not match:  # Includes unfinished .partial uploads.
@@ -669,7 +861,7 @@ def run(config, dry_run=False):
             serial = int(match[1])
             try:
                 serial_value(match[1], f"delivery serial in {delivery!r}")
-                if not dry_run and completed_result(directories["outbox_directory"], delivery, serial):
+                if not dry_run and (delivery in waiting or completed_result(outbox, delivery, serial)):
                     continue
                 with tempfile.TemporaryDirectory(prefix=".stage-", dir=config["state_directory"]) as folder:
                     stage = Path(folder)
@@ -685,6 +877,9 @@ def run(config, dry_run=False):
                                 f"candidate {serial}, installed {previous['serial']}.")
                     status = "already_installed" if current == previous else "installed"
                     if not dry_run:
+                        if reload_enabled and len(pending) >= MAX_PENDING:
+                            raise InstallError("Too many deliveries awaiting a general RNDC reload; "
+                                               "resolve the pending reload first.", 6)
                         if status == "installed":
                             install(state, destination, stage, config["allowed_zones"], current, previous, config)
                             previous = current
@@ -695,13 +890,51 @@ def run(config, dry_run=False):
                 print(str(failure), file=sys.stderr)
                 code = max(code, failure.code)
                 if not dry_run:
-                    result(directories["outbox_directory"], delivery, serial, "failed", str(failure)[:256])
+                    result(outbox, delivery, serial, "failed", str(failure)[:256])
                 if failure.code == 7:
                     break
             else:
-                if not dry_run:
-                    result(directories["outbox_directory"], delivery, serial, status,
-                           "Already installed." if status == "already_installed" else "Installation complete.")
+                if dry_run:
+                    continue
+                if reload_enabled:
+                    # Durable before any receipt: a crash before this point
+                    # leaves no receipt, so the delivery is reprocessed as
+                    # already_installed and joins the pending reload.
+                    pending.append({"delivery": delivery, "serial": serial,
+                                    "status": status, "fingerprint": current["fingerprint"]})
+                    waiting.add(delivery)
+                    write_pending(state, pending)
+                else:
+                    installed_without_reload = True
+                    result(outbox, delivery, serial, status,
+                           "Already installed; RNDC reload not configured." if status == "already_installed"
+                           else "Installation complete; RNDC reload not configured.")
+        if installed_without_reload:
+            print("RNDC reload not configured: installed files are not confirmed loaded by named.",
+                  file=sys.stderr)
+        if dry_run:
+            if pending:
+                print("General RNDC reload pending; dry run does not reload.", file=sys.stderr)
+            return code
+        if reload_enabled and pending:
+            if code >= 7 or read_file(state, JOURNAL_NAME, MAX_MANIFEST, trusted=True, missing=True):
+                print("General RNDC reload deferred: recovery incomplete.", file=sys.stderr)
+                return code
+            # ONE general reload for the complete installed zone set.
+            reloaded = general_reload(config)
+            for entry in pending:
+                outcome = "failed"
+                if reloaded:
+                    outcome = ("succeeded" if previous and entry["fingerprint"] == previous["fingerprint"]
+                               else "superseded")
+                result(outbox, entry["delivery"], entry["serial"], entry["status"],
+                       RELOAD_SUMMARIES[(entry["status"], outcome)], outcome)
+            if reloaded:
+                # Cleared only after every receipt is durable; a crash before
+                # this repeats the idempotent general reload and receipts.
+                write_pending(state, [])
+            else:
+                code = max(code, 8)
         return code
 
 

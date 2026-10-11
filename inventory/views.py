@@ -449,9 +449,9 @@ def dns_publish(request):
 
 
 def _delivery_message(request, status, summary):
-    if status in ("failure", "failed", "invalid", "unconfirmed"):
+    if status in ("failure", "failed", "invalid", "unconfirmed", "reload_failed"):
         messages.warning(request, summary)
-    elif status in ("installed", "already_installed"):
+    elif status in ("installed", "already_installed", "reloaded"):
         messages.success(request, summary)
     else:
         messages.info(request, summary)

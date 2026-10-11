@@ -7,6 +7,16 @@ destination_directory = /volume1/@appstore/DNSServer/named/etc/zone/master
 state_directory = /volume1/dnsgrid-private/state
 allowed_zones = example.test, 1.168.192.in-addr.arpa
 named_checkzone = /volume1/@appstore/DNSServer/bin/named-checkzone
+# Optional pair: ONE general reload after the complete zone set is installed:
+#   rndc -k <rndc_key> -s 127.0.0.1 -p 953 reload   (no zone argument)
+# Paths verified on one DSM DNS Server package (BIND 9.16.34) with
+# `rndc -k <rndc_key> status`. rndc_key is the key authorized by the active
+# named.conf controls block ("rndc-key"), NOT a zone/TSIG key such as
+# named/etc/key/*-key. Only the path is configured here, never the secret.
+# Omit both settings to install files without reload: installed files are
+# then NOT confirmed loaded by named until it is reloaded or restarted.
+rndc = /volume1/@appstore/DNSServer/bin/rndc
+rndc_key = /volume1/@appstore/DNSServer/named/rndc.key
 # Optional pair: trust this DSM account only inside this verified package root.
 # UID and primary GID are resolved locally; run the installer as root.
 # Omit both settings to retain administrator-only package path checks.
