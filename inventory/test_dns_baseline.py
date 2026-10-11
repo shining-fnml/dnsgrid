@@ -73,6 +73,9 @@ class DNSBaselineTests(TestCase):
         generation.mkdir(parents=True)
         (generation / "forward.zone").write_bytes(b"legacy immutable generation")
         (root / "installer-state.json").write_bytes(b'{"serial":1692746706}')
+        from .dns_delivery import _lock
+        with _lock(str(root)):
+            pass
         Configuration.objects.update(
             dns_export_directory=str(root),
             dns_published_generation=f"dnsgrid-{self.legacy}",
