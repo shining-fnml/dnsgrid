@@ -303,8 +303,9 @@ they never enable remote deployment.
 Configure a real authoritative nameserver before deploying zones.
 The default ``ns.example.tld`` is an illustrative out-of-zone name.
 If either nameserver is inside the LAN zone, create its matching inventory host
-so the exported zone contains its A record. Delegate the LAN zone and
-each of the four reverse /24 zones to your authoritative server.
+so the exported zone contains its A record. Delegate the LAN and VPN forward
+zones, each LAN reverse /24 zone, and the cumulative VPN reverse /16 zone to
+your authoritative server.
 
 Hub-side BIND primary and VPN resolver
 --------------------------------------
@@ -342,8 +343,36 @@ should use the NAS resolver on their physical subnet rather than the hub::
         also-notify { dns_secondaries; };
     };
 
-Add a primary zone stanza for each generated reverse zone as well. Configure
-each NAS with matching ``type secondary`` stanzas and the hub as its primary.
+The cumulative VPN reverse zone is generated from the configured ``vpn_prefix``
+/16 network plan, not from a fixed host address. For a prefix ``<first>.<second>``,
+its origin is ``<second>.<first>.in-addr.arpa.`` and its installed filename is
+the same name without the trailing dot. It contains PTR records for VPN-enabled
+hosts across all sites, pointing to their ``<hostname>.vpn.`` names. The two
+remaining address octets form the PTR owner as ``<host.x>.<site.g>``.
+
+Add primary stanzas for the LAN reverse zones and the cumulative VPN reverse
+zone. For the VPN reverse zone, use the calculated origin in this example::
+
+    zone "<VPN_REVERSE_ORIGIN_WITHOUT_TRAILING_DOT>" {
+        type primary;
+        file "<BIND_ZONE_DIRECTORY>/<VPN_REVERSE_ORIGIN_WITHOUT_TRAILING_DOT>";
+        allow-transfer { dns_secondaries; };
+        also-notify { dns_secondaries; };
+    };
+
+Configure each NAS with matching secondary stanzas and the hub as its primary.
+For example, the VPN reverse zone on each NAS uses::
+
+    zone "<VPN_REVERSE_ORIGIN_WITHOUT_TRAILING_DOT>" {
+        type secondary;
+        primaries { <HUB_VPN_ADDRESS>; };
+        file "<NAS_SECONDARY_ZONE_DIRECTORY>/<VPN_REVERSE_ORIGIN_WITHOUT_TRAILING_DOT>";
+    };
+
+Use a BIND-writable secondary storage directory on each NAS; zones arrive by
+DNS transfer from the hub, not by dnsgrid writing primary files to the NAS.
+Declare the new zone on the hub and NAS secondaries before publishing, then
+verify its SOA serial and a VPN host's PTR answer on both the hub and each NAS.
 Restrict transfers to those secondaries (and firewall DNS/RNDC appropriately).
 The angle-bracket values are documentation placeholders, not literal BIND
 syntax. Review the active configuration and ACLs before enabling recursion.
@@ -435,6 +464,10 @@ and queued deliveries after verifying they are not used by another service.
 Use the hub-side publication workflow above. The standalone
 ``synology/dns_install.py`` remains in the repository for legacy recovery only
 and is not part of active DNS publication.
+When recovering a generation with that installer, its ``allowed_zones`` must
+match the manifest's full zone set, including the prefix-derived VPN reverse
+origin for generations that contain it. Do not enable the retired delivery
+workflow to configure NAS secondaries; use DNS zone transfers from the hub.
 
 Provision separate paths, for example:
 
@@ -717,6 +750,10 @@ the preview if inventory changes instead of mixing different revisions.
     independent of the public VPN/Gandi domain and installs as ``vpn.zone``.
 ``reverse-<g>.zone``
     One BIND /24 reverse zone per site, with LAN FQDN PTR records.
+``reverse-vpn.zone``
+    One cumulative BIND /16 reverse zone derived from ``vpn_prefix``, with
+    ``<hostname>.vpn.`` PTR targets for VPN-enabled hosts across all sites.
+    It is generated even when there are no VPN members.
 ``dsm-reservations-site-<id>.json``
     For each site with a configured DSM interface, the reservation-only
     payload: ``ifname`` and ``reservationData`` containing ``mac``, ``ip``,
@@ -739,17 +776,21 @@ below instead.
 
 DNS zones begin with explicit ``$ORIGIN`` and ``$TTL`` directives and a
 multiline SOA. A and PTR records have explicit FQDN owners and TTLs, sorted
-alphabetically by hostname; PTR targets are full LAN FQDNs. Each zone ends
+alphabetically by hostname; PTR targets are full LAN FQDNs or ``<hostname>.vpn.``
+for the VPN reverse zone. Each zone ends
 with its zone-apex NS record, configured separately from the SOA nameserver.
 
 After reviewing the preview, use the explicit CSRF-protected ``dns-publish``
 POST carrying the preview's ``revision``; stale revisions are rejected.
 Previews, GET requests, downloads, saving hosts/Settings, and archive
 download/restore never install zones or reload BIND. Installed filenames are
-the configured LAN zone name, ``vpn.zone``, and
-``<g>.<second>.<first>.in-addr.arpa`` for each reverse zone (the latter two
-octets come from ``lan_prefix``). Download names are ``forward.zone``,
-``vpn.zone``, and ``reverse-<g>.zone``.
+the configured LAN zone name, ``vpn.zone``,
+``<g>.<second>.<first>.in-addr.arpa`` for each LAN reverse zone (the latter two
+octets come from ``lan_prefix``), and ``<second>.<first>.in-addr.arpa`` for the
+VPN reverse zone (from ``vpn_prefix``). Download names are ``forward.zone``,
+``vpn.zone``, ``reverse-<g>.zone``, and ``reverse-vpn.zone``.
+The VPN reverse zone participates in content hashing, SOA serial advancement,
+immutable generations and checksum manifests just like the other DNS zones.
 
 All generated zones are staged in the configured BIND directory and validated
 with the explicit ``named_checkzone`` executable before any replacement. Each

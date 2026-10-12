@@ -80,6 +80,15 @@ def _dns_zones(config, hosts):
     )
     vpn.append(f"{origin}. NS {config.zone_ns}.")
     zones[f"{origin}.zone"] = (f"{origin}.zone", "\n".join(vpn) + "\n")
+    prefix = config.vpn_prefix.split(".")
+    origin = f"{prefix[1]}.{prefix[0]}.in-addr.arpa"
+    reverse = _header(config, origin)
+    reverse.extend(
+        f"{host.x}.{_group(host)}.{origin}. {config.ttl} PTR {host.name}.{VPN_ZONE}."
+        for host in hosts if host.vpn
+    )
+    reverse.append(f"{origin}. NS {config.zone_ns}.")
+    zones["reverse-vpn.zone"] = (origin, "\n".join(reverse) + "\n")
     return zones
 
 
