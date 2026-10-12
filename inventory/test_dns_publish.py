@@ -44,7 +44,7 @@ class DNSPublicationTests(TestCase):
         return list(Site.objects.values("id", "name", "g", "dsm_ifname"))
 
     def test_explicit_publication_overwrites_only_zone_files(self):
-        host = Host(name="alpha", site_id=1, row=1, column=0)
+        host = Host(name="alpha", site_id=1, row=1, column=0, vpn=True)
         save_host(host, self.config.revision)
         artifacts = build_exports()
         forward = self.path / self.config.lan_domain
@@ -57,6 +57,10 @@ class DNSPublicationTests(TestCase):
         self.assertContains(response, "DNS zone files installed")
         self.assertEqual(forward.read_text(), artifacts["forward.zone"])
         self.assertEqual(vpn.read_text(), artifacts["vpn.zone"])
+        self.assertEqual(
+            (self.path / "28.172.in-addr.arpa").read_text(), artifacts["reverse-vpn.zone"],
+        )
+        self.assertContains(response, "28.172.in-addr.arpa")
         self.assertEqual(stat.S_IMODE(forward.stat().st_mode), previous_mode)
         for group in range(1, 5):
             filename = f"{group}.168.192.in-addr.arpa"
@@ -64,14 +68,19 @@ class DNSPublicationTests(TestCase):
             self.assertEqual(stat.S_IMODE((self.path / filename).stat().st_mode), 0o644)
             self.assertContains(response, filename)
         self.assertEqual(unrelated.read_text(), "unrelated")
-        self.assertEqual(len(list(self.path.iterdir())), 9)
+        self.assertEqual(len(list(self.path.iterdir())), 10)
         revision = Configuration.load().revision
         self.run.reset_mock()
         self.publish()
         self.assertEqual(Configuration.load().revision, revision)
         self.assertEqual(forward.read_text(), artifacts["forward.zone"])
         commands = self.run.call_args_list
-        self.assertEqual(len(commands), 7)
+        self.assertEqual(len(commands), 8)
+        self.assertEqual(
+            {call.args[0][1] for call in commands[:-1]},
+            {f"{self.config.lan_domain}.", "vpn.", "28.172.in-addr.arpa."}
+            | {f"{group}.168.192.in-addr.arpa." for group in range(1, 5)},
+        )
         for call in commands[:-1]:
             self.assertEqual(call.args[0][0], self.config.named_checkzone)
             self.assertIs(call.kwargs["shell"], False)
@@ -162,7 +171,7 @@ class DNSPublicationTests(TestCase):
         with patch("inventory.exporters.os.fsync", side_effect=OSError("disk error")):
             written, errors = publish_dns_zones(str(self.config.revision))
         self.assertEqual(written, [])
-        self.assertEqual(len(errors), 6)
+        self.assertEqual(len(errors), 7)
         self.assertEqual(forward.read_text(), "previous zone")
         self.assertEqual(list(self.path.iterdir()), [forward])
 
@@ -218,7 +227,7 @@ class DNSPublicationTests(TestCase):
         with patch("inventory.exporters.os.replace", side_effect=fail_one):
             response = self.publish()
         self.assertContains(response, "complete set was not installed and RNDC was not invoked")
-        self.assertEqual(len(self.run.call_args_list), 6)
+        self.assertEqual(len(self.run.call_args_list), 7)
         self.run.reset_mock()
         self.run.return_value = SimpleNamespace(returncode=0)
         self.run.side_effect = lambda command, **kwargs: SimpleNamespace(
@@ -238,6 +247,34 @@ class DNSPublicationTests(TestCase):
         with patch.object(dns_sftp, "deliver") as delivery:
             self.publish()
         delivery.assert_not_called()
+
+    def test_vpn_reverse_validation_failure_installs_nothing(self):
+        target = self.path / "28.172.in-addr.arpa"
+        target.write_text("previous VPN reverse zone")
+        self.run.side_effect = lambda command, **kwargs: SimpleNamespace(
+            returncode=1 if command[1] == "28.172.in-addr.arpa." else 0,
+        )
+        written, errors = publish_dns_zones(str(self.config.revision))
+        self.assertEqual(written, [])
+        self.assertEqual(errors, [
+            ("28.172.in-addr.arpa", "BIND zone validation failed; no zone files were installed."),
+        ])
+        self.assertEqual(target.read_text(), "previous VPN reverse zone")
+        self.assertEqual(list(self.path.iterdir()), [target])
+        self.assertEqual(len(self.run.call_args_list), 7)
+        self.assertFalse(any(call.args[0][0] == self.config.rndc for call in self.run.call_args_list))
+
+    def test_vpn_reverse_publication_uses_configured_prefix(self):
+        update_settings({"vpn_prefix": "10.29"}, self.sites(), self.config.revision)
+        written, errors = publish_dns_zones(str(Configuration.load().revision))
+        self.assertEqual(errors, [])
+        self.assertIn("29.10.in-addr.arpa", written)
+        self.assertIn("$ORIGIN 29.10.in-addr.arpa.", (self.path / "29.10.in-addr.arpa").read_text())
+        self.assertFalse((self.path / "28.172.in-addr.arpa").exists())
+        self.assertTrue(any(
+            call.args[0][:2] == [self.config.named_checkzone, "29.10.in-addr.arpa."]
+            for call in self.run.call_args_list
+        ))
 
     def test_colliding_zone_filenames_are_rejected_before_any_write(self):
         Configuration.objects.update(lan_domain="2.168.192.in-addr.arpa")

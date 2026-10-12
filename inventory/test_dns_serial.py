@@ -10,7 +10,7 @@ from django.db import OperationalError, close_old_connections
 from django.test import TestCase, TransactionTestCase
 
 from .archives import restore, snapshot, validate
-from .dns_serial import compare_serial, initial_serial, next_serial, validate_serial
+from .dns_serial import compare_serial, content_fingerprint, initial_serial, next_serial, validate_serial
 from .exporters import build_exports
 from .models import MAX_SERIAL, Configuration, Host, Site
 from .services import delete_host, lower_dns_serial, move_host, save_host, update_settings
@@ -104,6 +104,24 @@ class DNSSerialTests(TestCase):
             save_host(Host(name="alpha", site_id=1, row=1, column=0), 1)
         self.assertFalse(Host.objects.exists())
         self.assertEqual(Configuration.load().revision, 1)
+
+    def test_vpn_reverse_content_tracks_prefix_even_without_vpn_hosts(self):
+        config = update_settings({"ttl": 600}, self.sites, 1)
+        before = build_exports()
+        fingerprint = config.dns_content_hash
+        updated = update_settings({"vpn_prefix": "10.29"}, self.sites, config.revision)
+        after = build_exports()
+        self.assertEqual(updated.soa_serial, config.soa_serial + 1)
+        self.assertNotEqual(updated.dns_content_hash, fingerprint)
+        self.assertEqual(updated.dns_content_hash, content_fingerprint(updated))
+        self.assertIn("$ORIGIN 29.10.in-addr.arpa.", after["reverse-vpn.zone"])
+        for name in ("forward.zone", "vpn.zone", *(f"reverse-{g}.zone" for g in range(1, 5))):
+            self.assertEqual(
+                before[name].replace(f"        {config.soa_serial}\n", "        0\n"),
+                after[name].replace(f"        {updated.soa_serial}\n", "        0\n"),
+            )
+        self.assertEqual(build_exports(), after)
+        self.assertEqual(Configuration.load().soa_serial, updated.soa_serial)
 
     def test_upward_seed_is_distinct_and_stale_writer_cannot_claim_it(self):
         updated = update_settings({"soa_serial": 2026100902, "ttl": 600}, self.sites, 1)

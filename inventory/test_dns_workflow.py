@@ -45,17 +45,23 @@ class DNSWorkflowTests(TestCase):
     def test_manifest_hashes_precise_generation_and_noop_is_immutable(self):
         exports = build_exports()
         written, errors = self.publish()
-        self.assertEqual((len(written), errors), (6, []))
+        self.assertEqual((len(written), errors), (7, []))
         config = Configuration.load()
         path, manifest = read_generation(str(self.path), config.dns_published_generation)
         self.assertEqual(manifest["serial"], config.soa_serial)
         self.assertEqual(manifest["version"], 1)
         self.assertEqual(manifest["generation"], "dnsgrid-2026100800")
+        self.assertEqual(
+            {zone["name"] for zone in manifest["zones"]},
+            {config.lan_domain, "vpn.zone", "28.172.in-addr.arpa"}
+            | {f"{group}.168.192.in-addr.arpa" for group in range(1, 5)},
+        )
         for zone in manifest["zones"]:
             data = (path / zone["filename"]).read_bytes()
             self.assertEqual(hashlib.sha256(data).hexdigest(), zone["sha256"])
             self.assertEqual(len(data), zone["size"])
         self.assertEqual((path / config.lan_domain).read_text(), exports["forward.zone"])
+        self.assertEqual((path / "28.172.in-addr.arpa").read_text(), exports["reverse-vpn.zone"])
         raw = (path / "manifest.json").read_bytes()
         self.publish()
         self.assertEqual((path / "manifest.json").read_bytes(), raw)
@@ -76,6 +82,26 @@ class DNSWorkflowTests(TestCase):
         self.assertTrue(errors)
         self.assertFalse((self.path / "manifest.json").exists())
         self.assertFalse((self.path / "generations/dnsgrid-2026100800/manifest.json").exists())
+
+    def test_adding_vpn_reverse_advances_legacy_generation_serial(self):
+        from .exporters import _dns_zones
+
+        def legacy_zones(config, hosts):
+            zones = _dns_zones(config, hosts)
+            zones.pop("reverse-vpn.zone")
+            return zones
+
+        with patch("inventory.exporters._dns_zones", side_effect=legacy_zones):
+            self.assertEqual(self.publish()[1], [])
+        path, manifest = read_generation(str(self.path), "dnsgrid-2026100800")
+        raw = (path / "manifest.json").read_bytes()
+        self.assertEqual(len(manifest["zones"]), 6)
+        written, errors = self.publish()
+        self.assertEqual(errors, [])
+        self.assertIn("28.172.in-addr.arpa", written)
+        self.assertEqual(Configuration.load().soa_serial, 2026100801)
+        self.assertEqual(Configuration.load().dns_published_generation, "dnsgrid-2026100801")
+        self.assertEqual((path / "manifest.json").read_bytes(), raw)
 
     def test_manifest_write_failure_removes_uncommitted_application_files(self):
         from . import dns_publication
@@ -99,7 +125,8 @@ class DNSWorkflowTests(TestCase):
         def observe(path, data, **kwargs):
             if path.name == "manifest.json":
                 for filename in (Configuration.load().lan_domain, "vpn.zone", "1.168.192.in-addr.arpa",
-                                 "2.168.192.in-addr.arpa", "3.168.192.in-addr.arpa", "4.168.192.in-addr.arpa"):
+                                 "2.168.192.in-addr.arpa", "3.168.192.in-addr.arpa", "4.168.192.in-addr.arpa",
+                                 "28.172.in-addr.arpa"):
                     self.assertTrue((path.parent / filename).exists())
             seen.append(path)
             return atomic(path, data, **kwargs)

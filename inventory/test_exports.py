@@ -30,6 +30,8 @@ class ExportTests(TestCase):
         self.assertFalse(any(name.endswith(".form") for name in output))
         self.assertIn("$ORIGIN vpn.", output["vpn.zone"])
         self.assertIn("alpha.vpn. 300 A 172.28.1.50", output["vpn.zone"])
+        self.assertIn("$ORIGIN 28.172.in-addr.arpa.", output["reverse-vpn.zone"])
+        self.assertIn("50.1.28.172.in-addr.arpa. 300 PTR alpha.vpn.", output["reverse-vpn.zone"])
         self.assertNotIn("vpn.example.tld", output["vpn.zone"])
         self.assertNotIn("vpn.hosts", output)
         for group in range(1, 5):
@@ -70,6 +72,9 @@ class ExportTests(TestCase):
                 self.host.mac = ""
                 output = build_exports(self.config, [self.host])
                 self.assertEqual("alpha.vpn. 300 A 172.28.1.50\n" in output["vpn.zone"], vpn)
+                self.assertEqual(
+                    "50.1.28.172.in-addr.arpa. 300 PTR alpha.vpn.\n" in output["reverse-vpn.zone"], vpn,
+                )
                 self.assertEqual(len(desired_gandi(self.config, [self.host])), int(vpn and public))
                 self.assertEqual(json.loads(output["dsm-reservations-site-1.json"])["reservationData"], [])
                 self.assertIn("alpha.intranet.example.tld. 300 A", output["forward.zone"])
@@ -103,6 +108,9 @@ class ExportTests(TestCase):
         self.assertTrue(output["reverse-4.zone"].endswith("4.24.10.in-addr.arpa. NS dns.other.test.\n"))
         self.assertIn("alpha.vpn. 600 A 10.29.4.50\n", output["vpn.zone"])
         self.assertNotIn("vpn.other.test", output["vpn.zone"])
+        self.assertIn("$ORIGIN 29.10.in-addr.arpa.", output["reverse-vpn.zone"])
+        self.assertIn("50.4.29.10.in-addr.arpa. 600 PTR alpha.vpn.\n", output["reverse-vpn.zone"])
+        self.assertTrue(output["reverse-vpn.zone"].endswith("29.10.in-addr.arpa. NS dns.other.test.\n"))
         self.assertEqual(json.loads(output["dsm-reservations-site-4.json"])["reservationData"][0]["ip"], "10.24.4.50")
         self.assertEqual(desired_gandi(self.config, [self.host])[0]["rrset_values"], ["10.29.4.50"])
 
@@ -179,6 +187,22 @@ class ExportTests(TestCase):
         reverse = build_exports(self.config, [beta, self.host])["reverse-1.zone"]
         self.assertLess(reverse.index("alpha.intranet"), reverse.index("beta.intranet"))
         self.assertNotIn("PRIVATE-NOTE", first["dsm-reservations-site-1.json"])
+
+    def test_vpn_reverse_is_cumulative_and_deterministic(self):
+        beta = Host(name="beta", site=Site.objects.get(pk=2), row=1, column=1, vpn=True)
+        disabled = Host(name="disabled", site=Site.objects.get(pk=3), row=1, column=1)
+        hosts = [beta, disabled, self.host]
+        output = build_exports(self.config, hosts)
+        reverse = output["reverse-vpn.zone"]
+        self.assertEqual(output, build_exports(self.config, list(reversed(hosts))))
+        self.assertIn("50.1.28.172.in-addr.arpa. 300 PTR alpha.vpn.\n", reverse)
+        self.assertIn("17.2.28.172.in-addr.arpa. 300 PTR beta.vpn.\n", reverse)
+        self.assertNotIn("disabled", reverse)
+        self.assertEqual(reverse.count(" PTR "), 2)
+        self.assertLess(reverse.index("alpha.vpn"), reverse.index("beta.vpn"))
+        empty = build_exports(self.config, [])["reverse-vpn.zone"]
+        self.assertIn("$ORIGIN 28.172.in-addr.arpa.", empty)
+        self.assertNotIn(" PTR ", empty)
 
     def test_dsm_export_omits_hosts_without_mac_and_normalizes_macs(self):
         beta = Host.objects.create(name="beta", site=Site.objects.get(pk=2), row=1, column=1)
