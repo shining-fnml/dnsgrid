@@ -139,6 +139,9 @@ class DNSSerialTests(TestCase):
         restore(data, 2)
         self.assertEqual(Configuration.load().soa_serial, 2026100902)
         legacy = copy.deepcopy(data)
+        legacy["schema_version"] = 1
+        for host in legacy["hosts"]:
+            host.pop("static")
         legacy["configuration"].pop("soa_serial")
         legacy["configuration"]["revision"] = 2026101002
         self.assertEqual(validate(legacy)["configuration"]["soa_serial"], 2026101002)

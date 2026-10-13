@@ -206,6 +206,9 @@ class DNSWorkflowTests(TestCase):
         for field in ("dns_nas_host", "dns_nas_user", "dns_nas_port", "dns_published_generation", "dns_content_hash"):
             self.assertNotIn(field, archive["configuration"])
         legacy = copy.deepcopy(archive)
+        legacy["schema_version"] = 1
+        for host in legacy["hosts"]:
+            host.pop("static")
         legacy["configuration"].update(
             dns_nas_host="retired.example.test", dns_nas_user="retired", dns_nas_port=2222,
         )

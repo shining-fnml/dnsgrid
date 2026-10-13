@@ -16,14 +16,15 @@ from .exporters import build_exports, publish_dns_zones
 from .forms import ArchiveUploadForm, ConfigurationForm, HostForm, HostMoveForm
 from .models import Configuration, Host, Site
 from .services import (
-    delete_host, move_host, plan_placement, preview_host_move, save_host, update_settings,
+    delete_host, move_host, preview_host_change, preview_host_delete, preview_host_move,
+    preview_settings_addresses, preview_static_revocation, revoke_host_static, save_host, update_settings,
 )
 
 COLUMNS = (
     "Networking", "Peripherals", "Bare metal", "Virtual servers",
     "Console desktops", "TV desktops", "Laptops", "Phones",
 )
-HOST_FIELDS = ("name", "row", "column", "category", "status", "vpn", "public_export", "mac", "notes")
+HOST_FIELDS = ("name", "row", "column", "category", "status", "vpn", "static", "public_export", "mac", "notes")
 CONFIG_FIELDS = (
     "lan_domain", "vpn_domain", "lan_prefix", "vpn_prefix", "gandi_zone",
     "ttl", "soa_ns", "soa_mailbox",
@@ -108,7 +109,23 @@ def host_edit(request, host_id=None):
     }
     initial.update(revision=config.revision, site=host.site_id if host else 1)
     form = HostForm(request.POST or None, initial=initial)
-    if request.method == "POST" and form.is_valid():
+    if host and request.method == "POST" and request.POST.get("action") == "revoke-static":
+        try:
+            if set(request.POST) - {"csrfmiddlewaretoken", "revision", "action"}:
+                raise ValidationError("Static revocation cannot be combined with edits.")
+            revision = int(request.POST.get("revision", ""))
+            preview_static_revocation(host.pk, revision)
+            return _pending(request, "revoke-static", {"id": host.pk}, revision, [{
+                "label": host.name, "before": "Static: read-only, no DHCP reservation",
+                "after": "Not static: edits and DHCP reservations permitted",
+            }], "Confirm static protection revocation")
+        except (ValidationError, ValueError, IntegrityError, OperationalError) as error:
+            form.is_valid()
+            form.add_error(None, _errors(error))
+    elif host and host.static and request.method == "POST":
+        form.is_valid()
+        form.add_error(None, "Static hosts are read-only. Revoke static protection separately first.")
+    elif request.method == "POST" and form.is_valid():
         data = form.cleaned_data
         payload = {key: data[key] for key in HOST_FIELDS}
         payload.update(site_id=data["site"].pk, id=host_id)
@@ -116,9 +133,7 @@ def host_edit(request, host_id=None):
         try:
             if data["revision"] != config.revision:
                 raise ValidationError("Inventory changed. Reload this form before previewing.")
-            candidate.full_clean(validate_unique=False, validate_constraints=False)
-            candidate.validate_unique(exclude=["row", "column"])
-            shifts = plan_placement(candidate.row, candidate.column, exclude_host_id=host_id)
+            shifts = preview_host_change(candidate, data["revision"])
             changes = []
             if host:
                 changes.append({
@@ -135,17 +150,17 @@ def host_edit(request, host_id=None):
                 before = _address_summary(shifted, config)
                 shifted.row = shift["to_row"]
                 changes.append({"label": shifted.name, "before": before, "after": _address_summary(shifted, config)})
-            for field in ("site", "category", "status", "vpn", "public_export", "mac", "notes"):
+            for field in ("site", "category", "status", "vpn", "static", "public_export", "mac", "notes"):
                 before = str(getattr(host, field)) if host else "—"
                 after = str(getattr(candidate, field))
                 if before != after:
                     changes.append({"label": field, "before": before, "after": after})
             payload.update({key: getattr(candidate, key) for key in HOST_FIELDS})
             return _pending(request, "host", payload, config.revision, changes, "Confirm host and grid changes")
-        except ValidationError as error:
+        except (ValidationError, IntegrityError, OperationalError) as error:
             form.add_error(None, _errors(error))
     moves = []
-    if host:
+    if host and not host.static:
         for direction, label, target in (
             ("up", "Move up", host.x - 1), ("down", "Move down", host.x + 1),
         ):
@@ -153,9 +168,13 @@ def host_edit(request, host_id=None):
                 column=target // 16, row=target % 16,
             ).exists():
                 moves.append({"direction": direction, "label": label, "target": target})
+    if host and host.static:
+        for field in form.fields.values():
+            field.disabled = True
     return render(request, "inventory/form.html", {
         "form": form, "title": "Edit host" if host else "Insert host", "host": host,
         "moves": moves, "revision": config.revision,
+        "addresses": _address_summary(host, config) if host else "",
     })
 
 
@@ -184,6 +203,11 @@ def host_move(request, host_id):
 def host_delete(request, host_id):
     config = Configuration.load()
     host = get_object_or_404(Host, pk=host_id)
+    try:
+        host = preview_host_delete(host.pk, config.revision)
+    except (ValidationError, IntegrityError, OperationalError) as error:
+        messages.error(request, _errors(error))
+        return redirect("host-edit", host_id=host_id)
     return _pending(request, "delete", {"id": host.pk}, config.revision, [{
         "label": host.name, "before": host.lan_address(config),
         "after": "Removed from inventory and exports; other cells are not compacted.",
@@ -227,6 +251,7 @@ def configuration(request):
                 raise ValidationError("Each of the four sites must have a distinct octet.")
             if len({site["name"].strip().lower() for site in site_data}) != 4:
                 raise ValidationError("Each site must have a distinct name.")
+            preview_settings_addresses(candidate, [Site(**data) for data in site_data], data["revision"])
             changes = [{
                 "label": key, "before": getattr(config, key), "after": getattr(candidate, key),
             } for key in CONFIG_FIELDS if getattr(config, key) != getattr(candidate, key)]
@@ -257,7 +282,7 @@ def configuration(request):
                     changes.append({"label": host.name, "before": before, "after": after})
             return _pending(request, "settings", {"config": config_data, "sites": site_data},
                             config.revision, changes, "Confirm global settings")
-        except ValidationError as error:
+        except (ValidationError, IntegrityError, OperationalError) as error:
             form.add_error(None, _errors(error))
     return render(request, "inventory/form.html", {
         "form": form, "title": "Global settings", "settings_page": True,
@@ -320,6 +345,8 @@ def confirm(request):
             move_host(payload["id"], payload["direction"], expected_revision=revision)
         elif pending["kind"] == "delete":
             delete_host(payload["id"], expected_revision=revision)
+        elif pending["kind"] == "revoke-static":
+            revoke_host_static(payload["id"], expected_revision=revision)
         elif pending["kind"] == "settings":
             update_settings(payload["config"], payload["sites"], expected_revision=revision)
         elif pending["kind"] == "dns-baseline":
@@ -376,7 +403,7 @@ def archive_download(request):
     except ValidationError:
         return HttpResponse("Inventory changed. Reload export previews before downloading.", status=409)
     response = HttpResponse(dumps(data), content_type="application/json; charset=utf-8")
-    response["Content-Disposition"] = 'attachment; filename="dnsgrid-archive-v1.json"'
+    response["Content-Disposition"] = 'attachment; filename="dnsgrid-archive-v2.json"'
     return response
 
 
@@ -418,11 +445,16 @@ def archive_upload(request):
 
 @operator
 def exports(request):
+    from .vpn_report import build_vpn_report
+
     with transaction.atomic():
         Configuration.objects.filter(pk=1).update(revision=F("revision"))
-        config = Configuration.load()
-        artifacts = build_exports(config=config)
+        config = Configuration.objects.get(pk=1)
+        hosts = list(Host.objects.select_related("site"))
+        artifacts = build_exports(config=config, hosts=hosts)
+        report = build_vpn_report(config=config, hosts=hosts)
     return render(request, "inventory/exports.html", {
+        "vpn_report": report,
         "artifacts": artifacts, "revision": config.revision,
         "dns_export_directory": config.dns_export_directory,
         "dns_published_generation": config.dns_published_generation,

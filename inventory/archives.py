@@ -12,7 +12,7 @@ from .services import _claim_revision
 from .dns_serial import compare_serial, initial_serial, track_dns_content, validate_serial
 
 FORMAT = "dnsgrid.application-data"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_BYTES = 8 * 1024 * 1024
 MAX_LEDGER = 1024
 MAX_ID = MAX_PORTABLE_ID
@@ -24,12 +24,14 @@ CONFIG_FIELDS = (
 )
 HOST_FIELDS = (
     "id", "name", "site_id", "row", "column", "category", "status",
-    "vpn", "public_export", "mac", "notes",
+    "vpn", "public_export", "mac", "notes", "static",
 )
 SITE_FIELDS = ("id", "name", "g", "dsm_ifname")
 LEDGER_FIELDS = ("id", "zone", "name", "record_type", "values", "ttl")
 WARNINGS = (
     "This replaces all target settings, sites, hosts, and ownership records, not merges them.",
+    "Explicit archive replacement is an exception to static-host protection: outgoing static hosts "
+    "may be replaced or removed. Incoming version 2 static flags are preserved; version 1 hosts default to non-static.",
     "Use a trusted archive for the SAME Gandi domain and VPN control scope only. "
     "The ownership ledger grants the ability to update/delete matching provider records, "
     "including historical records no longer desired by any host.",
@@ -112,20 +114,21 @@ def validate(data):
         _fail("Unknown or missing archive fields.")
     if type(data["format"]) is not str or data["format"] != FORMAT:
         _fail("Unsupported archive format identifier.")
-    if type(data["schema_version"]) is not int or data["schema_version"] != SCHEMA_VERSION:
+    if type(data["schema_version"]) is not int or data["schema_version"] not in (1, SCHEMA_VERSION):
         _fail("Unsupported archive schema version.")
+    legacy = data["schema_version"] == 1
     for field, limit in (("sites", 4), ("hosts", 127), ("gandi_records", MAX_LEDGER)):
         if type(data[field]) is not list or len(data[field]) > limit:
             _fail(f"Invalid or excessive {field} count.")
     raw_config = data["configuration"]
-    if type(raw_config) is dict:
+    if legacy and type(raw_config) is dict:
         # Retired deployment fields are accepted only for archive compatibility.
         raw_config = {
             field: value for field, value in raw_config.items()
             if field not in {"dns_nas_host", "dns_nas_user", "dns_nas_port"}
         }
     new_fields = ("soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns", "soa_serial")
-    if type(raw_config) is dict and set(raw_config) in (
+    if legacy and type(raw_config) is dict and set(raw_config) in (
         set(CONFIG_FIELDS) - set(new_fields),
         set(CONFIG_FIELDS) - (set(new_fields) - {"soa_serial"}),
     ):
@@ -140,7 +143,7 @@ def validate(data):
             "soa_serial": raw_config.get("soa_serial", max(initial_serial(), raw_config["revision"])
                                         if type(raw_config["revision"]) is int else 0),
         }
-    if type(raw_config) is dict and set(raw_config) == set(CONFIG_FIELDS) - {"soa_serial"}:
+    if legacy and type(raw_config) is dict and set(raw_config) == set(CONFIG_FIELDS) - {"soa_serial"}:
         raw_config = {**raw_config, "soa_serial": max(initial_serial(), raw_config["revision"])
                       if type(raw_config["revision"]) is int else 0}
     if type(raw_config) is dict and "soa_serial" in raw_config:
@@ -154,7 +157,7 @@ def validate(data):
     config.clean_for_hosts([])
     sites = []
     for raw in data["sites"]:
-        if type(raw) is dict and set(raw) == {"id", "name", "g"}:
+        if legacy and type(raw) is dict and set(raw) == {"id", "name", "g"}:
             raw = {**raw, "dsm_ifname": ""}
         _object(raw, SITE_FIELDS, integer=("id", "g"))
         site = Site(**raw)
@@ -168,8 +171,12 @@ def validate(data):
     site_map = {site.pk: site for site in sites}
     hosts = []
     for raw in data["hosts"]:
+        fields = tuple(field for field in HOST_FIELDS if field != "static") if legacy else HOST_FIELDS
+        _object(raw, fields, integer=("id", "site_id", "row", "column"),
+                boolean=("vpn", "public_export", "static"))
+        raw = {**raw, "static": False} if legacy else raw
         _object(raw, HOST_FIELDS, integer=("id", "site_id", "row", "column"),
-                boolean=("vpn", "public_export"))
+                boolean=("vpn", "public_export", "static"))
         if raw["site_id"] not in site_map:
             _fail("Host references an unknown site.")
         host = Host(**raw)

@@ -280,6 +280,7 @@ class Host(models.Model):
     category = models.CharField(max_length=80, blank=True, default="")
     status = models.CharField(max_length=14, choices=Status.choices, default=Status.RUNNING)
     vpn = models.BooleanField(default=False)
+    static = models.BooleanField(default=False)
     public_export = models.BooleanField(default=False)
     mac = models.CharField(max_length=17, blank=True, default="")
     notes = models.TextField(

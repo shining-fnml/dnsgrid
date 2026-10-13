@@ -14,7 +14,7 @@ def reservation_payload(config, site, hosts):
     reservations = []
     seen = set()
     for host in sorted(hosts, key=lambda host: (host.x, host.name, host.site_id)):
-        if host.site_id != site.pk:
+        if host.site_id != site.pk or host.static:
             continue
         mac = normalize_mac(host.mac)
         if not mac:
