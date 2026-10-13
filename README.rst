@@ -30,7 +30,7 @@ and must be replaced with deployment values.
    and VPN ``172.28.1.50``.
 2. Enter hosts, their VPN membership, optional MACs, and public-export
    flags. LAN DNS covers all inventory hosts; DHCP reservations require a
-   MAC. Status is descriptive and does not exclude hosts from exports.
+   MAC and exclude static hosts. Status is descriptive and does not exclude hosts from exports.
    Review and confirm changes, including any shifted hosts and addresses.
 3. Review Export previews. Explicit publication validates and installs the
    ``intranet.linuxcondom.net.`` and ``vpn.`` primary zones and generated LAN
@@ -44,8 +44,8 @@ and must be replaced with deployment values.
    uses sudo; the web application does not apply DSM changes.
 4. On the VPN hub, run the web app as an unprivileged service account with
    access to its local BIND zone directory and read access to the existing
-   narrow ``/etc/hosts`` and ``/etc/openvpn/ccd`` report sources. dnsgrid no
-   longer exports ``/etc/hosts``. The VPN report remains read-only; correct
+   ``/etc/openvpn/ccd`` report source. dnsgrid neither inspects nor exports
+   ``/etc/hosts``. The VPN report remains read-only; correct
    discrepancies manually.
 
 The sections below describe confirmations, exports, and deployment details.
@@ -120,6 +120,18 @@ Inventory and confirmations
 * Preview and confirm host changes, deletions, and global settings.
   Diffs show affected addresses and metadata. Inventory revisions
   reject stale forms and stale confirmations; refresh and preview again.
+* ``static`` defaults to false. A static host has a red dot labelled
+  "Static host" in Grid; its detail page remains available. Static hosts
+  cannot be edited, deleted, relocated, quick-moved, or shifted indirectly.
+  An insertion whose contiguous shift chain reaches a static host is
+  rejected as a whole; unrelated placements remain available.
+  Revoke static as a separate preview/confirmation before making any other
+  changes: combining revocation with edits or a move is rejected.
+  Static hosts are omitted from every DHCP reservation payload, even with
+  a MAC, but remain in inventory, eligible DNS forward/reverse records,
+  and the VPN report. Static does not change status or VPN membership.
+  Toggling static advances inventory revision and invalidates previews,
+  but does not advance the DNS serial unless DNS content also changes.
 * ``running``, ``decommissioned``, and ``unconfirmed`` are informational.
   Nothing expires automatically and statuses never enter exports.
 * Occupied grid cells use dark ink by stable site ID: 1 blue, 2 green,
@@ -162,6 +174,11 @@ Each site also has an optional DSM DHCP interface name (for example
 on its DSM server; leaving it blank disables that site's DSM API exports.
 The SOA mailbox is a DNS name such as ``hostmaster.example.tld``, not
 an email address. Defaults derive ``192.168.g.x`` and ``172.28.g.x``.
+Settings changes that would alter a persisted static host's assigned LAN
+IP, or its VPN IP when it is a VPN member, are rejected. Revoke static first
+before changing an affected prefix or site's subnet octet. A non-VPN static
+host does not prevent changes to the VPN prefix. Unrelated settings,
+including site names and DSM interface mappings, remain editable.
 The persisted SOA serial is separate from the optimistic inventory revision.
 All zones share a Unix timestamp in seconds, an unsigned 32-bit integer
 (``0..4294967295``), not a calendar date or ``YYYYMMDDnn`` counter.
@@ -184,7 +201,7 @@ Legacy archives without a serial follow the same rule; restore never regresses
 the destination serial under RFC 1982 (numeric wraparound can still advance).
 Higher legacy values are preserved, not rewritten
 automatically. Archives now include
-``soa_serial`` in JSON v1; older archive shapes remain accepted. Restore may
+``soa_serial`` in JSON v2; supported older v1 archive shapes remain accepted. Restore may
 advance the serial when DNS content differs, independently of its revision.
 
 Exceptional administrator-confirmed baseline lowering
@@ -759,7 +776,7 @@ the preview if inventory changes instead of mixing different revisions.
     payload: ``ifname`` and ``reservationData`` containing ``mac``, ``ip``,
     and ``hostname``. MACs are lowercase colon-separated, IPs are the
     site's LAN addresses, and hostnames are dnsgrid's short host names.
-    Only MAC-bearing hosts in that site are included, in grid address
+    Only nonstatic MAC-bearing hosts in that site are included, in grid address
     order. Invalid nonempty MACs abort export rather than silently omitting
     reservations. The JSON export alone does not apply changes; it is input
     to the local NAS-side utility described below.
@@ -948,36 +965,43 @@ VPN alignment report
 --------------------
 
 dnsgrid is meant to run on the VPN center. The "VPN report" page compares
-dnsgrid's VPN members with that machine's ``/etc/hosts`` and
-``/etc/openvpn/ccd/`` and lists discrepancies. **It is strictly
+dnsgrid's VPN members with that machine's ``/etc/openvpn/ccd/`` and
+lists discrepancies. **It is strictly
 read-only**: it only opens files for reading and lists the directory; it
-never writes, corrects, or deletes ``/etc/hosts``, CCD files, or service
-files and never reloads OpenVPN or resolvers. dnsgrid no longer generates or
-exports a hosts file; keep ``/etc/hosts`` to its existing narrow local use and
-fix report discrepancies manually.
+never writes, corrects, or deletes CCD files or service files and never
+reloads OpenVPN or resolvers. ``/etc/hosts`` is ordinary OS local resolution,
+not an inventory consistency source: dnsgrid does not read, write, or
+export it. Fix report discrepancies manually.
 
 For every host with VPN membership (every status) it checks that:
 
-* ``/etc/hosts`` maps ``name.vpn`` to the computed VPN address exactly
-  once (missing, duplicate, invalid, or different addresses are reported);
 * ``/etc/openvpn/ccd/<name>`` exists, is readable, and contains exactly one
   active ``ifconfig-push <ip> <netmask>`` directive whose IP is the computed
   VPN address. Missing, multiple, or malformed directives (not two IPv4
   arguments) are reported. The netmask/peer is shown but not compared,
   because dnsgrid does not model the OpenVPN topology.
 
-Orphans are also listed: ``*.vpn`` names in ``/etc/hosts`` that are not
-dnsgrid VPN members, and CCD entries that do not match a VPN member's name.
-Only ``*.vpn`` names in ``/etc/hosts`` are in scope; other entries such as
-``localhost`` or LAN names are ignored. OpenVPN's ``DEFAULT`` CCD file is
+Orphan CCD entries that do not match a VPN member's name are also listed.
+OpenVPN's ``DEFAULT`` CCD file is
 ignored. Missing, unreadable, oversized (over 1 MiB), or wrong-type sources
 are reported as not inspected rather than treated as aligned. The report
-checks files only, not connected clients or DNS resolution.
+checks files only, not connected clients or DNS resolution. Inspection is
+bounded to 4,096 directory entries and 8 MiB of total reads per request;
+limit exhaustion is inconclusive. Symlinks and special files are not read.
 
 Paths are deployment settings, never user input: override them with the
-``DNSGRID_VPN_HOSTS_FILE`` and ``DNSGRID_VPN_CCD_DIR`` environment variables
-(defaults ``/etc/hosts`` and ``/etc/openvpn/ccd``). Grant the dnsgrid
-service account read access to them only; do not run dnsgrid as root.
+``DNSGRID_VPN_CCD_DIR`` environment variable (default ``/etc/openvpn/ccd``).
+Grant the dnsgrid service account read access only; do not run dnsgrid as root.
+
+Every Export previews GET repeats the same read-only CCD consistency check
+using the preview's inventory snapshot. A prominent warning links to
+"VPN report" when discrepancies exist and recommends reviewing it before
+exporting. If CCD inspection cannot be completed, a distinct inconclusive
+warning is shown rather than claiming alignment. **Exports remain available**:
+these warnings do not block previews, downloads, or explicit publication.
+The preliminary check makes no DNS/network calls, writes, corrections,
+validation commands, reloads, or revision/serial changes. Normal stale-preview
+checks still apply.
 
 Gandi ownership and synchronization
 ----------------------------------
@@ -1011,7 +1035,7 @@ tests use a fake provider and never contact Gandi.
 Application-data portability
 ----------------------------
 
-Export previews offers ``dnsgrid-archive-v1.json``. Settings includes an
+Export previews offers ``dnsgrid-archive-v2.json``. Settings includes an
 explicit application-archive file upload section and preview button; a
 standalone upload/restore form is also linked from Export previews.
 Only authenticated staff can use them. Downloads are read-only,
@@ -1023,7 +1047,10 @@ and trusted same-scope Gandi ownership.
 The deterministic UTF-8 JSON schema has exactly these top-level keys:
 
 * ``format``: exact string ``"dnsgrid.application-data"``.
-* ``schema_version``: integer ``1``.
+* ``schema_version``: integer ``2``. Supported legacy version ``1`` archives
+  are accepted with every host's ``static`` defaulting to false. Version 2
+  requires an explicit boolean ``static``; strings and integers are rejected,
+  not coerced. Version 1 does not accept a ``static`` field.
 * ``configuration``: ``id`` (always 1), ``lan_domain``, ``vpn_domain``,
   ``lan_prefix``, ``vpn_prefix``, ``gandi_zone``, ``ttl``, ``soa_ns``,
   ``soa_mailbox``, ``soa_refresh``, ``soa_retry``, ``soa_expire``,
@@ -1036,7 +1063,8 @@ The deterministic UTF-8 JSON schema has exactly these top-level keys:
   ``dsm_ifname``. Older v1 archives without ``dsm_ifname`` are accepted
   with an empty mapping; new exports include it.
 * ``hosts``: objects with ``id``, ``name``, ``site_id``, ``row``, ``column``,
-  ``category``, ``status``, ``vpn``, ``public_export``, ``mac``, and ``notes``.
+  ``category``, ``status``, ``vpn``, ``public_export``, ``mac``, ``notes``, and
+  boolean ``static``.
   Every status is included, with IDs and positions preserved.
 * ``gandi_records``: ownership objects with ``id``, ``zone``, ``name``,
   ``record_type`` (``A``), ``values``, and ``ttl``.
@@ -1067,6 +1095,11 @@ they are retained so future sync can safely delete obsolete records.
 Confirmation replaces settings, fixed-site mappings, hosts, and the ledger
 atomically with foreign-key-safe ordering. It preserves destination users
 and the saved token, as well as the destination's ``dns_export_directory``.
+This explicitly acknowledged administrative replacement is not a normal
+host edit: it may replace, relocate, or remove existing static hosts and
+change their assigned IPs. Version 2 preserves the incoming static flags;
+restoring version 1 makes incoming hosts nonstatic. Review that destructive
+replacement carefully and keep an offline backup.
 The resulting revision is
 ``max(destination revision, archive revision) + 1``; serial overflow,
 stale inventory, or changed target ownership rejects the replacement.

@@ -325,6 +325,9 @@ class DNSDeliveryTests(TestCase):
         ):
             self.assertNotIn(field, data["configuration"])
         legacy = copy.deepcopy(data)
+        legacy["schema_version"] = 1
+        for host in legacy["hosts"]:
+            host.pop("static")
         legacy["configuration"].update(dns_nas_host="retired", dns_nas_user="old", dns_nas_port=22)
         self.assertEqual(validate(legacy), data)
         restore(legacy, 1)

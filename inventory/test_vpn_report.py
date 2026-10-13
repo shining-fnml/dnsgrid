@@ -1,4 +1,3 @@
-import builtins
 import os
 import shutil
 import tempfile
@@ -6,233 +5,288 @@ from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.db import connection
 from django.test import TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 
 from .exporters import build_exports
 from .models import Configuration, Host, Site
-from .vpn_report import build_vpn_report, parse_ccd, parse_hosts
+from .vpn_report import build_vpn_report, parse_ccd
 
 
-HOSTS_FILE = """\
-127.0.0.1 localhost
-192.168.1.6 lan lan.intranet.example.tld
-172.28.1.50 alpha.vpn   # aligned
-172.28.2.9 beta.vpn
-172.28.1.4 delta.vpn
-172.28.1.4 delta.vpn
-172.28.1.5 epsilon.vpn
-172.28.9.9 ghost.vpn
-"""
-
-CCD_FILES = {
-    "alpha": "ifconfig-push 172.28.1.50 255.255.0.0\n",
-    "beta": "ifconfig-push 172.28.2.2 255.255.0.0\n",
-    "gamma": "ifconfig-push 172.28.1.3\n",
-    "epsilon": "# ifconfig-push 172.28.1.5 255.255.0.0\npush \"route 10.0.0.0 255.0.0.0\"\n",
-    "lan": "ifconfig-push 172.28.1.6 255.255.0.0\n",
-    "ghost": "ifconfig-push 172.28.9.9 255.255.0.0\n",
-    "DEFAULT": "disable\n",
-}
-
-
-class VpnReportTests(TestCase):
+class VpnReportFixture:
     def setUp(self):
         self.config = Configuration.load()
-        site1, site2 = Site.objects.get(pk=1), Site.objects.get(pk=2)
-        Host.objects.create(name="alpha", site=site1, row=2, column=3, vpn=True)
-        Host.objects.create(name="beta", site=site2, row=1, column=0, vpn=True)
-        Host.objects.create(name="gamma", site=site1, row=3, column=0, vpn=True)
-        Host.objects.create(name="delta", site=site1, row=4, column=0, vpn=True)
-        Host.objects.create(name="epsilon", site=site1, row=5, column=0, vpn=True)
-        Host.objects.create(name="lan", site=site1, row=6, column=0, vpn=False)
-        self.root = Path(tempfile.mkdtemp())
+        self.alpha = Host.objects.create(
+            name="alpha", site=Site.objects.get(pk=1), row=2, column=3, vpn=True,
+        )
+        self.root = Path(tempfile.mkdtemp(dir=Path.cwd(), prefix=".vpn-test-"))
         self.addCleanup(shutil.rmtree, self.root)
-        self.hosts_file = self.root / "hosts"
-        self.hosts_file.write_text(HOSTS_FILE)
         self.ccd = self.root / "ccd"
         self.ccd.mkdir()
-        for name, content in CCD_FILES.items():
-            (self.ccd / name).write_text(content)
-        (self.ccd / "subdir").mkdir()
+        (self.ccd / "alpha").write_text("ifconfig-push 172.28.1.50 255.255.0.0\n")
+        (self.ccd / "DEFAULT").write_text("disable\n")
 
     def report(self, **kwargs):
-        kwargs.setdefault("hosts_file", self.hosts_file)
         kwargs.setdefault("ccd_dir", self.ccd)
         return build_vpn_report(**kwargs)
 
-    def test_parsers_only_consider_vpn_names_and_active_directives(self):
-        entries = parse_hosts(HOSTS_FILE)
-        self.assertNotIn("localhost", entries)
-        self.assertNotIn("lan", entries)
-        self.assertEqual(entries["alpha"], [(3, "172.28.1.50")])
-        self.assertEqual(entries["delta"], [(5, "172.28.1.4"), (6, "172.28.1.4")])
-        self.assertEqual(parse_ccd(CCD_FILES["alpha"]), [["172.28.1.50", "255.255.0.0"]])
-        self.assertEqual(parse_ccd(CCD_FILES["epsilon"]), [])
 
-    def test_mismatches_and_orphans(self):
+class VpnReportTests(VpnReportFixture, TestCase):
+    def test_ccd_parser_ignores_comments_and_other_directives(self):
+        self.assertEqual(parse_ccd(
+            "# ifconfig-push 1.2.3.4 255.255.0.0\n"
+            "; ifconfig-push 1.2.3.4 255.255.0.0\n"
+            'push "route 10.0.0.0 255.0.0.0"\n'
+            "ifconfig-push 172.28.1.50 255.255.0.0\n",
+        ), [["172.28.1.50", "255.255.0.0"]])
+
+    def test_clean_ccd_and_default_ignored(self):
         report = self.report()
-        rows = {row["name"]: row for row in report["rows"]}
-        self.assertEqual(sorted(rows), ["alpha", "beta", "delta", "epsilon", "gamma"])
-        self.assertEqual(rows["alpha"]["issues"], [])
-        self.assertEqual(rows["alpha"]["short_name"], "alpha.vpn")
-        self.assertEqual(rows["alpha"]["ccd_value"], "172.28.1.50 255.255.0.0")
-        self.assertEqual(rows["beta"]["expected"], "172.28.2.1")
-        self.assertEqual(rows["beta"]["issues"], [
-            "Hosts-file line 4 maps to 172.28.2.9, expected 172.28.2.1.",
-            "CCD file beta pushes 172.28.2.2, expected 172.28.2.1.",
-        ])
-        self.assertEqual(rows["gamma"]["issues"], [
-            "gamma.vpn is missing from the hosts file.",
-            "CCD file gamma has a malformed ifconfig-push: '172.28.1.3'.",
-        ])
-        self.assertEqual(rows["delta"]["issues"], [
-            "delta.vpn appears on multiple hosts-file lines (5, 6).",
-            "CCD file delta is missing.",
-        ])
-        self.assertEqual(rows["epsilon"]["issues"], [
-            "CCD file epsilon has no ifconfig-push directive.",
-        ])
-        self.assertEqual(report["hosts_orphans"], [
-            {"name": "ghost.vpn", "lines": "8", "addresses": "172.28.9.9"},
-        ])
+        self.assertEqual(report["status"], "clean")
+        self.assertTrue(report["aligned"])
+        self.assertEqual(report["issue_count"], 0)
+        self.assertEqual(report["ccd_orphans"], [])
+        self.assertEqual(report["rows"][0]["ccd_value"], "172.28.1.50 255.255.0.0")
+
+    def test_ccd_mismatch_missing_invalid_and_duplicate(self):
+        cases = [
+            ("ifconfig-push 172.28.9.9 255.255.0.0\n", "pushes 172.28.9.9, expected 172.28.1.50"),
+            ("ifconfig-push 172.28.1.50\n", "malformed ifconfig-push"),
+            ("ifconfig-push bad 255.255.0.0\n", "malformed ifconfig-push"),
+            ("ifconfig-push 172.28.1.50 bad\n", "malformed ifconfig-push"),
+            ("ifconfig-push 172.28.1.50 255.255.0.0 extra\n", "malformed ifconfig-push"),
+            ("ifconfig-push 172.28.1.50 255.255.0.0\n" * 2, "2 ifconfig-push directives"),
+            ("# disabled\n", "no ifconfig-push directive"),
+        ]
+        for text, issue in cases:
+            with self.subTest(issue=issue):
+                (self.ccd / "alpha").write_text(text)
+                report = self.report()
+                self.assertEqual(report["status"], "issues")
+                self.assertIn(issue, report["rows"][0]["issues"][0])
+        (self.ccd / "alpha").unlink()
+        self.assertEqual(self.report()["rows"][0]["issues"], ["CCD file alpha is missing."])
+
+    def test_orphan_files_and_nonmembers_are_reported(self):
+        Host.objects.create(name="lan", site=Site.objects.get(pk=1), row=1, column=0)
+        (self.ccd / "lan").write_text("ifconfig-push 172.28.1.1 255.255.0.0\n")
+        (self.ccd / "ghost").write_text("")
+        (self.ccd / "subdir").mkdir()
+        report = self.report()
         self.assertEqual(report["ccd_orphans"], [
             {"name": "ghost", "regular_file": True},
             {"name": "lan", "regular_file": True},
             {"name": "subdir", "regular_file": False},
         ])
-        self.assertEqual(report["issue_count"], 11)
-        self.assertFalse(report["aligned"])
+        self.assertEqual(report["issue_count"], 3)
+        self.assertEqual(len(report["rows"]), 1)
 
-    def test_aligned_inventory(self):
-        Host.objects.exclude(name="alpha").delete()
-        self.hosts_file.write_text("127.0.0.1 localhost\n172.28.1.50 alpha.vpn\n")
-        for path in self.ccd.iterdir():
-            if path.name not in ("alpha", "DEFAULT"):
-                shutil.rmtree(path) if path.is_dir() else path.unlink()
-        report = self.report()
-        self.assertTrue(report["aligned"])
-        self.assertEqual(report["issue_count"], 0)
-
-    def test_missing_and_unreadable_sources_are_reported_not_treated_as_aligned(self):
-        report = self.report(hosts_file=self.root / "absent", ccd_dir=self.root / "nope")
-        self.assertEqual([source["error"] for source in report["sources"]], ["missing", "missing"])
-        self.assertEqual(report["issue_count"], 2)
-        self.assertFalse(report["aligned"])
-        for row in report["rows"]:
-            self.assertEqual(row["hosts_value"], "(not checked)")
-            self.assertEqual(row["ccd_value"], "(not checked)")
-            self.assertEqual(row["issues"], [])
-        self.assertEqual(report["hosts_orphans"], [])
-        self.assertEqual(report["ccd_orphans"], [])
-        report = self.report(hosts_file=self.ccd, ccd_dir=self.hosts_file)
-        self.assertEqual(
-            [source["error"] for source in report["sources"]],
-            ["not a regular file", "not a directory"],
-        )
+    def test_source_errors_are_inconclusive_not_clean_or_missing_members(self):
+        for source in (self.root / "absent", self.ccd / "alpha"):
+            with self.subTest(source=source):
+                report = self.report(ccd_dir=source)
+                self.assertEqual(report["status"], "inconclusive")
+                self.assertFalse(report["aligned"])
+                self.assertTrue(report["sources"][0]["error"])
+                self.assertEqual(report["rows"][0]["ccd_value"], "(not checked)")
+                self.assertEqual(report["rows"][0]["issues"], [])
+                self.assertFalse(report["rows"][0]["checked"])
         with patch("inventory.vpn_report.os.scandir", side_effect=PermissionError(13, "Permission denied")):
-            with patch("builtins.open", side_effect=PermissionError(13, "Permission denied")):
-                report = self.report()
-        self.assertEqual(
-            [source["error"] for source in report["sources"]],
-            ["unreadable (Permission denied)", "unreadable (Permission denied)"],
-        )
+            self.assertIn("Permission denied", self.report()["sources"][0]["error"])
+        self.assertEqual(self.report(ccd_dir="bad\x00path")["status"], "inconclusive")
 
-    def test_unreadable_ccd_file_is_reported(self):
-        real_open = builtins.open
+    def test_file_read_failure_and_truncation_are_inconclusive(self):
+        real_open = os.open
 
-        def guarded(path, *args, **kwargs):
-            if Path(path) == self.ccd / "alpha":
+        def denied(path, *args, **kwargs):
+            if path == "alpha":
                 raise PermissionError(13, "Permission denied")
             return real_open(path, *args, **kwargs)
 
-        with patch("builtins.open", side_effect=guarded):
+        with patch("inventory.vpn_report.os.open", side_effect=denied):
             report = self.report()
-        alpha = next(row for row in report["rows"] if row["name"] == "alpha")
-        self.assertEqual(alpha["issues"], ["CCD file alpha is unreadable (Permission denied)."])
+        self.assertEqual(report["status"], "inconclusive")
+        self.assertIn("Permission denied", report["rows"][0]["issues"][0])
+        with patch("inventory.vpn_report.MAX_FILE_BYTES", 8):
+            self.assertEqual(self.report()["status"], "inconclusive")
+        with patch("inventory.vpn_report.MAX_TOTAL_BYTES", 8):
+            self.assertEqual(self.report()["status"], "inconclusive")
+        (self.ccd / "alpha").write_bytes(b"\xff")
+        self.assertEqual(self.report()["status"], "inconclusive")
 
-    def test_report_is_read_only(self):
-        def snapshot():
-            return {
-                str(path): (path.is_dir() or path.read_bytes(), path.stat().st_mtime_ns)
-                for path in sorted(self.root.rglob("*"))
-            }
+    def test_directory_scan_is_bounded(self):
+        with patch("inventory.vpn_report.MAX_DIRECTORY_ENTRIES", 1):
+            report = self.report()
+        self.assertEqual(report["status"], "inconclusive")
+        self.assertIn("more than 1 entries", report["sources"][0]["error"])
+        self.assertEqual(report["ccd_orphans"], [])
 
-        before = snapshot()
-        modes = []
-        real_open = builtins.open
+    def test_symlinks_fifo_and_symlink_directory_are_not_followed(self):
+        (self.ccd / "alpha").unlink()
+        (self.ccd / "alpha").symlink_to(self.root / "absent")
+        self.assertEqual(self.report()["status"], "inconclusive")
+        (self.ccd / "alpha").unlink()
+        os.mkfifo(self.ccd / "alpha")
+        real_open = os.open
 
-        def recording_open(path, mode="r", *args, **kwargs):
-            modes.append(mode)
-            return real_open(path, mode, *args, **kwargs)
+        def no_special_open(path, *args, **kwargs):
+            self.assertNotEqual(path, "alpha")
+            return real_open(path, *args, **kwargs)
 
-        forbidden = AssertionError("write path invoked")
-        with patch("builtins.open", side_effect=recording_open), \
-                patch.object(os, "remove", side_effect=forbidden), \
-                patch.object(os, "unlink", side_effect=forbidden), \
-                patch.object(os, "rename", side_effect=forbidden), \
-                patch.object(os, "replace", side_effect=forbidden), \
-                patch.object(os, "mkdir", side_effect=forbidden), \
-                patch.object(os, "chmod", side_effect=forbidden), \
+        with patch("inventory.vpn_report.os.open", side_effect=no_special_open):
+            self.assertEqual(self.report()["status"], "inconclusive")
+        link = self.root / "link"
+        link.symlink_to(self.ccd, target_is_directory=True)
+        self.assertEqual(self.report(ccd_dir=link)["status"], "inconclusive")
+        self.assertEqual(self.report(ccd_dir=link / "child")["status"], "inconclusive")
+
+    def test_report_only_opens_ccd_read_only_without_database_writes(self):
+        before = (self.ccd / "alpha").read_bytes(), (self.ccd / "alpha").stat().st_mtime_ns
+        real_open = os.open
+        opened = []
+
+        def recording(path, flags, *args, **kwargs):
+            opened.append((path, flags))
+            self.assertFalse(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC))
+            return real_open(path, flags, *args, **kwargs)
+
+        forbidden = AssertionError("write or external command invoked")
+        with CaptureQueriesContext(connection) as queries, \
+                patch("inventory.vpn_report.os.open", side_effect=recording), \
+                patch("subprocess.run", side_effect=forbidden), \
                 patch.object(Path, "write_text", side_effect=forbidden), \
                 patch.object(Path, "write_bytes", side_effect=forbidden):
-            self.report()
-        self.assertTrue(modes)
-        self.assertEqual(set(modes), {"rb"})
-        self.assertEqual(snapshot(), before)
+            for _ in range(2):
+                self.report()
+        self.assertTrue(opened)
+        self.assertFalse(any("hosts" in str(path) for path, _ in opened))
+        self.assertFalse(any(q["sql"].lstrip().upper().startswith(("UPDATE", "INSERT", "DELETE"))
+                             for q in queries))
+        self.assertEqual(before, (
+            (self.ccd / "alpha").read_bytes(), (self.ccd / "alpha").stat().st_mtime_ns,
+        ))
 
-    def test_vpn_zone_export_replaces_hosts_file_export(self):
+    def test_vpn_forward_and_reverse_export_preserved(self):
         exports = build_exports()
         self.assertIn("alpha.vpn. 300 A 172.28.1.50", exports["vpn.zone"])
+        self.assertIn("50.1.28.172.in-addr.arpa. 300 PTR alpha.vpn.", exports["reverse-vpn.zone"])
         self.assertNotIn("vpn.hosts", exports)
 
 
-class VpnReportViewTests(TestCase):
+class VpnReportViewTests(VpnReportFixture, TestCase):
     def setUp(self):
+        super().setUp()
         self.user = get_user_model().objects.create_user(username="operator", is_staff=True)
         self.client.force_login(self.user)
-        Host.objects.create(name="alpha", site=Site.objects.get(pk=1), row=2, column=3, vpn=True)
-        self.root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.root)
-        (self.root / "hosts").write_text("172.28.1.9 alpha.vpn\n172.28.9.9 ghost.vpn\n")
-        (self.root / "ccd").mkdir()
-        (self.root / "ccd" / "ghost").write_text("ifconfig-push 172.28.9.9 255.255.0.0\n")
-        overrides = override_settings(
-            DNSGRID_VPN_HOSTS_FILE=str(self.root / "hosts"),
-            DNSGRID_VPN_CCD_DIR=str(self.root / "ccd"),
-        )
+        overrides = override_settings(DNSGRID_VPN_CCD_DIR=str(self.ccd))
         overrides.enable()
         self.addCleanup(overrides.disable)
 
-    def test_page_reports_issues_read_only(self):
-        revision = Configuration.load().revision
-        response = self.client.get(reverse("vpn-report"))
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "VPN alignment report")
-        self.assertContains(response, "read-only")
-        self.assertContains(response, "Hosts-file line 1 maps to 172.28.1.9, expected 172.28.1.50.")
-        self.assertContains(response, "CCD file alpha is missing.")
-        self.assertContains(response, "ghost.vpn")
-        self.assertContains(response, "<code>ghost</code>", html=True)
-        self.assertNotContains(response, "<form method=\"post\"")
-        self.assertEqual(Configuration.load().revision, revision)
-        self.assertEqual(
-            (self.root / "hosts").read_text(), "172.28.1.9 alpha.vpn\n172.28.9.9 ghost.vpn\n",
-        )
-        self.assertFalse((self.root / "ccd" / "alpha").exists())
+    def test_page_and_export_states_real_link_and_read_only_repeated_gets(self):
+        forbidden = AssertionError("write, validator, or reload invoked")
+        before = Configuration.objects.values().get(pk=1)
+        states = [
+            ("clean", "no discrepancies found"),
+            ("issues", "VPN alignment warning"),
+            ("inconclusive", "VPN alignment check inconclusive"),
+        ]
+        for state, advisory in states:
+            if state == "issues":
+                (self.ccd / "alpha").write_text("ifconfig-push 172.28.9.9 255.255.0.0\n")
+            if state == "inconclusive":
+                (self.ccd / "alpha").unlink()
+                (self.ccd / "alpha").symlink_to(self.root / "absent")
+            with self.subTest(state=state), CaptureQueriesContext(connection) as queries, \
+                    patch("subprocess.run", side_effect=forbidden), \
+                    patch.object(Path, "write_text", side_effect=forbidden), \
+                    patch.object(Path, "write_bytes", side_effect=forbidden):
+                for _ in range(2):
+                    response = self.client.get(reverse("exports"))
+                    self.assertContains(response, advisory)
+                    self.assertContains(response, 'role="status"')
+                    self.assertContains(response, f'href="{reverse("vpn-report")}"')
+                    self.assertEqual(response.context["vpn_report"]["status"], state)
+                    self.assertContains(response, "alpha.vpn. 300 A 172.28.1.50")
+                    self.assertNotContains(response, "/etc/hosts")
+                    self.assertNotContains(response, "Hosts file")
+                    report = self.client.get(reverse("vpn-report"))
+                    self.assertEqual(report.context["report"]["status"], state)
+                    self.assertContains(report, "read-only")
+                    self.assertNotContains(report, "hosts file")
+            for query in queries:
+                statement = query["sql"].lstrip()
+                if statement.upper().startswith(("UPDATE", "INSERT", "DELETE")):
+                    self.assertRegex(
+                        statement,
+                        r'^UPDATE "inventory_configuration" SET "revision" = '
+                        r'"inventory_configuration"\."revision" WHERE '
+                        r'"inventory_configuration"\."id" = 1$',
+                    )
+        self.assertEqual(Configuration.objects.values().get(pk=1), before)
+
+    def test_export_uses_same_materialized_objects_for_report_and_artifacts(self):
+        from .vpn_report import build_vpn_report as real_report
+        from .exporters import build_exports as real_exports
+        snapshots = {}
+
+        def exports(*args, **kwargs):
+            snapshots["exports"] = kwargs
+            return real_exports(*args, **kwargs)
+
+        def report(*args, **kwargs):
+            snapshots["report"] = kwargs
+            return real_report(*args, **kwargs)
+
+        with CaptureQueriesContext(connection) as queries, \
+                patch("inventory.views.build_exports", side_effect=exports), \
+                patch("inventory.vpn_report.build_vpn_report", side_effect=report):
+            response = self.client.get(reverse("exports"))
+            self.assertEqual(response.status_code, 200)
+            self.assertContains(response, "JSON v2")
+            self.assertContains(response, "static protection does not block an archive replacement")
+        self.assertIs(snapshots["exports"]["config"], snapshots["report"]["config"])
+        self.assertIs(snapshots["exports"]["hosts"], snapshots["report"]["hosts"])
+        statements = [query["sql"] for query in queries]
+        lock = next(index for index, sql in enumerate(statements)
+                    if sql.startswith('UPDATE "inventory_configuration"'))
+        config_read = next(index for index, sql in enumerate(statements)
+                           if sql.startswith("SELECT") and '"inventory_configuration"' in sql)
+        hosts_read = next(index for index, sql in enumerate(statements)
+                          if sql.startswith("SELECT") and '"inventory_host"' in sql)
+        self.assertLess(lock, config_read)
+        self.assertLess(config_read, hosts_read)
+
+    def test_warning_is_nonblocking_and_stale_download_still_rejected(self):
+        Configuration.objects.filter(pk=1).update(dns_export_directory=str(self.root))
+        revision = self.config.revision
+        for state in ("clean", "issues", "inconclusive"):
+            if state == "issues":
+                (self.ccd / "alpha").unlink()
+            if state == "inconclusive":
+                shutil.rmtree(self.ccd)
+            response = self.client.get(reverse("exports"))
+            self.assertEqual(response.context["vpn_report"]["status"], state)
+            if state != "clean":
+                self.assertContains(response, "does not block downloads or publication")
+            self.assertContains(response, f'action="{reverse("dns-publish")}"')
+            with patch("subprocess.run", side_effect=AssertionError("unexpected command")):
+                for name in ("vpn.zone", "reverse-vpn.zone", "forward.zone"):
+                    self.assertEqual(self.client.get(
+                        reverse("download", args=[name]), {"revision": revision},
+                    ).status_code, 200)
+                self.assertEqual(self.client.get(
+                    reverse("download", args=["vpn.zone"]), {"revision": revision + 1},
+                ).status_code, 409)
+            with patch("inventory.views.publish_dns_zones", return_value=([], [])) as publish:
+                self.assertEqual(self.client.post(
+                    reverse("dns-publish"), {"revision": revision},
+                ).status_code, 302)
+                publish.assert_called_once_with(str(revision))
 
     def test_post_is_rejected_and_access_requires_operator(self):
         self.assertEqual(self.client.post(reverse("vpn-report")).status_code, 405)
         self.user.is_staff = False
         self.user.save()
         self.assertEqual(self.client.get(reverse("vpn-report")).status_code, 403)
-
-    def test_navigation_and_export_page_link_report_without_hosts_file_download(self):
-        response = self.client.get(reverse("exports"))
-        self.assertContains(response, reverse("vpn-report"))
-        self.assertContains(response, "<code>vpn.</code>", html=True)
-        revision = response.context["revision"]
-        download = self.client.get(
-            reverse("download", args=["vpn.hosts"]) + f"?revision={revision}",
-        )
-        self.assertEqual(download.status_code, 404)

@@ -2,12 +2,20 @@
 {% block content %}
 <h1>Export previews</h1>
 <p>Inventory revision {{ revision }}; DNS SOA serial {{ soa_serial }}. Downloads from this preview are rejected if inventory changes.</p>
+{% if vpn_report.inconclusive %}
+<p role="status" class="warning"><strong>VPN alignment check inconclusive.</strong> Some CCD data could not be inspected; alignment cannot be confirmed. <a href="{% url 'vpn-report' %}">Review the VPN alignment report</a>. This advisory does not block downloads or publication.</p>
+{% elif not vpn_report.aligned %}
+<p role="status" class="warning"><strong>VPN alignment warning: {{ vpn_report.issue_count }} issue{{ vpn_report.issue_count|pluralize }} found.</strong> <a href="{% url 'vpn-report' %}">Review the VPN alignment report</a>. This advisory does not block downloads or publication.</p>
+{% else %}
+<p role="status" class="message">VPN alignment check: no discrepancies found. <a href="{% url 'vpn-report' %}">View the VPN alignment report</a>.</p>
+{% endif %}
 <form method="get" action="{% url 'archive-download' %}">
 <input type="hidden" name="revision" value="{{ revision }}">
-<button>Download complete application-data archive (JSON v1)</button>
+<button>Download complete application-data archive (JSON v2)</button>
 </form>
 <p><a href="{% url 'archive-upload' %}">Preview archive restore</a></p>
 <p>Archives include all hosts, sites, portable nonsecret settings (including SOA and zone NS fields), revision, and trusted Gandi ownership history; not users, sessions, tokens, deployment secrets, the host-specific BIND zone directory, or RNDC deployment paths. Restore preserves the destination's deployment paths. They are portable application data, not byte-for-byte backups. Stop the source Gandi writer before migration.</p>
+<p class="warning">Archive restore explicitly replaces application inventory, including static hosts and their protection flags. Review the replacement preview before confirming; static protection does not block an archive replacement.</p>
 <p>Generated from current inventory, including every status. Files are dedicated dnsgrid-owned artifacts: do not replace user-managed zones or configurations with them. Downloads do not deploy anything.</p>
 <p class="warning">Use these zones only for networks/domains delegated to dnsgrid. Validate with BIND before deployment; review DSM reservations before applying them. DNS caching and existing DHCP leases can delay moves.</p>
 <h2>Write DNS zones to directory</h2>
@@ -22,7 +30,7 @@
 {% else %}
 <p>No BIND zone directory configured; hub-side DNS publication is disabled.</p>
 {% endif %}
-<p>Only explicit publication actions write zones. Previews and downloads never validate, install, or reload. The publisher generates the configured LAN primary zone, <code>vpn.</code> for VPN members, and the corresponding LAN reverse zones. The temporary files are validated using <code>named-checkzone</code> before installation. Files are atomically replaced; the complete set must install and the immutable generation manifest must commit before one general RNDC reload is issued.</p>
+<p>Only explicit publication actions write zones. Previews and downloads never validate, install, or reload. The publisher generates the configured LAN primary zone, <code>vpn.</code> for VPN members, and the corresponding LAN and VPN reverse zones. The temporary files are validated using <code>named-checkzone</code> before installation. Files are atomically replaced; the complete set must install and the immutable generation manifest must commit before one general RNDC reload is issued.</p>
 <p>Existing regular zone files retain read/write permission bits and group ownership; new zones use mode <code>0644</code>. The application owns the newly replaced inode. Symlink destinations are replaced, not followed. If preserving an existing group is unauthorized, publication fails and RNDC is not invoked. A failure during a multi-file install may leave some new files on disk, but no reload is issued; review and repair before retrying.</p>
 <p>Successful RNDC exit confirms only that the local general reload command returned success. It does not confirm that the server loaded every intended record or that any external client can resolve it. No SFTP delivery or NAS receipt is part of DNS publication.</p>
 <p>After all zone writes succeed, an immutable <code>generations/dnsgrid-SERIAL/manifest.json</code> commits checksummed generation copies. Ten committed generations are retained. Partial publication does not commit a new manifest or reload.</p>
@@ -30,12 +38,13 @@
 <p>Zones start with explicit origin and TTL directives and a multiline SOA. A/PTR records have explicit FQDN owners and TTLs, are ordered alphabetically by hostname, and PTR targets are full LAN names. The final record is the zone-apex NS. Settings configures <code>ttl</code>, <code>soa_ns</code>, <code>soa_mailbox</code>, <code>soa_refresh</code>, <code>soa_retry</code>, <code>soa_expire</code>, <code>soa_minimum</code>, and the separate <code>zone_ns</code>. Persisted UTC <code>YYYYMMDDnn</code> serials advance only for DNS content changes or upward manual seeding; counter 99 exhaustion is rejected. Future seeds and clock rollback never lower the serial. Downloads, previews, and unchanged republication do not advance it.</p>
 <h2>DSM DHCP reservations (API)</h2>
 <p>Configure each site's DSM DHCP interface in Settings to generate <code>dsm-reservations-site-ID.json</code>. The JSON contains only <code>ifname</code> and the complete <code>reservationData</code> list for that site.</p>
+<p>Static hosts remain in DNS exports but are omitted from DSM DHCP reservations, even when they have a MAC address.</p>
 <p>For local NAS-side application, manually copy only the JSON export and the repository's <code>synology/dsm_apply.py</code> utility onto the target NAS. Run with <code>sudo python3 /path/to/dsm_apply.py /path/to/dsm-reservations-site-ID.json --backup-dir /path/to/backups</code>. By default it only reads, creates private raw/restorable backups, and shows a diff. Add <code>--apply</code> to confirm interactively or <code>--yes</code> to explicitly authorize writing.</p>
 <p>The utility uses local <code>synowebapi --exec</code>: <code>SYNO.Network.DHCPServer.Reservation.get</code> version 3 to read, then <code>SYNO.Network.DHCPServer.Reservation.set</code> version 2 to write, followed by a verification read. The <code>reservationData</code> argument is the raw JSON array, not the export's wrapper object. It requires Python 3, not Django, a web login, or root access for the web app.</p>
 <p class="warning">Applying replaces the full reservation list for the configured interface, even when empty. Review the diff, target server/interface, and backups; merge unmanaged reservations explicitly before applying. This feature supports IPv4 only and refuses to write if current IPv6 reservations or malformed entries are present. The JSON export alone never applies changes.</p>
 <p>User testing observed DSM updating <code>/etc/dhcpd/dhcpd-&lt;ifname&gt;-static.conf</code>, the main configuration under <code>/etc/dhcpd/</code>, and <code>/etc/dhcpd/dhcpd.info</code> during a write. Do not edit DSM system files or package services. This is reservation-only, not DHCP pools, gateway, DNS, or lease configuration.</p>
 <h2>VPN hosts</h2>
-<p>The private <code>vpn.</code> zone contains VPN members as <code>name.vpn.</code> records. dnsgrid no longer exports an <code>/etc/hosts</code> file. The VPN alignment report remains read-only and compares the existing narrow <code>/etc/hosts</code> use and <code>/etc/openvpn/ccd/</code> files with inventory.</p>
+<p>The private <code>vpn.</code> zone contains VPN members as <code>name.vpn.</code> records, with PTR records in the VPN reverse zone. The <a href="{% url 'vpn-report' %}">VPN alignment report</a> compares only OpenVPN CCD files with inventory and remains read-only.</p>
 <form method="post" action="{% url 'gandi-preview' %}">{% csrf_token %}<button>Fetch Gandi preview / diff</button></form>
 <p>Gandi sync only creates new records or updates/deletes records tracked as owned by this installation. Unmanaged collisions and externally modified owned records block sync.</p>
 {% for filename, content in artifacts.items %}

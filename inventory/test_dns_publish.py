@@ -317,6 +317,9 @@ class DNSPublicationTests(TestCase):
         self.assertEqual(current.rndc, "/usr/bin/rndc")
         self.assertEqual(current.rndc_key, "/etc/bind/rndc.key")
         legacy = copy.deepcopy(data)
+        legacy["schema_version"] = 1
+        for host in legacy["hosts"]:
+            host.pop("static")
         for field in ("soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns"):
             legacy["configuration"].pop(field)
         normalized = validate(legacy)

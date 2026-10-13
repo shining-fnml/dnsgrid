@@ -1,48 +1,79 @@
-"""Read-only VPN alignment report for the VPN center.
-
-Compares dnsgrid's VPN members with the hosts file and the OpenVPN
-client-config directory. This module only opens files for reading and
-lists directories; it never creates, modifies, renames, or deletes files
-and never reloads services. Nothing is auto-corrected.
-"""
+"""Bounded, read-only comparison of VPN inventory with OpenVPN CCD files."""
 
 import ipaddress
 import os
+import stat
 from pathlib import Path
 
 from django.conf import settings
+from django.db import transaction
 
-from .exporters import _inputs
-from .models import VPN_SHORT_SUFFIX
+from .models import Configuration, Host
 
-DEFAULT_HOSTS_FILE = "/etc/hosts"
 DEFAULT_CCD_DIR = "/etc/openvpn/ccd"
-# OpenVPN's fallback client-config file, not a client.
 CCD_DEFAULT_FILE = "DEFAULT"
+MAX_DIRECTORY_ENTRIES = 4096
 MAX_FILE_BYTES = 1024 * 1024
+MAX_TOTAL_BYTES = 8 * MAX_FILE_BYTES
 
 
 def configured_paths():
-    return (
-        Path(getattr(settings, "DNSGRID_VPN_HOSTS_FILE", DEFAULT_HOSTS_FILE)),
-        Path(getattr(settings, "DNSGRID_VPN_CCD_DIR", DEFAULT_CCD_DIR)),
-    )
+    return Path(getattr(settings, "DNSGRID_VPN_CCD_DIR", DEFAULT_CCD_DIR))
 
 
-def _read_text(path):
-    """Return (text, error) for a bounded, read-only text read."""
+def _source_error(error):
+    if isinstance(error, FileNotFoundError):
+        return "missing"
+    if isinstance(error, NotADirectoryError):
+        return "not a directory or contains a symlink"
+    return f"unreadable ({error.strerror or error.__class__.__name__})"
+
+
+def _open_directory(path):
+    """Open each component without following symlinks, including parents."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    descriptor = os.open("/", flags)
     try:
-        with open(path, "rb") as handle:
-            data = handle.read(MAX_FILE_BYTES + 1)
-    except FileNotFoundError:
-        return None, "missing"
-    except IsADirectoryError:
-        return None, "not a regular file"
+        for component in Path(os.path.abspath(path)).parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_text(directory, name, remaining):
+    """Never follow symlinks or block on special files; cap total read bytes."""
+    if Path(name).name != name or name in (".", "..") or "\x00" in name:
+        return None, "has an unsafe filename; not inspected", 0
+    if remaining <= 0:
+        return None, "not inspected: total read limit reached", 0
+    descriptor = None
+    try:
+        if not stat.S_ISREG(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mode):
+            return None, "not a regular file; not inspected", 0
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory,
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None, "not a regular file; not inspected", 0
+        limit = min(MAX_FILE_BYTES + 1, remaining)
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            data = handle.read(limit)
+            if len(data) >= limit:
+                return None, "not inspected: file or total read limit reached", len(data)
+        try:
+            return data.decode("utf-8"), None, len(data)
+        except UnicodeDecodeError:
+            return None, "not valid UTF-8; not inspected", len(data)
     except OSError as error:
-        return None, f"unreadable ({error.strerror or error.__class__.__name__})"
-    if len(data) > MAX_FILE_BYTES:
-        return None, f"larger than {MAX_FILE_BYTES} bytes; not inspected"
-    return data.decode("utf-8", errors="replace"), None
+        return None, _source_error(error), 0
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _valid_ipv4(value):
@@ -52,62 +83,17 @@ def _valid_ipv4(value):
         return None
 
 
-def parse_hosts(text):
-    """Map VPN short names (without ``.vpn``) to [(line, ip)] entries.
-
-    Only names ending in ``.vpn`` are VPN entries; every other name in the
-    hosts file is out of scope and ignored.
-    """
-    suffix = "." + VPN_SHORT_SUFFIX
-    entries = {}
-    for number, line in enumerate(text.splitlines(), start=1):
-        fields = line.split("#", 1)[0].split()
-        if len(fields) < 2:
-            continue
-        address, names = fields[0], fields[1:]
-        for name in names:
-            name = name.lower()
-            if name.endswith(suffix) and len(name) > len(suffix):
-                entries.setdefault(name[: -len(suffix)], []).append((number, address))
-    return entries
-
-
 def parse_ccd(text):
-    """Return the list of ``ifconfig-push`` argument lists in a CCD file."""
+    """Return active ``ifconfig-push`` argument lists."""
     pushes = []
     for line in text.splitlines():
         fields = line.strip().split()
-        if not fields or fields[0].startswith(("#", ";")):
-            continue
-        if fields[0] == "ifconfig-push":
+        if fields and fields[0] == "ifconfig-push":
             pushes.append(fields[1:])
     return pushes
 
 
-def _check_hosts(name, expected, hosts_entries):
-    found = hosts_entries.get(name, [])
-    if not found:
-        return "", [f"{name}.{VPN_SHORT_SUFFIX} is missing from the hosts file."]
-    addresses = sorted({address for _, address in found})
-    shown = ", ".join(addresses)
-    issues = []
-    if len(found) > 1:
-        lines = ", ".join(str(number) for number, _ in found)
-        issues.append(f"{name}.{VPN_SHORT_SUFFIX} appears on multiple hosts-file lines ({lines}).")
-    for number, address in found:
-        if not _valid_ipv4(address):
-            issues.append(f"Hosts-file line {number} has an invalid IPv4 address {address!r}.")
-        elif address != expected:
-            issues.append(f"Hosts-file line {number} maps to {address}, expected {expected}.")
-    return shown, issues
-
-
-def _check_ccd(name, expected, ccd_dir):
-    text, error = _read_text(ccd_dir / name)
-    if error == "missing":
-        return "", [f"CCD file {name} is missing."]
-    if error:
-        return "", [f"CCD file {name} is {error}."]
+def _check_ccd(name, expected, text):
     pushes = parse_ccd(text)
     if not pushes:
         return "", [f"CCD file {name} has no ifconfig-push directive."]
@@ -122,73 +108,70 @@ def _check_ccd(name, expected, ccd_dir):
     return shown, []
 
 
-def build_vpn_report(config=None, hosts=None, hosts_file=None, ccd_dir=None):
-    default_hosts_file, default_ccd_dir = configured_paths()
-    hosts_file = Path(hosts_file) if hosts_file is not None else default_hosts_file
-    ccd_dir = Path(ccd_dir) if ccd_dir is not None else default_ccd_dir
-    config, hosts = _inputs(config, hosts)
-    members = [host for host in hosts if host.vpn]
+@transaction.atomic
+def build_vpn_report(config=None, hosts=None, ccd_dir=None):
+    config = config if config is not None else Configuration.objects.get(pk=1)
+    hosts = list(hosts if hosts is not None else Host.objects.select_related("site"))
+    members = sorted((host for host in hosts if host.vpn), key=lambda host: host.name)
     expected = {host.name: host.vpn_address(config) for host in members}
-
-    sources = []
-    hosts_text, hosts_error = _read_text(hosts_file)
-    hosts_entries = parse_hosts(hosts_text) if hosts_error is None else {}
-    sources.append({"label": "Hosts file", "path": str(hosts_file), "error": hosts_error})
-
-    ccd_files, ccd_error = [], None
+    ccd_dir = Path(ccd_dir) if ccd_dir is not None else configured_paths()
+    files, directory_error, descriptor = {}, None, None
+    rows, remaining, inspection_errors = [], MAX_TOTAL_BYTES, 0
     try:
-        with os.scandir(ccd_dir) as listing:
-            ccd_files = sorted(
-                (entry.name, entry.is_file()) for entry in listing
-                if entry.name != CCD_DEFAULT_FILE
-            )
-    except FileNotFoundError:
-        ccd_error = "missing"
-    except NotADirectoryError:
-        ccd_error = "not a directory"
-    except OSError as error:
-        ccd_error = f"unreadable ({error.strerror or error.__class__.__name__})"
-    sources.append({"label": "OpenVPN CCD directory", "path": str(ccd_dir), "error": ccd_error})
+        try:
+            descriptor = _open_directory(ccd_dir)
+            with os.scandir(descriptor) as listing:
+                for index, entry in enumerate(listing):
+                    if index >= MAX_DIRECTORY_ENTRIES:
+                        directory_error = f"more than {MAX_DIRECTORY_ENTRIES} entries; not inspected"
+                        break
+                    if entry.name != CCD_DEFAULT_FILE:
+                        files[entry.name] = entry.is_file(follow_symlinks=False)
+        except OSError as error:
+            directory_error = _source_error(error)
+        except ValueError:
+            directory_error = "invalid directory path; not inspected"
+        if directory_error:
+            files = {}
 
-    rows = []
-    for host in members:
-        name, address = host.name, expected[host.name]
-        row = {
-            "name": name, "short_name": host.vpn_short_name, "expected": address,
-            "hosts_value": "", "ccd_value": "", "issues": [],
-        }
-        if hosts_error is None:
-            row["hosts_value"], issues = _check_hosts(name, address, hosts_entries)
-            row["issues"].extend(issues)
-        else:
-            row["hosts_value"] = "(not checked)"
-        if ccd_error is None:
-            row["ccd_value"], issues = _check_ccd(name, address, ccd_dir)
-            row["issues"].extend(issues)
-        else:
-            row["ccd_value"] = "(not checked)"
-        rows.append(row)
+        for host in members:
+            name = host.name
+            row = {
+                "name": name, "short_name": host.vpn_short_name,
+                "expected": expected[name], "ccd_value": "", "issues": [],
+                "checked": directory_error is None,
+            }
+            if directory_error:
+                row["ccd_value"] = "(not checked)"
+            elif name not in files:
+                row["issues"] = [f"CCD file {name} is missing."]
+            else:
+                text, error, used = _read_text(descriptor, name, remaining)
+                remaining -= used
+                if error:
+                    row["checked"] = False
+                    row["ccd_value"] = "(not checked)"
+                    row["issues"] = [f"CCD file {name} is {error}."]
+                    inspection_errors += 1
+                else:
+                    row["ccd_value"], row["issues"] = _check_ccd(name, expected[name], text)
+            rows.append(row)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
-    hosts_orphans = [
-        {
-            "name": f"{name}.{VPN_SHORT_SUFFIX}",
-            "lines": ", ".join(str(number) for number, _ in entries),
-            "addresses": ", ".join(sorted({address for _, address in entries})),
-        }
-        for name, entries in sorted(hosts_entries.items()) if name not in expected
-    ]
-    ccd_orphans = [
+    orphans = [
         {"name": name, "regular_file": regular}
-        for name, regular in ccd_files if name not in expected
+        for name, regular in sorted(files.items()) if name not in expected
     ]
-    issue_count = sum(len(row["issues"]) for row in rows) + len(hosts_orphans) + len(ccd_orphans)
-    issue_count += sum(1 for source in sources if source["error"])
+    issue_count = sum(len(row["issues"]) for row in rows) + len(orphans)
+    issue_count += bool(directory_error)
+    inconclusive = bool(directory_error or inspection_errors)
     return {
         "revision": config.revision,
-        "sources": sources,
-        "rows": rows,
-        "hosts_orphans": hosts_orphans,
-        "ccd_orphans": ccd_orphans,
-        "issue_count": issue_count,
-        "aligned": issue_count == 0,
+        "sources": [{"label": "OpenVPN CCD directory", "path": str(ccd_dir), "error": directory_error}],
+        "rows": rows, "ccd_orphans": orphans, "issue_count": issue_count,
+        "inconclusive": inconclusive,
+        "status": "inconclusive" if inconclusive else ("issues" if issue_count else "clean"),
+        "aligned": issue_count == 0 and not inconclusive,
     }

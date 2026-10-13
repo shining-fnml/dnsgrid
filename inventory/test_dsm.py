@@ -145,6 +145,9 @@ class DSMReservationTests(TestCase):
         restore(data, self.config.revision)
         self.assertEqual(Site.objects.get(pk=1).dsm_ifname, "ovs_eth0")
         legacy = copy.deepcopy(data)
+        legacy["schema_version"] = 1
+        for host in legacy["hosts"]:
+            host.pop("static")
         for site in legacy["sites"]:
             site.pop("dsm_ifname")
         restored = loads(dumps(legacy).encode())

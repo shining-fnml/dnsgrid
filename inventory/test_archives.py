@@ -75,7 +75,7 @@ class ArchiveDataTests(TestCase):
 
     def test_schema_and_exact_fields_reject_unknowns_and_missing_values(self):
         mutations = [
-            lambda data: data.update(schema_version=2),
+            lambda data: data.update(schema_version=3),
             lambda data: data.update(schema_version=True),
             lambda data: data.update(users=[]),
             lambda data: data.pop("sites"),
@@ -490,7 +490,7 @@ class ArchiveViewTests(TestCase):
         response = self.client.get(url, {"revision": 1})
         self.assertEqual(response.status_code, 200)
         self.assertIn("no-store", response["Cache-Control"])
-        self.assertIn("dnsgrid-archive-v1.json", response["Content-Disposition"])
+        self.assertIn("dnsgrid-archive-v2.json", response["Content-Disposition"])
         self.assertEqual(json.loads(response.content), snapshot())
         self.assertNotIn(b"keep-secret", response.content)
         self.assertEqual(self.client.get(url, {"revision": 1}).content, response.content)
@@ -499,7 +499,7 @@ class ArchiveViewTests(TestCase):
         response = self.client.get(reverse("exports"))
         self.assertContains(response, f'<form method="get" action="{reverse("archive-download")}">')
         self.assertContains(response, '<input type="hidden" name="revision" value="1">', html=True)
-        self.assertContains(response, "<button>Download complete application-data archive (JSON v1)</button>", html=True)
+        self.assertContains(response, "<button>Download complete application-data archive (JSON v2)</button>", html=True)
         self.assertContains(response, reverse("archive-upload"))
         self.assertContains(self.client.get(reverse("configuration")), reverse("archive-upload"))
 

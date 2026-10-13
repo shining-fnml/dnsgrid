@@ -244,7 +244,7 @@ class OperatorViewsTests(TestCase):
         other.refresh_from_db()
         self.assertEqual(other.row, 2)
 
-    def test_concurrent_move_during_deletion_preview_blocks_confirmation(self):
+    def test_concurrent_move_during_deletion_preview_blocks_stale_preview(self):
         from .views import get_object_or_404
         host = self.create_host()
 
@@ -257,10 +257,9 @@ class OperatorViewsTests(TestCase):
 
         with patch("inventory.views.get_object_or_404", side_effect=move_after_read):
             response = self.client.post(reverse("host-delete", args=[host.pk]))
-        self.assertContains(response, "192.168.1.1")
-        response = self.client.post(reverse("confirm"), {
-            "nonce": self.client.session["pending"]["nonce"],
-        }, follow=True)
+        self.assertEqual(response.status_code, 302)
+        self.assertNotIn("pending", self.client.session)
+        response = self.client.get(response.url)
         self.assertContains(response, "Stale")
         host.refresh_from_db()
         self.assertEqual(host.site_id, 2)

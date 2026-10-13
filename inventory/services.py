@@ -39,6 +39,8 @@ def plan_placement(row, column, exclude_host_id=None):
         if row == 15:
             raise ValidationError("There is no free position below this host in the column.")
         host = occupants[row]
+        if host.static:
+            raise ValidationError(f"Static host {host.name} cannot be shifted. Revoke static protection first.")
         shifts.append({
             "id": host.pk,
             "name": host.name,
@@ -72,6 +74,64 @@ def _host_values(host):
     )
 
 
+def validate_host_change(host, existing):
+    if existing and existing.static and _host_values(existing) != _host_values(host):
+        raise ValidationError("Static hosts are read-only. Revoke static protection as a separate operation first.")
+
+
+def protect_static_addresses(current, candidate, sites):
+    site_map = {site.pk: site for site in sites}
+    for host in Host.objects.filter(static=True).select_related("site"):
+        moved = copy.copy(host)
+        moved.site = site_map[host.site_id]
+        if host.lan_address(current) != moved.lan_address(candidate) or (
+            host.vpn and host.vpn_address(current) != moved.vpn_address(candidate)
+        ):
+            raise ValidationError(f"Settings would change the IP address of static host {host.name}. Revoke static protection first.")
+
+
+def preview_settings_addresses(candidate, sites, expected_revision):
+    with transaction.atomic():
+        _claim_revision(expected_revision, changed=False)
+        protect_static_addresses(Configuration.load(), candidate, sites)
+
+
+def preview_static_revocation(host_id, expected_revision):
+    with transaction.atomic():
+        _claim_revision(expected_revision, changed=False)
+        host = Host.objects.filter(pk=host_id).first()
+        if host is None or not host.static:
+            raise ValidationError("This host is no longer static. Generate a fresh preview.")
+        return host
+
+
+def revoke_host_static(host_id, expected_revision):
+    with transaction.atomic():
+        _claim_revision(expected_revision, changed=False)
+        try:
+            host = Host.objects.get(pk=host_id)
+        except Host.DoesNotExist as error:
+            raise ValidationError("This host no longer exists.") from error
+        if not host.static:
+            raise ValidationError("This host is no longer static. Generate a fresh preview.")
+        _claim_revision(expected_revision)
+        Host.objects.filter(pk=host_id).update(static=False)
+        host.static = False
+        return host
+
+
+def preview_host_change(host, expected_revision):
+    with transaction.atomic():
+        _claim_revision(expected_revision, changed=False)
+        existing = Host.objects.filter(pk=host.pk).first() if host.pk else None
+        if host.pk and existing is None:
+            raise ValidationError("This host no longer exists.")
+        host.full_clean(validate_unique=False, validate_constraints=False)
+        host.validate_unique(exclude=["row", "column"])
+        validate_host_change(host, existing)
+        return plan_placement(host.row, host.column, exclude_host_id=host.pk)
+
+
 def save_host(host, expected_revision):
     original_pk = host.pk
     try:
@@ -83,6 +143,7 @@ def save_host(host, expected_revision):
             existing = Host.objects.filter(pk=host.pk).first() if host.pk else None
             if host.pk and existing is None:
                 raise ValidationError("This host no longer exists.")
+            validate_host_change(host, existing)
             changed = existing is None or _host_values(existing) != _host_values(host)
             if not changed:
                 return host
@@ -112,9 +173,22 @@ def delete_host(host_id, expected_revision):
             host = Host.objects.get(pk=host_id)
         except Host.DoesNotExist as error:
             raise ValidationError("This host no longer exists.") from error
+        if host.static:
+            raise ValidationError("Static hosts cannot be deleted. Revoke static protection first.")
         _claim_revision(expected_revision)
         host.delete()
         track_dns_content(Configuration.load())
+
+
+def preview_host_delete(host_id, expected_revision):
+    with transaction.atomic():
+        _claim_revision(expected_revision, changed=False)
+        host = Host.objects.filter(pk=host_id).select_related("site").first()
+        if host is None:
+            raise ValidationError("This host no longer exists.")
+        if host.static:
+            raise ValidationError("Static hosts cannot be deleted. Revoke static protection first.")
+        return host
 
 
 def _plan_host_move(host_id, direction):
@@ -124,6 +198,8 @@ def _plan_host_move(host_id, direction):
         host = Host.objects.select_related("site").get(pk=host_id)
     except Host.DoesNotExist as error:
         raise ValidationError("This host no longer exists.") from error
+    if host.static:
+        raise ValidationError("Static hosts cannot be moved. Revoke static protection first.")
     target = host.x + (-1 if direction == "up" else 1)
     column, row = divmod(target, 16)
     _validate_position(row, column)
@@ -208,6 +284,7 @@ def update_settings(config_data, site_data, expected_revision):
                 raise ValidationError("Site names must be unique.")
             if len({site.g for site in sites}) != 4:
                 raise ValidationError("Site octets must be unique.")
+            protect_static_addresses(current, candidate, sites)
             changed = serial != current.soa_serial or any(
                 getattr(candidate, field) != getattr(current, field) for field in CONFIG_FIELDS
             ) or any(

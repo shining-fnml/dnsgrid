@@ -6,11 +6,23 @@
 {% for warning in warnings %}<p class="warning">{{ warning }}</p>{% endfor %}
 {% elif settings_page %}
 <p>These settings affect every export. Site mappings must remain distinct. Saved Gandi token: {% if token_saved %}yes{% else %}no{% endif %}; the token is never displayed.</p>
+<p>Settings cannot change a static host's assigned LAN IP. VPN addresses are protected only for VPN members. Revoke static protection separately first. Non-VPN static hosts do not block VPN-prefix changes, and unrelated settings remain editable.</p>
 <p><a href="{% url 'archive-upload' %}">Preview application archive restore</a> · <a href="{% url 'exports' %}">Download application archive from Export previews</a></p>
 {% else %}
 <p>Status is informational only. Decommissioned hosts remain in all eligible exports until manually deleted.</p>
 {% endif %}
+{% if host.static %}
+<p class="warning">Static host: this entry is read-only and excluded from DHCP reservations. DNS remains included. Revoke static protection separately before editing, moving, or deleting.</p>
+<pre>{{ addresses }}</pre>
+<div class="editor">{{ form.as_p }}</div>
+<form method="post">{% csrf_token %}
+<input type="hidden" name="revision" value="{{ revision }}">
+<input type="hidden" name="action" value="revoke-static">
+<button class="danger">Preview static protection revocation</button>
+</form>
+{% else %}
 <form method="post" enctype="multipart/form-data" class="editor">{% csrf_token %}{{ form.as_p }}<button>Preview changes</button></form>
+{% endif %}
 <form method="post" action="{% url 'cancel' %}">{% csrf_token %}<button>Cancel</button></form>
 {% if settings_page %}
 {% if request.user.is_superuser %}
@@ -34,7 +46,7 @@
 </form>
 </section>
 {% endif %}
-{% if host %}
+{% if host and not host.static %}
 <p>Quick moves act on the saved entry, not unsaved edits. They change x by exactly 1, including across column boundaries (15 ↔ 16), only into a free cell in 1–127. No other hosts move.</p>
 {% for move in moves %}
 <form method="post" action="{% url 'host-move' host.pk %}">{% csrf_token %}
