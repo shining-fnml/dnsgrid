@@ -38,13 +38,15 @@ ENVELOPE_KEYS = {
 }
 STATE_KEYS = {
     "schema_version", "site_id", "ifname", "subnet", "fetched", "applied",
-    "inflight", "pending", "blocked",
+    "inflight", "baseline", "pending", "last_report", "blocked",
 }
 DIAGNOSTICS = {
     "invalid_response", "destructive_not_authorized", "dsm_drift",
     "dsm_failed", "verification_failed", "baseline_changed",
     "recovery_required",
+    "mapping_mismatch",
 }
+NEW_REPORT = object()
 
 
 class SafeError(Exception):
@@ -80,7 +82,7 @@ def validate_envelope(value, config):
     require(isinstance(value, dict) and set(value) == ENVELOPE_KEYS)
     require(type(value["schema_version"]) is int and value["schema_version"] == 1)
     require(type(value["site_id"]) is int and value["site_id"] == config["site_id"])
-    require(value["subnet"] == config["subnet"])
+    require(isinstance(value["subnet"], str))
     require(isinstance(value["version"], str) and
             re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value["version"]))
     require(isinstance(value["sha256"], str) and
@@ -92,15 +94,17 @@ def validate_envelope(value, config):
     try:
         require(datetime.fromisoformat(published.replace("Z", "+00:00")).tzinfo is not None)
         payload = dsm_apply.validate_payload(value["payload"])
-        require(payload["ifname"] == config["ifname"])
         require(len(payload["reservationData"]) <= MAX_RESERVATIONS)
-        network = ipaddress.IPv4Network(config["subnet"])
+        network = ipaddress.IPv4Network(value["subnet"], strict=True)
+        require(str(network) == value["subnet"] and network.prefixlen == 24)
         for item in payload["reservationData"]:
             address = ipaddress.IPv4Address(item["ip"])
             require(address in network and address not in (network.network_address, network.broadcast_address))
     except (ValueError, TypeError):
         raise SafeError("invalid_response") from None
     require(digest(value["payload"]) == value["sha256"])
+    require(payload["ifname"] == config["ifname"] and value["subnet"] == config["subnet"],
+            "mapping_mismatch")
     return value
 
 
@@ -185,7 +189,11 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 class Transport:
     def __init__(self, config):
         self.config = config
-        context = ssl.create_default_context(cafile=config.get("ca_file") or None)
+        if config.get("ca_file"):
+            ca_data = read_private(config["ca_file"], MAX_BODY).decode("ascii")
+            context = ssl.create_default_context(cadata=ca_data)
+        else:
+            context = ssl.create_default_context()
         self.opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context), NoRedirect(),
         )
@@ -233,43 +241,90 @@ class Transport:
 def empty_state(config):
     return dict(schema_version=1, site_id=config["site_id"], ifname=config["ifname"],
                 subnet=config["subnet"], fetched=None, applied=None, inflight=None,
-                pending=None, blocked=False)
+                baseline=None, pending=None, last_report=None, blocked=False)
 
 
-def acknowledgement(envelope, status, diagnostic=None):
+def acknowledgement(envelope, status, diagnostic=None, *, report_id=NEW_REPORT):
     result = dict(schema_version=1, version=envelope["version"], sha256=envelope["sha256"], status=status)
+    if report_id is NEW_REPORT:
+        report_id = str(uuid.uuid4())
+    if report_id is not None:
+        result["report_id"] = report_id
     if diagnostic:
         require(diagnostic in DIAGNOSTICS, "invalid_state")
         result["diagnostic"] = diagnostic
     return result
 
 
+def queue_ack(state, envelope, status, diagnostic=None):
+    expected = acknowledgement(envelope, status, diagnostic, report_id=None)
+    pending = state["pending"]
+    if pending is not None and {key: value for key, value in pending.items() if key != "report_id"} == expected:
+        return
+    state["pending"] = acknowledgement(envelope, status, diagnostic)
+
+
 def validate_state(state, config):
+    if isinstance(state, dict) and set(state) == STATE_KEYS - {"last_report"}:
+        state["last_report"] = None
     require(isinstance(state, dict) and set(state) == STATE_KEYS, "invalid_state")
     initial = empty_state(config)
     for key in ("schema_version", "site_id", "ifname", "subnet"):
         require(type(state[key]) is type(initial[key]) and state[key] == initial[key], "invalid_state")
     require(type(state["blocked"]) is bool, "invalid_state")
+    last = state["last_report"]
+    if last is not None:
+        require(isinstance(last, dict) and set(last) == {"version", "sha256", "status"}, "invalid_state")
+        require(isinstance(last["version"], str) and
+                re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", last["version"]), "invalid_state")
+        require(isinstance(last["sha256"], str) and
+                re.fullmatch(r"[0-9a-f]{64}", last["sha256"]), "invalid_state")
+        require(last["status"] in {"applied", "failed", "rejected"}, "invalid_state")
     for key in ("fetched", "applied", "inflight"):
         if state[key] is not None:
             validate_envelope(state[key], config)
+    require((state["inflight"] is None) == (state["baseline"] is None), "invalid_state")
+    if state["baseline"] is not None:
+        baseline = dsm_apply.validate_payload(state["baseline"])
+        require(baseline["ifname"] == config["ifname"] and
+                len(baseline["reservationData"]) <= MAX_RESERVATIONS, "invalid_state")
     pending = state["pending"]
     if pending is not None:
         require(isinstance(pending, dict) and set(pending) in (
             {"schema_version", "version", "sha256", "status"},
             {"schema_version", "version", "sha256", "status", "diagnostic"},
+            {"schema_version", "version", "sha256", "status", "report_id"},
+            {"schema_version", "version", "sha256", "status", "diagnostic", "report_id"},
         ), "invalid_state")
+        report_id = pending.get("report_id")
+        if "report_id" in pending:
+            require(isinstance(report_id, str) and len(report_id) == 36, "invalid_state")
+            try:
+                identifier = uuid.UUID(report_id)
+                require(identifier.int != 0 and str(identifier) == report_id, "invalid_state")
+            except ValueError:
+                raise SafeError("invalid_state") from None
+        require(type(pending["schema_version"]) is int and pending["schema_version"] == 1,
+                "invalid_state")
+        require(isinstance(pending["version"], str) and
+                re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", pending["version"]), "invalid_state")
+        require(isinstance(pending["sha256"], str) and
+                re.fullmatch(r"[0-9a-f]{64}", pending["sha256"]), "invalid_state")
         require(pending["status"] in {"applied", "failed", "rejected"}, "invalid_state")
         if "diagnostic" in pending:
             require(pending["diagnostic"] in DIAGNOSTICS, "invalid_state")
         matches = [state[key] for key in ("fetched", "applied", "inflight")
                    if state[key] is not None and state[key]["version"] == pending["version"] and
                    state[key]["sha256"] == pending["sha256"]]
-        require(matches and pending == acknowledgement(matches[0], pending["status"], pending.get("diagnostic")),
+        minimal_rejection = pending["status"] == "rejected" and pending.get("diagnostic") == "mapping_mismatch"
+        require(minimal_rejection or
+                (matches and pending == acknowledgement(
+                    matches[0], pending["status"], pending.get("diagnostic"), report_id=report_id,
+                )),
                 "invalid_state")
         if pending["status"] == "applied":
             require(state["applied"] is not None and
-                    pending == acknowledgement(state["applied"], "applied"), "invalid_state")
+                    pending == acknowledgement(state["applied"], "applied", report_id=report_id), "invalid_state")
     return state
 
 
@@ -431,9 +486,14 @@ def report(transport, store, state):
     if state["pending"] is None:
         return True
     try:
-        transport.request("POST", "results", state["pending"])
+        status, _, body = transport.request("POST", "results", state["pending"])
+        require(status == 200, "invalid_ack")
+        receipt = parse_json(body)
+        require(isinstance(receipt, dict) and set(receipt) == {"status"} and
+                receipt["status"] == state["pending"]["status"], "invalid_ack")
     except SafeError:
         return False
+    state["last_report"] = {key: state["pending"][key] for key in ("version", "sha256", "status")}
     state["pending"] = None
     store.save(state)
     return True
@@ -441,7 +501,7 @@ def report(transport, store, state):
 
 def reject(transport, store, state, envelope, code):
     state["fetched"] = envelope
-    state["pending"] = acknowledgement(envelope, "rejected", code)
+    queue_ack(state, envelope, "rejected", code)
     store.save(state)
     report(transport, store, state)
     return 2
@@ -458,13 +518,23 @@ def run(config, reconcile=False):
             require(received_tag is None or received_tag == conditional)
             envelope = state["applied"]
         else:
-            envelope = validate_envelope(parse_json(body), config)
+            raw = parse_json(body)
+            try:
+                envelope = validate_envelope(raw, config)
+            except SafeError as error:
+                if error.code != "mapping_mismatch":
+                    raise
+                require(received_tag is None or received_tag == etag(raw))
+                queue_ack(state, raw, "rejected", "mapping_mismatch")
+                store.save(state)
+                report(transport, store, state)
+                return 2
             require(received_tag is None or received_tag == etag(envelope))
         try:
             response, live = read_live(config)
         except (ValueError, OSError, subprocess.SubprocessError, SafeError):
             state["fetched"] = envelope
-            state["pending"] = acknowledgement(envelope, "failed", "dsm_failed")
+            queue_ack(state, envelope, "failed", "dsm_failed")
             store.save(state)
             report(transport, store, state)
             return 1
@@ -472,17 +542,20 @@ def run(config, reconcile=False):
             attempt = state["inflight"]
             if equal(live, attempt["payload"]):
                 state["applied"] = attempt
-                state["pending"] = acknowledgement(attempt, "applied")
+                queue_ack(state, attempt, "applied")
+                state["blocked"] = False
+            elif equal(live, state["baseline"]):
                 state["blocked"] = False
             else:
                 state["blocked"] = True
                 state["fetched"] = attempt
-                state["pending"] = acknowledgement(attempt, "failed", "recovery_required")
+                queue_ack(state, attempt, "failed", "recovery_required")
             state["inflight"] = None
+            state["baseline"] = None
             store.save(state)
         drift = state["applied"] is not None and not equal(live, state["applied"]["payload"])
         if drift and state["pending"] is not None and state["pending"]["status"] == "applied":
-            state["pending"] = acknowledgement(state["applied"], "rejected", "dsm_drift")
+            queue_ack(state, state["applied"], "rejected", "dsm_drift")
             store.save(state)
         if (drift or state["blocked"]) and not reconcile:
             # Preserve an undelivered report, but never claim applied after drift.
@@ -504,11 +577,12 @@ def run(config, reconcile=False):
         if (new_count == 0 or new_count * 2 < baseline) and not envelope["destructive_authorized"]:
             return reject(transport, store, state, envelope, "destructive_not_authorized")
         if equal(live, desired):
-            if state["applied"] == envelope and not state["blocked"]:
+            delivered = {"version": envelope["version"], "sha256": envelope["sha256"], "status": "applied"}
+            if state["applied"] == envelope and not state["blocked"] and state["last_report"] == delivered:
                 return 0
             state["applied"] = envelope
             state["blocked"] = False
-            state["pending"] = acknowledgement(envelope, "applied")
+            queue_ack(state, envelope, "applied")
             store.save(state)
             return 0 if report(transport, store, state) else 1
         try:
@@ -517,6 +591,7 @@ def run(config, reconcile=False):
             if not equal(live, latest):
                 return reject(transport, store, state, envelope, "baseline_changed")
             state["inflight"] = envelope
+            state["baseline"] = live
             store.save(state)
         except (ValueError, OSError, subprocess.SubprocessError):
             # No DSM write occurred. Never acknowledge an undurable attempt.
@@ -528,14 +603,15 @@ def run(config, reconcile=False):
             _, verified = read_live(config)
             require(equal(verified, desired), diagnostic)
         except (ValueError, OSError, subprocess.SubprocessError, SafeError):
-            state["pending"] = acknowledgement(envelope, "failed", diagnostic)
+            queue_ack(state, envelope, "failed", diagnostic)
             store.save(state)
             report(transport, store, state)
             return 1
         state["applied"] = envelope
         state["inflight"] = None
+        state["baseline"] = None
         state["blocked"] = False
-        state["pending"] = acknowledgement(envelope, "applied")
+        queue_ack(state, envelope, "applied")
         store.save(state)
         return 0 if report(transport, store, state) else 1
 

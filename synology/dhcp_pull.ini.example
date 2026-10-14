@@ -9,6 +9,11 @@
 # root or scheduling user. Do not place files under /tmp or a shared directory.
 # The state directory is created if absent; its parent must already exist.
 # TLS verification is mandatory. A private CA file is optional; no insecure mode.
+# If supplied, ca_file must be a PEM file under the same private-file/ancestor
+# rules as the config; it is bounded to 1 MiB and loaded from validated bytes.
+# timeout bounds each socket operation. The body deadline is checked between
+# reads, so a final blocking read can add up to one socket timeout; OS DNS
+# resolution time is platform-controlled. DSM subprocesses have a 120s deadline.
 # Authentication is a bearer-token header only; redirects and proxies are disabled.
 #
 # Exit codes: 0 verified/no-op + report delivered; 1 failure/report retry;
@@ -22,12 +27,32 @@
 # carry destructive_authorized=true, including an intentional empty list.
 # Never remove state blindly to bypass drift or destructive checks.
 #
-# Durable state separates fetched, applied, inflight and pending reports.
+# Durable state separates fetched, applied, inflight, baseline and pending reports.
 # Successful DSM verification is persisted before an applied report is sent.
 # A failed report retries on the next successful fetch/live-read, without
 # applying twice. Failed/rejected publications never advance the applied ETag.
+# The last delivered status is also durable. After a failure or rejection,
+# verified live equality emits a fresh applied report without another DSM write;
+# an already-delivered applied report is not repeated on ordinary no-op polls.
+# Reports count as delivered only after HTTP 200 with exact JSON {"status": ...}
+# matching the pending status. HTML/malformed/mismatched receipts retain pending.
+# New reports include report_id, a canonical lowercase hyphenated UUID.
+# The UUID is durable with the pending report and unchanged on retries. New
+# attempts/status transitions get new UUIDs, including on the same publication.
+# Backend duplicate UUIDs never advance status pointers; a new verified success
+# can clear an earlier failure on that same version. Legacy reports without
+# report_id remain readable/retryable but cannot distinguish recurring attempts.
+# Backend retains the newest 50 receipts plus last-attempt, last-failure and
+# latest-applied pins (at most 53/site). Fresh UUIDs remain accepted for retained
+# publications; there is no permanent per-publication attempt cap.
+# UUID deduplication covers only retained receipts. An expired unknown UUID
+# is treated as a new event; do not replay manually archived acknowledgements.
+# The current pending latest attempt is pinned by the backend when accepted.
+# Undelivered pending reports are always retained/retried, even with --reconcile
+# and even after a different latest publication becomes available.
 # A write-ahead attempt permits crash recovery by checking live DSM equality;
-# a mismatch requires operator reconciliation. A crash between the external
+# unchanged pre-write baseline permits a safe retry; any other mismatch requires
+# operator reconciliation. A crash between the external
 # DSM write and local verification is inherently nontransactional; equality
 # proves current state, not who wrote it. Concurrent external changes remain
 # possible between the final baseline read and DSM set; avoid other writers.
@@ -35,6 +60,9 @@
 # backups; pruning never removes the current run's backup, even after clock
 # rollback. Unexpected files, symlinks or non-private backups stop writes.
 # Keep state and backups on persistent local storage, not a network mount.
+# A structurally valid, checksum-verified envelope for this site with the wrong
+# configured interface/subnet is reported rejected without applying or storing
+# its payload as fetched. Malformed/untrusted identity or checksums are not acked.
 
 [dhcp_pull]
 base_url = https://dnsgrid.example.invalid

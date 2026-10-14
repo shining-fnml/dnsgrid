@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import uuid
 from unittest.mock import patch
 
 from django.test import SimpleTestCase
@@ -77,6 +78,7 @@ class FakeTransport:
         self.not_modified = False
         self.raw = None
         self.tag = None
+        self.post_body = None
 
     def request(self, method, resource, body=None, conditional=None):
         if method == "GET":
@@ -90,7 +92,8 @@ class FakeTransport:
         self.posts.append(copy.deepcopy(body))
         if self.fail_post:
             raise pull.SafeError("network_failed")
-        return 204, None, b""
+        return 200, None, self.post_body if self.post_body is not None else \
+            json.dumps({"status": body["status"]}).encode("ascii")
 
 
 class PullTests(SimpleTestCase):
@@ -129,7 +132,9 @@ class PullTests(SimpleTestCase):
         self.assertEqual(state["applied"], self.transport.current)
         self.assertIsNone(state["inflight"])
         self.assertIsNone(state["pending"])
-        self.assertEqual(self.transport.posts, [pull.acknowledgement(self.transport.current, "applied")])
+        self.assertEqual(self.transport.posts, [pull.acknowledgement(
+            self.transport.current, "applied", report_id=self.transport.posts[0]["report_id"],
+        )])
         backup, = (self.config["state_dir"] / "backups").glob("dsm-*")
         self.assertEqual(json.loads((backup / "reservations.json").read_text()), payload(2, 10))
         self.assertEqual(backup.stat().st_mode & 0o777, 0o700)
@@ -143,7 +148,9 @@ class PullTests(SimpleTestCase):
             if method == "POST":
                 state = self.state()
                 self.assertTrue(pull.equal(self.dsm.live, state["applied"]["payload"]))
-                self.assertEqual(state["pending"], pull.acknowledgement(state["applied"], "applied"))
+                self.assertEqual(state["pending"], pull.acknowledgement(
+                    state["applied"], "applied", report_id=state["pending"]["report_id"],
+                ))
                 self.assertIsNone(state["inflight"])
             return original(method, *args, **kwargs)
 
@@ -207,12 +214,33 @@ class PullTests(SimpleTestCase):
         wrong_interface["sha256"] = pull.digest(wrong_interface["payload"])
         wrong_schema = envelope()
         wrong_schema["schema_version"] = True
-        for value in (wrong_interface, wrong_schema):
-            self.transport.current = value
-            with self.subTest(value=value), self.assertRaises(pull.SafeError):
-                self.run_pull()
+        self.transport.current = wrong_interface
+        self.assertEqual(self.run_pull(), 2)
+        self.assertEqual(self.transport.posts[-1], pull.acknowledgement(
+            wrong_interface, "rejected", "mapping_mismatch",
+            report_id=self.transport.posts[-1]["report_id"],
+        ))
+        self.assertIsNone(self.state()["fetched"])
+        self.transport.posts.clear()
+        self.transport.current = wrong_schema
+        with self.assertRaises(pull.SafeError):
+            self.run_pull()
         self.assertEqual(self.dsm.calls, [])
         self.assertEqual(self.transport.posts, [])
+
+    def test_trustworthy_wrong_subnet_reports_rejection_and_retries(self):
+        self.transport.current["subnet"] = "192.168.2.0/24"
+        for item in self.transport.current["payload"]["reservationData"]:
+            item["ip"] = item["ip"].replace("192.168.1.", "192.168.2.")
+        self.transport.current["sha256"] = pull.digest(self.transport.current["payload"])
+        self.transport.fail_post = True
+        self.assertEqual(self.run_pull(), 2)
+        self.assertEqual(self.state()["pending"]["diagnostic"], "mapping_mismatch")
+        self.assertIsNone(self.state()["fetched"])
+        self.transport.fail_post = False
+        self.assertEqual(self.run_pull(), 2)
+        self.assertIsNone(self.state()["pending"])
+        self.assertEqual(self.dsm.calls, [])
 
     def test_empty_requires_exact_envelope_authorization(self):
         self.transport.current = envelope(0)
@@ -257,6 +285,27 @@ class PullTests(SimpleTestCase):
         self.assertEqual(self.run_pull(True), 0)
         self.assertEqual(self.dsm.calls.count("set"), count + 1)
 
+    def test_repeated_drift_reconciliation_reports_each_status_transition(self):
+        self.assertEqual(self.run_pull(), 0)
+        self.transport.not_modified = True
+        for _ in range(2):
+            self.dsm.live = payload(2, 30)
+            self.assertEqual(self.run_pull(), 2)
+            self.assertEqual(self.run_pull(True), 0)
+        self.dsm.live = payload(2, 30)
+        self.assertEqual(self.run_pull(), 2)
+        self.assertEqual(
+            [report["status"] for report in self.transport.posts],
+            ["applied", "rejected", "applied", "rejected", "applied", "rejected"],
+        )
+        self.assertEqual({report["version"] for report in self.transport.posts}, {"v1"})
+        identifiers = [report["report_id"] for report in self.transport.posts]
+        self.assertEqual(len(set(identifiers)), len(identifiers))
+        for identifier in identifiers:
+            self.assertEqual(str(uuid.UUID(identifier)), identifier)
+        self.assertEqual(self.state()["fetched"]["version"], "v1")
+        self.assertEqual(self.state()["applied"]["version"], "v1")
+
     def test_reconciliation_still_requires_destructive_authorization(self):
         self.run_pull()
         self.dsm.live = payload(8, 20)
@@ -273,18 +322,81 @@ class PullTests(SimpleTestCase):
         self.assertEqual(self.transport.posts[-1]["diagnostic"], "dsm_failed")
         self.assertNotIn("private-output", json.dumps(self.transport.posts))
 
-    def test_set_failure_does_not_advance_etag_and_requires_recovery_review(self):
+    def test_read_failure_then_verified_noop_reports_fresh_success(self):
+        self.assertEqual(self.run_pull(), 0)
+        count = self.dsm.calls.count("set")
+        self.dsm.fail_read = True
+        self.assertEqual(self.run_pull(), 1)
+        failed_id = self.transport.posts[-1]["report_id"]
+        self.assertEqual(self.state()["last_report"]["status"], "failed")
+        self.dsm.fail_read = False
+        self.transport.not_modified = True
+        self.assertEqual(self.run_pull(), 0)
+        self.assertEqual(self.transport.posts[-1]["status"], "applied")
+        self.assertNotEqual(self.transport.posts[-1]["report_id"], failed_id)
+        self.assertEqual(self.dsm.calls.count("set"), count)
+        reports = len(self.transport.posts)
+        self.assertEqual(self.run_pull(), 0)
+        self.assertEqual(len(self.transport.posts), reports)
+
+    def test_manually_restored_drift_reconcile_reports_success_without_set(self):
+        self.assertEqual(self.run_pull(), 0)
+        count = self.dsm.calls.count("set")
+        self.transport.not_modified = True
+        self.dsm.live = payload(2, 30)
+        self.assertEqual(self.run_pull(), 2)
+        rejected_id = self.transport.posts[-1]["report_id"]
+        self.assertEqual(self.state()["last_report"]["status"], "rejected")
+        self.dsm.live = self.transport.current["payload"]
+        self.assertEqual(self.run_pull(True), 0)
+        self.assertEqual(self.transport.posts[-1]["status"], "applied")
+        self.assertNotEqual(self.transport.posts[-1]["report_id"], rejected_id)
+        self.assertEqual(self.dsm.calls.count("set"), count)
+
+    def test_set_failure_does_not_advance_etag_and_unchanged_baseline_retries(self):
         self.dsm.fail_set = True
         self.assertEqual(self.run_pull(), 1)
         self.assertIsNone(self.state()["applied"])
         self.assertEqual(self.state()["inflight"], self.transport.current)
         self.dsm.fail_set = False
         count = self.dsm.calls.count("set")
-        self.assertEqual(self.run_pull(), 2)
+        self.assertEqual(self.run_pull(), 0)
         self.assertEqual(self.transport.gets[-1], None)
+        self.assertEqual(self.dsm.calls.count("set"), count + 1)
+        self.assertFalse(self.state()["blocked"])
+        self.assertIsNone(self.state()["baseline"])
+
+    def test_failed_write_unknown_partial_state_requires_reconciliation(self):
+        self.dsm.fail_set = True
+        self.assertEqual(self.run_pull(), 1)
+        self.dsm.fail_set = False
+        self.dsm.live = payload(2, 30)
+        count = self.dsm.calls.count("set")
+        self.assertEqual(self.run_pull(), 2)
         self.assertEqual(self.dsm.calls.count("set"), count)
         self.assertTrue(self.state()["blocked"])
         self.assertEqual(self.run_pull(True), 0)
+
+    def test_unchanged_baseline_recovery_preserves_pending_failure_event(self):
+        self.dsm.wrong_verification = True
+        self.transport.fail_post = True
+        self.assertEqual(self.run_pull(), 1)
+        failed = copy.deepcopy(self.state()["pending"])
+        self.assertEqual(failed["diagnostic"], "verification_failed")
+        self.dsm.wrong_verification = False
+        self.transport.fail_post = False
+        self.assertEqual(self.run_pull(), 0)
+        self.assertEqual(self.transport.posts[:2], [failed, failed])
+        self.assertEqual(self.transport.posts[-1]["status"], "applied")
+        self.assertNotEqual(self.transport.posts[-1]["report_id"], failed["report_id"])
+
+    def test_delivered_failure_not_reported_again_during_baseline_retry(self):
+        self.dsm.fail_set = True
+        self.assertEqual(self.run_pull(), 1)
+        self.assertIsNone(self.state()["pending"])
+        self.dsm.fail_set = False
+        self.assertEqual(self.run_pull(), 0)
+        self.assertEqual([report["status"] for report in self.transport.posts], ["failed", "applied"])
 
     def test_verification_failure_keeps_applied_version(self):
         self.run_pull()
@@ -301,12 +413,98 @@ class PullTests(SimpleTestCase):
         state = self.state()
         self.assertEqual(state["applied"], self.transport.current)
         self.assertEqual(state["pending"]["status"], "applied")
+        pending = copy.deepcopy(state["pending"])
         self.transport.fail_post = False
         self.transport.not_modified = True
         count = self.dsm.calls.count("set")
         self.assertEqual(self.run_pull(), 0)
         self.assertEqual(self.dsm.calls.count("set"), count)
         self.assertIsNone(self.state()["pending"])
+        self.assertEqual(self.transport.posts, [pending, pending])
+
+    def test_malformed_or_mismatched_success_receipt_retains_pending(self):
+        for body in (b"<html>proxy login</html>", b"{", b'{"status":"failed"}',
+                     b'{"status":"applied","status":"applied"}', b'{"status":"applied","extra":true}'):
+            self.transport.post_body = body
+            self.assertEqual(self.run_pull(), 1)
+            pending = copy.deepcopy(self.state()["pending"])
+            self.assertEqual(pending["status"], "applied")
+            self.assertIsNone(self.state()["last_report"])
+            sets = self.dsm.calls.count("set")
+            self.assertEqual(self.run_pull(), 1)
+            self.assertEqual(self.state()["pending"], pending)
+            self.assertEqual(self.dsm.calls.count("set"), sets)
+            self.transport.post_body = None
+            self.assertEqual(self.run_pull(), 0)
+            self.assertIsNone(self.state()["pending"])
+            # Reset only test fixture state for the next independently malformed receipt.
+            self.install_state()
+            self.dsm.live = payload(2, 10)
+
+    def test_failure_reports_preserve_uuid_until_retry_is_delivered(self):
+        self.dsm.fail_read = True
+        self.transport.fail_post = True
+        self.assertEqual(self.run_pull(), 1)
+        pending = self.state()["pending"]
+        self.assertEqual(self.run_pull(), 1)
+        self.assertEqual(self.state()["pending"], pending)
+        self.assertEqual(self.transport.posts, [pending, pending])
+        self.transport.fail_post = False
+        self.assertEqual(self.run_pull(), 1)
+        self.assertEqual(self.transport.posts[-1], pending)
+
+    def test_legacy_pending_without_report_id_remains_retryable(self):
+        published = envelope()
+        legacy = pull.acknowledgement(published, "applied", report_id=None)
+        self.install_state(applied=published, fetched=published, pending=legacy)
+        old_state = self.state()
+        del old_state["last_report"]
+        (self.config["state_dir"] / "state.json").write_text(json.dumps(old_state))
+        self.dsm.live = published["payload"]
+        self.transport.not_modified = True
+        self.assertEqual(self.run_pull(), 0)
+        self.assertEqual(self.transport.posts, [legacy])
+
+    def test_invalid_or_noncanonical_report_id_state_is_rejected(self):
+        published = envelope()
+        for report_id in ("not-a-uuid", str(uuid.uuid4()).upper(), "0" * 32, str(uuid.UUID(int=0))):
+            state = pull.empty_state(self.config)
+            state.update(applied=published, fetched=published,
+                         pending=pull.acknowledgement(published, "applied", report_id=report_id))
+            with self.subTest(report_id=report_id), self.assertRaises(pull.SafeError):
+                pull.validate_state(state, self.config)
+
+    def test_operator_reconcile_never_retires_undeliverable_older_report(self):
+        original = envelope()
+        old_ack = pull.acknowledgement(original, "applied")
+        self.install_state(applied=original, fetched=original, pending=old_ack)
+        self.dsm.live = original["payload"]
+        self.transport.current = envelope(version="v2")
+        request = self.transport.request
+
+        def reject_old(method, resource, body=None, **kwargs):
+            if method == "POST" and body["version"] == "v1":
+                raise pull.SafeError("http_failed")
+            return request(method, resource, body, **kwargs)
+
+        self.transport.request = reject_old
+        self.assertEqual(self.run_pull(), 1)
+        self.assertEqual(self.state()["pending"], old_ack)
+        self.assertEqual(self.run_pull(True), 1)
+        self.assertEqual(self.state()["applied"]["version"], "v1")
+        self.assertEqual(self.state()["pending"], old_ack)
+        self.assertNotIn("set", self.dsm.calls)
+        self.assertEqual(self.transport.posts, [])
+
+    def test_operator_reconcile_never_retires_same_version_pending_report(self):
+        current = envelope()
+        pending = pull.acknowledgement(current, "applied")
+        self.install_state(applied=current, fetched=current, pending=pending)
+        self.dsm.live = current["payload"]
+        self.transport.fail_post = True
+        self.assertEqual(self.run_pull(True), 1)
+        self.assertEqual(self.state()["pending"], pending)
+        self.assertNotIn("set", self.dsm.calls)
 
     def test_drift_never_retries_false_applied_ack_even_with_reconcile(self):
         for reconcile in (False, True):
@@ -363,7 +561,7 @@ class PullTests(SimpleTestCase):
         self.assertEqual(self.transport.posts[-1]["status"], "applied")
 
     def test_recovery_with_newer_publication_and_failed_prior_attempt(self):
-        self.install_state(fetched=envelope(), inflight=envelope())
+        self.install_state(fetched=envelope(), inflight=envelope(), baseline=payload(2, 40))
         self.transport.current = envelope(version="v2", offset=20)
         self.assertEqual(self.run_pull(), 2)
         self.assertEqual(self.state()["fetched"]["version"], "v2")
@@ -472,6 +670,44 @@ class PullTests(SimpleTestCase):
         with self.assertRaises(pull.SafeError):
             self.run_pull()
         self.assertNotIn("set", self.dsm.calls)
+
+    def test_private_backup_retention_is_bounded(self):
+        with patch("synology.dhcp_pull.BACKUP_LIMIT", 2):
+            for number in range(4):
+                self.transport.current = envelope(version=f"v{number}", offset=number * 10)
+                self.assertEqual(self.run_pull(), 0)
+        directory = self.config["state_dir"] / "backups"
+        backups = sorted(directory.iterdir())
+        self.assertEqual(len(backups), 2)
+        self.assertEqual(
+            json.loads((backups[-1] / "reservations.json").read_text()),
+            envelope(version="v2", offset=20)["payload"],
+        )
+
+    def test_unknown_backup_files_stop_writes_without_deleting_them(self):
+        self.run_pull()
+        directory = self.config["state_dir"] / "backups"
+        unexpected = directory / "operator-note"
+        unexpected.write_text("keep")
+        self.transport.current = envelope(version="v2", offset=20)
+        count = self.dsm.calls.count("set")
+        with self.assertRaises(pull.SafeError) as error:
+            self.run_pull()
+        self.assertEqual(error.exception.code, "unsafe_backup")
+        self.assertEqual(self.dsm.calls.count("set"), count)
+        self.assertEqual(unexpected.read_text(), "keep")
+
+    def test_retention_preserves_current_backup_after_clock_rollback(self):
+        with pull.Store(self.config) as store:
+            for _ in range(2):
+                store.backup(self.dsm.response(self.dsm.live), self.dsm.live)
+            directory = self.config["state_dir"] / "backups"
+            for index, backup in enumerate(sorted(directory.iterdir())):
+                backup.rename(directory / f"dsm-eth0-29990101T00000000000{index}Z-abcdefgh")
+            with patch("synology.dhcp_pull.BACKUP_LIMIT", 2):
+                store.backup(self.dsm.response(self.dsm.live), self.dsm.live)
+        self.assertEqual(len(list(directory.iterdir())), 2)
+        self.assertEqual(sum(not child.name.startswith("dsm-eth0-2999") for child in directory.iterdir()), 1)
 
 
 class SchemaConfigTests(SimpleTestCase):
@@ -638,16 +874,27 @@ class TransportTests(SimpleTestCase):
 
     def test_optional_ca_and_exact_ack_json(self):
         with patch("synology.dhcp_pull.ssl.create_default_context") as context, \
-                patch("synology.dhcp_pull.urllib.request.build_opener") as build:
+                patch("synology.dhcp_pull.urllib.request.build_opener") as build, \
+                patch("synology.dhcp_pull.read_private", return_value=b"private-pem-data") as read:
             transport = pull.Transport({**self.config, "ca_file": "/private/ca.pem"})
-        context.assert_called_once_with(cafile="/private/ca.pem")
+        read.assert_called_once_with("/private/ca.pem", pull.MAX_BODY)
+        context.assert_called_once_with(cadata="private-pem-data")
         build.return_value.open.return_value = FakeResponse(b"", 204)
         ack = pull.acknowledgement(envelope(), "rejected", "dsm_drift")
         self.assertEqual(transport.request("POST", "results", ack)[0], 204)
         request = transport.opener.open.call_args.args[0]
         self.assertEqual(json.loads(request.data), ack)
-        self.assertEqual(set(ack), {"schema_version", "version", "sha256", "status", "diagnostic"})
+        self.assertEqual(set(ack), {"schema_version", "version", "sha256", "status", "diagnostic", "report_id"})
         self.assertEqual(request.get_header("Content-type"), "application/json")
+
+    def test_unsafe_ca_fails_before_ssl_or_request(self):
+        with patch("synology.dhcp_pull.read_private", side_effect=pull.SafeError("unsafe_file")), \
+                patch("synology.dhcp_pull.ssl.create_default_context") as context, \
+                patch("synology.dhcp_pull.urllib.request.build_opener") as build:
+            with self.assertRaises(pull.SafeError):
+                pull.Transport({**self.config, "ca_file": "/private/ca.pem"})
+        context.assert_not_called()
+        build.assert_not_called()
 
     def test_http_redirect_auth_server_errors_and_network_fail_closed(self):
         with patch("synology.dhcp_pull.urllib.request.build_opener") as build:

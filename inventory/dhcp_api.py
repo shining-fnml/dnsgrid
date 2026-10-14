@@ -8,9 +8,8 @@ from django.http import HttpResponse, JsonResponse, UnreadablePostError
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 
-from .dhcp import envelope, mapping_matches, record_result
-from .models import Configuration, DHCPState
-from .services import _claim_revision
+from .dhcp import _lock_configuration, envelope, mapping_matches, record_result
+from .models import DHCPState
 
 
 def _response(data=None, status=200):
@@ -18,6 +17,15 @@ def _response(data=None, status=200):
     response["Cache-Control"] = "private, no-store"
     response["Vary"] = "Authorization"
     return response
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON member.")
+        result[key] = value
+    return result
 
 
 def _authenticate(request, site_id):
@@ -41,7 +49,7 @@ def latest(request, site_id):
         response["Allow"] = "GET"
         return response
     with transaction.atomic():
-        _claim_revision(Configuration.load().revision, changed=False)
+        _lock_configuration()
         state = _authenticate(request, site_id)
         if state is None:
             return _response({"error": "unauthorized"}, 401)
@@ -51,11 +59,12 @@ def latest(request, site_id):
         if not mapping_matches(publication):
             return _response({"error": "mapping_changed"}, 409)
         etag = f'"{publication.version}"'
-        state.downloaded = publication
-        state.downloaded_at = timezone.now()
-        state.save(update_fields=["downloaded", "downloaded_at"])
         matches = request.META.get("HTTP_IF_NONE_MATCH", "").split(",")
         not_modified = any(value.strip() in (etag, "*") for value in matches)
+        if not not_modified:
+            state.downloaded = publication
+            state.downloaded_at = timezone.now()
+            state.save(update_fields=["downloaded", "downloaded_at"])
         response = _response(None, 304) if not_modified else _response(envelope(publication))
         response["ETag"] = etag
         return response
@@ -68,7 +77,7 @@ def result(request, site_id):
         response["Allow"] = "POST"
         return response
     with transaction.atomic():
-        _claim_revision(Configuration.load().revision, changed=False)
+        _lock_configuration()
         if _authenticate(request, site_id) is None:
             return _response({"error": "unauthorized"}, 401)
         length = request.META.get("CONTENT_LENGTH", "")
@@ -81,11 +90,13 @@ def result(request, site_id):
                 return _response({"error": "invalid_content_length"}, 400)
             if size > 4096:
                 return _response({"error": "payload_too_large"}, 413)
+        if request.content_type != "application/json":
+            return _response({"error": "unsupported_media_type"}, 415)
         try:
             raw = request.read(4097)
             if len(raw) > 4096:
                 return _response({"error": "payload_too_large"}, 413)
-            data = json.loads(raw)
+            data = json.loads(raw, object_pairs_hook=_unique_object)
             report = record_result(site_id, data)
         except (ValueError, UnicodeError, ValidationError, UnreadablePostError, RecursionError):
             return _response({"error": "invalid_result"}, 400)

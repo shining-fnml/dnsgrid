@@ -425,6 +425,7 @@ class DHCPPublication(models.Model):
 
 class DHCPResult(models.Model):
     publication = models.ForeignKey(DHCPPublication, on_delete=models.CASCADE)
+    report_id = models.UUIDField(null=True, blank=True)
     status = models.CharField(max_length=8, choices=[
         ("applied", "Applied"), ("failed", "Failed"), ("rejected", "Rejected"),
     ])
@@ -434,7 +435,12 @@ class DHCPResult(models.Model):
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=["publication", "status"], name="dhcp_result_unique_status",
+                fields=["publication", "status"], condition=Q(report_id__isnull=True),
+                name="dhcp_result_unique_legacy_status",
+            ),
+            models.UniqueConstraint(
+                fields=["publication", "report_id"], condition=Q(report_id__isnull=False),
+                name="dhcp_result_unique_report",
             ),
             models.CheckConstraint(
                 condition=Q(status__in=["applied", "failed", "rejected"]),
@@ -462,6 +468,9 @@ class DHCPState(models.Model):
         DHCPResult, null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
     )
     last_failure = models.ForeignKey(
+        DHCPResult, null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+    )
+    applied_receipt = models.ForeignKey(
         DHCPResult, null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
     )
     contacted_at = models.DateTimeField(null=True, blank=True)

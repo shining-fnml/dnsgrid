@@ -1,3 +1,4 @@
+import uuid
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -143,3 +144,25 @@ class DHCPOperatorTests(TestCase):
         self.assertIsNotNone(row["last_downloaded_at"])
         self.assertFalse(row["pending"])
         self.assertEqual(row["status"], "applied")
+        failure = {
+            "schema_version": 1, "version": publication.version,
+            "sha256": publication.sha256, "status": "failed",
+            "diagnostic": "dsm_drift", "report_id": str(uuid.uuid4()),
+        }
+        result_url = reverse("dhcp-result", args=[2])
+        self.assertEqual(machine.post(
+            result_url, failure, content_type="application/json", **headers,
+        ).status_code, 200)
+        response = self.client.get(reverse("dhcp-status"))
+        row = next(row for row in response.context["rows"] if row["site"].pk == 2)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(machine.post(result_url, {
+            **failure, "status": "applied", "diagnostic": "", "report_id": str(uuid.uuid4()),
+        }, content_type="application/json", **headers).status_code, 200)
+        self.assertEqual(machine.post(
+            result_url, failure, content_type="application/json", **headers,
+        ).status_code, 200)
+        response = self.client.get(reverse("dhcp-status"))
+        row = next(row for row in response.context["rows"] if row["site"].pk == 2)
+        self.assertEqual(row["status"], "applied")
+        self.assertEqual(row["last_failure"].diagnostic, "dsm_drift")

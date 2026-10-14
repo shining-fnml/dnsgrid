@@ -2,13 +2,15 @@ import copy
 import hashlib
 import io
 import json
+import uuid
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.db.migrations.executor import MigrationExecutor
-from django.db import connection
+from django.db import connection, transaction
 from django.test import RequestFactory, TestCase, TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 
 from . import dhcp, dhcp_api
 from .archives import restore, snapshot
@@ -164,8 +166,12 @@ class DHCPTests(TestCase):
 
     def test_safe_diagnostic_codes_retained_unknown_text_sanitized(self):
         publication = self.publish()
-        self.post(self.report(publication, "failed", diagnostic="verification_failed"))
-        self.assertEqual(DHCPResult.objects.get().diagnostic, "verification_failed")
+        for code in dhcp.SAFE_DIAGNOSTICS:
+            identifier = str(uuid.uuid4())
+            self.post(self.report(
+                publication, "failed", diagnostic=code, report_id=identifier,
+            ))
+            self.assertEqual(DHCPResult.objects.get(report_id=identifier).diagnostic, code)
 
     def test_same_version_failure_is_visible_after_success_and_duplicate_cycles(self):
         publication = self.publish()
@@ -181,6 +187,151 @@ class DHCPTests(TestCase):
         replacement = self.publish(True)
         self.assertNotEqual(replacement.version, publication.version)
         self.assertEqual(dhcp.status_rows()[0]["status"], "pending")
+
+    def test_uuid_attempts_allow_reconciliation_without_duplicate_regression(self):
+        publication = self.publish()
+        initial = self.report(publication, report_id=str(uuid.uuid4()))
+        failure = self.report(
+            publication, "failed", report_id=str(uuid.uuid4()), diagnostic="dsm_drift",
+        )
+        reconciled = self.report(publication, report_id=str(uuid.uuid4()))
+        self.assertEqual(self.post(initial).status_code, 200)
+        self.assertEqual(dhcp.status_rows()[0]["status"], "applied")
+        self.assertEqual(self.post(failure).status_code, 200)
+        self.assertEqual(dhcp.status_rows()[0]["status"], "failed")
+        failed_attempt_id = DHCPState.objects.get(site=self.site).last_attempt_id
+        self.post(initial)
+        self.assertEqual(DHCPState.objects.get(site=self.site).last_attempt_id, failed_attempt_id)
+        self.assertEqual(dhcp.status_rows()[0]["status"], "failed")
+        self.assertEqual(self.post(reconciled).status_code, 200)
+        state = DHCPState.objects.get(site=self.site)
+        self.assertEqual(dhcp.status_rows()[0]["status"], "applied")
+        applied_attempt_id = state.last_attempt_id
+        self.post(failure)
+        self.assertEqual(DHCPState.objects.get(site=self.site).last_attempt_id, applied_attempt_id)
+        self.assertEqual(dhcp.status_rows()[0]["status"], "applied")
+        self.assertEqual(DHCPResult.objects.count(), 3)
+        self.assertEqual(state.applied_id, publication.pk)
+
+    def test_uuid_conflicts_invalid_identifiers_and_older_versions_fail_safe(self):
+        old = self.publish()
+        self.host.name = "newer"
+        self.host.save()
+        latest = self.publish()
+        identifier = str(uuid.uuid4())
+        success = self.report(latest, report_id=identifier)
+        self.post(success)
+        self.assertEqual(self.post(dict(success, status="failed")).status_code, 400)
+        self.assertEqual(self.post(dict(success, diagnostic="dsm_failed")).status_code, 400)
+        for value in (None, 1, "", "not-a-uuid", identifier.upper(), str(uuid.UUID(int=0))):
+            self.assertEqual(self.post(self.report(latest, report_id=value)).status_code, 400)
+        attempt_id = DHCPState.objects.get(site=self.site).last_attempt_id
+        self.post(self.report(old, "failed", report_id=str(uuid.uuid4())))
+        state = DHCPState.objects.get(site=self.site)
+        self.assertEqual(state.last_attempt_id, attempt_id)
+        self.assertEqual(state.applied_id, latest.pk)
+        self.assertEqual(dhcp.status_rows()[0]["status"], "applied")
+
+    def test_unlimited_fresh_uuid_events_reconcile_with_bounded_receipts(self):
+        publication = self.publish()
+        known = self.report(publication, report_id=str(uuid.uuid4()))
+        self.assertEqual(self.post(known).status_code, 200)
+        pinned_applied_id = DHCPState.objects.get(site=self.site).applied_receipt_id
+        for _ in range(100):
+            self.assertEqual(self.post(self.report(
+                publication, "failed", report_id=str(uuid.uuid4()),
+            )).status_code, 200)
+        self.assertLessEqual(DHCPResult.objects.count(), 53)
+        self.assertTrue(DHCPResult.objects.filter(pk=pinned_applied_id).exists())
+        self.assertEqual(self.post(known).status_code, 200)
+        self.assertEqual(dhcp.status_rows()[0]["status"], "failed")
+        self.assertEqual(self.post(self.report(
+            publication, report_id=str(uuid.uuid4()),
+        )).status_code, 200)
+        self.assertEqual(dhcp.status_rows()[0]["status"], "applied")
+        self.assertLessEqual(DHCPResult.objects.count(), 53)
+        self.assertEqual(DHCPPublication.objects.count(), 1)
+
+    def test_rolling_result_history_pins_latest_attempt_failure_and_applied_receipt(self):
+        publication = self.publish()
+        first_applied = self.report(publication, report_id=str(uuid.uuid4()))
+        self.post(first_applied)
+        first_applied_id = DHCPState.objects.get(site=self.site).applied_receipt_id
+        pinned_failure = self.report(
+            publication, "failed", report_id=str(uuid.uuid4()), diagnostic="dsm_drift",
+        )
+        self.post(pinned_failure)
+        expired_ids = []
+        for _ in range(52):
+            data = self.report(
+                publication, report_id=str(uuid.uuid4()),
+            )
+            expired_ids.append(data["report_id"])
+            self.assertEqual(self.post(data).status_code, 200)
+        state = DHCPState.objects.get(site=self.site)
+        self.assertEqual(DHCPResult.objects.count(), 51)
+        self.assertLessEqual(DHCPResult.objects.count(), 53)
+        current_attempt_id = state.last_attempt_id
+        self.assertEqual(self.post(pinned_failure).status_code, 200)
+        state.refresh_from_db()
+        self.assertEqual(state.last_attempt_id, current_attempt_id)
+        self.assertEqual(dhcp.status_rows()[0]["status"], "applied")
+        self.assertFalse(DHCPResult.objects.filter(report_id=expired_ids[0]).exists())
+        self.assertFalse(DHCPResult.objects.filter(pk=first_applied_id).exists())
+        self.assertTrue(DHCPResult.objects.filter(pk=state.applied_receipt_id).exists())
+        self.assertTrue(DHCPResult.objects.filter(pk=state.last_failure_id).exists())
+        self.assertTrue(DHCPResult.objects.filter(pk=state.last_attempt_id).exists())
+
+    def test_dhcp_operations_do_not_depend_on_dns_recovery_journal(self):
+        with patch("inventory.dns_reset.ensure_ready", side_effect=RuntimeError("DNS recovery unavailable")) as ensure:
+            rows = dhcp.preview(1)
+            publication = dhcp.publish(1, rows)[0]
+            self.token = dhcp.rotate_token(self.site.pk)
+            self.assertEqual(self.get().status_code, 200)
+            self.assertEqual(self.get(HTTP_IF_NONE_MATCH=f'"{publication.version}"').status_code, 304)
+            self.assertEqual(self.post(self.report(
+                publication, report_id=str(uuid.uuid4()),
+            )).status_code, 200)
+            self.assertEqual(dhcp.status_rows()[0]["status"], "applied")
+            dhcp.rotate_token(self.site.pk, revoke=True)
+            self.assertEqual(self.get().status_code, 401)
+            ensure.assert_not_called()
+
+    def test_machine_operations_do_not_claim_a_racing_inventory_revision(self):
+        publication = self.publish()
+        stale_config = Configuration.load()
+        Configuration.objects.update(revision=2)
+        with patch("inventory.dhcp.Configuration.load", return_value=stale_config):
+            with patch("inventory.dhcp._claim_revision", side_effect=ValidationError("Stale revision")) as claim:
+                self.token = dhcp.rotate_token(self.site.pk)
+                self.assertEqual(self.get().status_code, 200)
+                self.assertEqual(self.post(self.report(
+                    publication, report_id=str(uuid.uuid4()),
+                )).status_code, 200)
+                self.assertEqual(dhcp.status_rows()[0]["status"], "applied")
+                dhcp.rotate_token(self.site.pk, revoke=True)
+                self.assertEqual(self.get().status_code, 401)
+                claim.assert_not_called()
+        self.assertEqual(Configuration.load().revision, 2)
+        self.assertEqual(Configuration.load().soa_serial, self.config.soa_serial)
+        with self.assertRaises(ValidationError):
+            dhcp.preview(1)
+        with self.assertRaises(ValidationError):
+            dhcp.publish(1, [])
+
+    def test_machine_lock_writes_before_any_read_even_when_singleton_is_absent(self):
+        for absent in (False, True):
+            with self.subTest(absent=absent):
+                if absent:
+                    Configuration.objects.all().delete()
+                with transaction.atomic():
+                    with CaptureQueriesContext(connection) as queries:
+                        config = dhcp._lock_configuration()
+                self.assertTrue(queries[0]["sql"].lstrip().upper().startswith("UPDATE "))
+                self.assertIn("inventory_configuration", queries[0]["sql"])
+                self.assertEqual(config.pk, 1)
+                self.assertEqual(config.revision, 1)
+                self.assertTrue(Configuration.objects.filter(pk=1).exists())
 
     def test_empty_payload_subnet_metadata_change_is_pending(self):
         Host.objects.all().delete()
@@ -321,6 +472,33 @@ class DHCPTests(TestCase):
         self.assertEqual(conditional.status_code, 304)
         self.assertEqual(conditional["ETag"], response["ETag"])
         self.assertEqual(conditional.content, b"")
+        refreshed = DHCPState.objects.get(site=self.site)
+        self.assertEqual(refreshed.downloaded_at, state.downloaded_at)
+        self.assertEqual(refreshed.downloaded_id, state.downloaded_id)
+        self.assertGreaterEqual(refreshed.contacted_at, state.contacted_at)
+
+    def test_conditional_get_contact_is_not_a_payload_download(self):
+        publication = self.publish()
+        response = self.get(HTTP_IF_NONE_MATCH=f'"{publication.version}"')
+        self.assertEqual(response.status_code, 304)
+        state = DHCPState.objects.get(site=self.site)
+        self.assertIsNotNone(state.contacted_at)
+        self.assertIsNone(state.downloaded_at)
+        self.assertIsNone(state.downloaded_id)
+
+    def test_result_requires_json_content_type_and_unique_members(self):
+        publication = self.publish()
+        body = json.dumps(self.report(publication)).encode()
+        request = self.factory.post(
+            "/", body, content_type="text/plain",
+            HTTP_AUTHORIZATION="Bearer " + self.token,
+        )
+        self.assertEqual(dhcp_api.result(request, self.site.pk).status_code, 415)
+        duplicate = body[:-1] + b', "status":"failed", "status":"applied"}'
+        self.assertEqual(self.post(duplicate).status_code, 400)
+        duplicate = body[:-1] + b', "schema_version":2, "schema_version":1}'
+        self.assertEqual(self.post(duplicate).status_code, 400)
+        self.assertFalse(DHCPResult.objects.exists())
 
     def test_result_schema_exact_checksum_version_and_sanitized_diagnostic(self):
         publication = self.publish()
@@ -418,20 +596,28 @@ class DHCPMigrationTests(TransactionTestCase):
         old = executor.loader.project_state([("inventory", "0012_host_static")]).apps
         config = old.get_model("inventory", "Configuration").objects.get(pk=1)
         config.revision = 17
+        config.lan_prefix = "10.24"
         config.save()
         site = old.get_model("inventory", "Site").objects.get(pk=1)
         site.dsm_ifname = "bond0"
+        site.g = 42
         site.save()
         host = old.get_model("inventory", "Host").objects.create(
             name="preserved", site_id=1, row=1, column=0, static=True,
+            mac="02:00:00:00:00:01", notes="Preserve static inventory.",
         )
+        configuration_data = old.get_model("inventory", "Configuration").objects.values().get(pk=1)
+        sites_data = list(old.get_model("inventory", "Site").objects.order_by("pk").values())
+        hosts_data = list(old.get_model("inventory", "Host").objects.order_by("pk").values())
         try:
             executor = MigrationExecutor(connection)
             executor.migrate([("inventory", "0013_dhcp_publications")])
-            self.assertEqual(Configuration.load().revision, 17)
-            self.assertEqual(Site.objects.get(pk=1).dsm_ifname, "bond0")
+            self.assertEqual(Configuration.objects.values().get(pk=1), configuration_data)
+            self.assertEqual(list(Site.objects.order_by("pk").values()), sites_data)
+            self.assertEqual(list(Host.objects.order_by("pk").values()), hosts_data)
             self.assertTrue(Host.objects.get(pk=host.pk).static)
-            self.assertEqual(DHCPPublication.objects.count(), 0)
-            self.assertEqual(DHCPState.objects.count(), 0)
+            self.assertFalse(DHCPPublication.objects.exists())
+            self.assertFalse(DHCPResult.objects.exists())
+            self.assertFalse(DHCPState.objects.exists())
         finally:
             MigrationExecutor(connection).migrate([("inventory", "0013_dhcp_publications")])
