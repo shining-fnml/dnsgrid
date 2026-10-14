@@ -37,6 +37,12 @@
 <p>Legacy migration and archive compatibility retain old SOA timing values and the existing nameserver rather than changing them to new DSM defaults.</p>
 <p>Zones start with explicit origin and TTL directives and a multiline SOA. A/PTR records have explicit FQDN owners and TTLs, are ordered alphabetically by hostname, and PTR targets are full LAN names. The final record is the zone-apex NS. Settings configures <code>ttl</code>, <code>soa_ns</code>, <code>soa_mailbox</code>, <code>soa_refresh</code>, <code>soa_retry</code>, <code>soa_expire</code>, <code>soa_minimum</code>, and the separate <code>zone_ns</code>. Persisted UTC <code>YYYYMMDDnn</code> serials advance only for DNS content changes or upward manual seeding; counter 99 exhaustion is rejected. Future seeds and clock rollback never lower the serial. Downloads, previews, and unchanged republication do not advance it.</p>
 <h2>DSM DHCP reservations (API)</h2>
+<p><a href="{% url 'dhcp-status' %}">DHCP delivery status and published artifact history</a></p>
+<form method="post" action="{% url 'dhcp-preview' %}">
+{% csrf_token %}<input type="hidden" name="revision" value="{{ revision }}">
+<button>Preview Publish DHCP</button>
+</form>
+<p>Publish DHCP explicitly snapshots every configured DHCP site after confirmation. NAS appliances pull only published snapshots, never these mutable previews. Inventory saves and manual downloads do not deploy reservations.</p>
 <p>Configure each site's DSM DHCP interface in Settings to generate <code>dsm-reservations-site-ID.json</code>. The JSON contains only <code>ifname</code> and the complete <code>reservationData</code> list for that site.</p>
 <p>Static hosts remain in DNS exports but are omitted from DSM DHCP reservations, even when they have a MAC address.</p>
 <p>For local NAS-side application, manually copy only the JSON export and the repository's <code>synology/dsm_apply.py</code> utility onto the target NAS. Run with <code>sudo python3 /path/to/dsm_apply.py /path/to/dsm-reservations-site-ID.json --backup-dir /path/to/backups</code>. By default it only reads, creates private raw/restorable backups, and shows a diff. Add <code>--apply</code> to confirm interactively or <code>--yes</code> to explicitly authorize writing.</p>

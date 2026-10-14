@@ -8,9 +8,11 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import subprocess
 import sys
 import tempfile
+import time
 
 
 SYNOWEBAPI = "/usr/syno/bin/synowebapi"
@@ -86,15 +88,52 @@ def parse_response(output):
     raise ValueError("No complete DSM JSON response found.")
 
 
-def call_api(method, ifname, reservations=None):
+def bounded_output(args, maximum):
+    """Capture a scheduled client's output without unbounded pipe buffering."""
+    with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        output = bytearray()
+        total = 0
+        deadline = time.monotonic() + 120
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                selector.register(process.stderr, selectors.EVENT_READ)
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(args, 120)
+                    for key, _ in selector.select(remaining):
+                        chunk = os.read(key.fileobj.fileno(), min(65536, maximum - total + 1))
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        total += len(chunk)
+                        if total > maximum:
+                            raise ValueError("DSM output limit exceeded.")
+                        if key.fileobj is process.stdout:
+                            output.extend(chunk)
+                process.wait(timeout=max(0.001, deadline - time.monotonic()))
+                if process.returncode:
+                    raise subprocess.CalledProcessError(process.returncode, args)
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+    return output.decode("utf-8")
+
+
+def call_api(method, ifname, reservations=None, *, max_output=None):
     args = [
         SYNOWEBAPI, "--exec", f"api={API}", f"method={method}",
         f"version={3 if method == 'get' else 2}", f"ifname={json.dumps(ifname)}",
     ]
     if method == "set":
         args.append("reservationData=" + json.dumps(reservations, separators=(",", ":")))
-    result = subprocess.run(args, capture_output=True, text=True, check=True, timeout=120)
-    response = parse_response(result.stdout)
+    if max_output is None:
+        output = subprocess.run(args, capture_output=True, text=True, check=True, timeout=120).stdout
+    else:
+        output = bounded_output(args, max_output)
+    response = parse_response(output)
     if response.get("success") is not True:
         raise ValueError(f"DSM Reservation.{method} failed: {response.get('error', 'unknown error')}")
     return response
