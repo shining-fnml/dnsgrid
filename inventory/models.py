@@ -403,3 +403,66 @@ class GandiRecord(models.Model):
 
     def __str__(self):
         return f"{self.name}.{self.zone} {self.record_type}"
+
+
+class DHCPPublication(models.Model):
+    site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name="dhcp_publications")
+    subnet = models.CharField(max_length=18)
+    payload = models.JSONField()
+    sha256 = models.CharField(max_length=64)
+    destructive_authorized = models.BooleanField(default=False)
+    published_at = models.DateTimeField(auto_now_add=True)
+
+    @property
+    def version(self):
+        return f"{self.pk}-{self.sha256}"
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError("DHCP publications are immutable.")
+        return super().save(*args, **kwargs)
+
+
+class DHCPResult(models.Model):
+    publication = models.ForeignKey(DHCPPublication, on_delete=models.CASCADE)
+    status = models.CharField(max_length=8, choices=[
+        ("applied", "Applied"), ("failed", "Failed"), ("rejected", "Rejected"),
+    ])
+    diagnostic = models.CharField(max_length=40, blank=True, default="")
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["publication", "status"], name="dhcp_result_unique_status",
+            ),
+            models.CheckConstraint(
+                condition=Q(status__in=["applied", "failed", "rejected"]),
+                name="dhcp_result_status",
+            ),
+        ]
+
+
+class DHCPState(models.Model):
+    site = models.OneToOneField(Site, on_delete=models.CASCADE, primary_key=True)
+    token_sha256 = models.CharField(max_length=64, blank=True, default="")
+    latest = models.ForeignKey(
+        DHCPPublication, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    applied = models.ForeignKey(
+        DHCPPublication, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    downloaded = models.ForeignKey(
+        DHCPPublication, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    last_attempt = models.ForeignKey(
+        DHCPResult, null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+    )
+    last_failure = models.ForeignKey(
+        DHCPResult, null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+    )
+    contacted_at = models.DateTimeField(null=True, blank=True)
+    downloaded_at = models.DateTimeField(null=True, blank=True)

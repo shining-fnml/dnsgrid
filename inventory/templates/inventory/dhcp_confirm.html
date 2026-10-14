@@ -1,0 +1,26 @@
+{% extends 'inventory/base.html' %}
+{% block content %}
+<h1>Confirm DHCP publication</h1>
+<p>Inventory revision {{ revision }}. This publishes complete immutable lists, not live inventory. No DSM writes or DNS reloads occur here.</p>
+<p class="warning">Each list replaces all IPv4 reservations on its interface. Static hosts are excluded. Review the subnet, interface and complete list for every site.</p>
+<p><a href="{% url 'vpn-report' %}">Review the VPN alignment report</a>; CCD warnings remain advisory and do not block publication.</p>
+{% for row in rows %}
+<h2>{{ row.site_name }} (site ID {{ row.site_id }})</h2>
+<p>Subnet <code>{{ row.subnet }}</code>; interface <code>{{ row.payload.ifname }}</code>; {{ row.payload.reservationData|length }} reservations.</p>
+<p>Content SHA-256: <code>{{ row.sha256 }}</code>. Previous version: <code>{{ row.previous_version|default:"None" }}</code>.</p>
+{% if row.destructive %}<p class="warning">This publication is empty or below half the previous desired count. Explicit destructive authorization is required.</p>{% endif %}
+<details><summary>Complete desired reservation list</summary>
+<table><thead><tr><th>MAC</th><th>IPv4</th><th>Hostname</th></tr></thead><tbody>
+{% for item in row.payload.reservationData %}<tr><td>{{ item.mac }}</td><td>{{ item.ip }}</td><td>{{ item.hostname }}</td></tr>{% empty %}<tr><td colspan="3">Empty authoritative list: applying removes every reservation.</td></tr>{% endfor %}
+</tbody></table></details>
+{% empty %}<p>No sites have a configured DHCP interface. Configure sites in Settings first.</p>{% endfor %}
+{% if rows %}
+<form method="post" action="{% url 'dhcp-publish' %}">
+{% csrf_token %}<input type="hidden" name="nonce" value="{{ nonce }}">
+<p><label><input type="checkbox" name="authorize_destructive" value="yes"> Authorize empty lists or drastic reductions for these exact site/content versions, including reductions against the NAS's live reservations. I reviewed every list above.</label></p>
+<p>This authorization is not a permanent bypass. If a NAS rejects a nonempty list against its live baseline, generate a fresh preview and explicitly authorize that exact publication.</p>
+<button>Publish DHCP</button>
+</form>
+{% endif %}
+<p><a href="{% url 'exports' %}">Cancel and return to Export previews</a></p>
+{% endblock %}

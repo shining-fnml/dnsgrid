@@ -1,0 +1,30 @@
+{% extends 'inventory/base.html' %}
+{% block content %}
+<h1>DHCP delivery status</h1>
+<p><a href="{% url 'exports' %}">Preview and publish DHCP</a>. Saving inventory does not publish DHCP. Downloaded is not applied.</p>
+<p>Application is reported by the NAS, not independent proof of live DHCP leases. An aligned report does not establish client connectivity.</p>
+<table>
+<thead><tr><th>Site / subnet / interface</th><th>Desired version / time</th><th>Contact / downloaded</th><th>Reported applied</th><th>Latest attempt / failure</th><th>State</th></tr></thead>
+<tbody>
+{% for row in rows %}
+<tr>
+<td>{{ row.site.name }} (ID {{ row.site.pk }})<br>{{ row.subnet }}<br><code>{{ row.site.dsm_ifname|default:"Not configured" }}</code></td>
+<td>{% if row.latest %}<code>{{ row.latest.version }}</code><br>{{ row.latest.published_at }}{% else %}No publication{% endif %}</td>
+<td>{{ row.last_seen|default:"No contact" }}<br>{% if row.downloaded %}<code>{{ row.downloaded.version }}</code><br>{{ row.last_downloaded_at }}{% else %}No download{% endif %}</td>
+<td>{% if row.applied %}<code>{{ row.applied.version }}</code>{% else %}Unreported{% endif %}</td>
+<td>{% if row.last_attempt %}{{ row.last_attempt.status }}: <code>{{ row.last_attempt.publication.version }}</code><br>{{ row.last_attempt.received_at }}<br>{{ row.last_attempt.diagnostic }}{% else %}No result{% endif %}
+{% if row.last_failure %}<details><summary>Latest reported failure</summary>{{ row.last_failure.status }}: <code>{{ row.last_failure.publication.version }}</code><br>{{ row.last_failure.received_at }}<br>{{ row.last_failure.diagnostic }}</details>{% endif %}</td>
+<td>{{ row.status }}{% if row.pending %}<br><strong>Unpublished inventory changes</strong>{% endif %}</td>
+</tr>
+{% empty %}<tr><td colspan="6">No configured DHCP sites.</td></tr>{% endfor %}
+</tbody></table>
+{% for row in rows %}
+<details><summary>{{ row.site.name }} publication history</summary>
+{% for publication in row.history %}
+<p><code>{{ publication.version }}</code> · {{ publication.published_at }} · {{ publication.subnet }} · {{ publication.payload.ifname }} · {{ publication.payload.reservationData|length }} reservations · destructive authorization: {{ publication.destructive_authorized|yesno:"yes,no" }}</p>
+<p><a href="{% url 'dhcp-publication-download' row.site.pk publication.pk %}">Download immutable DSM-compatible desired artifact</a></p>
+{% empty %}<p>No publications.</p>{% endfor %}
+</details>
+{% endfor %}
+<p>Provision or rotate a site token locally with <code>python manage.py dhcp_token SITE_ID</code>; revoke with <code>--revoke</code>. Tokens are never displayed here. See the installation documentation before scheduling a NAS.</p>
+{% endblock %}

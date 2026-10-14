@@ -1,0 +1,47 @@
+# Copy dhcp_pull.py and dsm_apply.py side by side onto the NAS.
+# Run once from DSM Task Scheduler as the owner with DSM permissions:
+# python3 /private/path/dhcp_pull.py --config /private/path/dhcp_pull.ini
+# No daemon, third-party packages, remote commands or configurable DSM executable.
+#
+# Config: regular file, owner = scheduling user, mode 0600 (or 0400).
+# State directory: same owner, mode 0700; state/lock files mode 0600.
+# Ancestors must not be symlinks or group/world writable and must be owned by
+# root or scheduling user. Do not place files under /tmp or a shared directory.
+# The state directory is created if absent; its parent must already exist.
+# TLS verification is mandatory. A private CA file is optional; no insecure mode.
+# Authentication is a bearer-token header only; redirects and proxies are disabled.
+#
+# Exit codes: 0 verified/no-op + report delivered; 1 failure/report retry;
+# 2 rejected/operator review; 3 another instance holds the lock.
+# Logs are fixed English codes, never server content, credentials or exceptions.
+#
+# All runs read live DSM, including HTTP 304. Changed live reservations block
+# writes. After reviewing DSM and backups, use --reconcile for ONE run to adopt
+# or replace drift with the exact current publication. This does not bypass the
+# empty/<50%-of-live-or-last-applied guard: that publication must explicitly
+# carry destructive_authorized=true, including an intentional empty list.
+# Never remove state blindly to bypass drift or destructive checks.
+#
+# Durable state separates fetched, applied, inflight and pending reports.
+# Successful DSM verification is persisted before an applied report is sent.
+# A failed report retries on the next successful fetch/live-read, without
+# applying twice. Failed/rejected publications never advance the applied ETag.
+# A write-ahead attempt permits crash recovery by checking live DSM equality;
+# a mismatch requires operator reconciliation. A crash between the external
+# DSM write and local verification is inherently nontransactional; equality
+# proves current state, not who wrote it. Concurrent external changes remain
+# possible between the final baseline read and DSM set; avoid other writers.
+# Backups are private and durable before writes. Keep the newest 20 complete
+# backups; pruning never removes the current run's backup, even after clock
+# rollback. Unexpected files, symlinks or non-private backups stop writes.
+# Keep state and backups on persistent local storage, not a network mount.
+
+[dhcp_pull]
+base_url = https://dnsgrid.example.invalid
+site_id = 1
+ifname = eth0
+subnet = 192.168.1.0/24
+token = CHANGE_ME_BEFORE_USE
+state_dir = /var/lib/dnsgrid-dhcp
+timeout = 30
+# ca_file = /private/path/internal-ca.pem

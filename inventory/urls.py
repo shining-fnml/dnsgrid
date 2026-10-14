@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import views
+from . import dhcp_api, dhcp_views, views
 
 urlpatterns = [
     path("", views.grid, name="grid"),
@@ -14,6 +14,15 @@ urlpatterns = [
     path("settings/lower-dns-serial/", views.dns_baseline_preview, name="dns-baseline-preview"),
     path("exports/", views.exports, name="exports"),
     path("exports/publish-dns/", views.dns_publish, name="dns-publish"),
+    path("exports/dhcp/preview/", dhcp_views.preview, name="dhcp-preview"),
+    path("exports/dhcp/publish/", dhcp_views.publish, name="dhcp-publish"),
+    path("exports/dhcp/status/", dhcp_views.status, name="dhcp-status"),
+    path(
+        "exports/dhcp/sites/<int:site_id>/<int:publication_id>/download/",
+        dhcp_views.download, name="dhcp-publication-download",
+    ),
+    path("api/dhcp/sites/<int:site_id>/latest/", dhcp_api.latest, name="dhcp-latest"),
+    path("api/dhcp/sites/<int:site_id>/results/", dhcp_api.result, name="dhcp-result"),
     path("archive/download/", views.archive_download, name="archive-download"),
     path("archive/upload/", views.archive_upload, name="archive-upload"),
     path("exports/download/<str:filename>/", views.download, name="download"),
