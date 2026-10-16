@@ -722,6 +722,27 @@ class PullTests(SimpleTestCase):
         self.assertNotIn("set", self.dsm.calls)
         self.assertEqual(self.transport.posts, [])
 
+    def test_state_replace_and_sync_failures_keep_local_context(self):
+        with pull.Store(self.config) as store:
+            for function, operation, expected_path in (
+                ("replace", "replace file", store.path / "state.json"),
+                ("fsync", "sync temporary file", None),
+            ):
+                with self.subTest(function=function), \
+                        patch.object(pull.os, function, side_effect=OSError(errno.ENOSPC, "private-body")):
+                    with self.assertRaises(OSError) as raised:
+                        store.save(pull.empty_state(self.config))
+                diagnostic = raised.exception.diagnostic
+                self.assertEqual(diagnostic.operation, operation)
+                if expected_path is not None:
+                    self.assertEqual(diagnostic.path, expected_path)
+                else:
+                    self.assertEqual(diagnostic.path.parent, store.path)
+                    self.assertTrue(diagnostic.path.name.startswith(".state-"))
+                self.assertEqual(diagnostic.failed, ("no_space",))
+                self.assertNotIn("private-body", diagnostic.render())
+                self.assertEqual(list(store.path.glob(".state-*")), [])
+
     def test_version_reuse_with_changed_content_rejected(self):
         self.run_pull()
         self.transport.current = envelope(offset=20)
@@ -928,7 +949,9 @@ class FilesystemDiagnosticTests(SimpleTestCase):
         for number, reason in (
             (errno.ENOENT, "missing"), (errno.EACCES, "permission_denied"),
             (errno.EPERM, "permission_denied"), (errno.ELOOP, "symlink_rejected"),
-            (errno.ENOTDIR, "not_directory_or_symlink_rejected"), (errno.EIO, "filesystem_error"),
+            (errno.ENOTDIR, "not_directory_or_symlink_rejected"), (errno.EIO, "io_error"),
+            (errno.ENOSPC, "no_space"), (errno.EROFS, "read_only_filesystem"),
+            (errno.EBADF, "filesystem_error"),
         ):
             original = OSError(number, "secret-token\nAuthorization: private-server-body")
             with self.subTest(errno=number), patch.object(Path, "lstat", side_effect=original):
@@ -1074,6 +1097,10 @@ class SchemaConfigTests(SimpleTestCase):
             self.assertEqual(raised.exception.code, "invalid_config")
             self.assertEqual(raised.exception.diagnostic.context, context)
             self.assertEqual(raised.exception.diagnostic.failed, ("nonabsolute_path",))
+
+    def test_relative_config_still_works_with_safe_ancestors(self):
+        relative = self.path.relative_to(Path.cwd())
+        self.assertEqual(pull.load_config(relative), self.config)
 
     def test_strict_envelope_schema_metadata_subnet_checksum(self):
         good = envelope()

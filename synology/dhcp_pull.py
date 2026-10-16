@@ -90,6 +90,9 @@ def local_call(path, context, operation, function, *args, **kwargs):
             errno.ELOOP: "symlink_rejected",
             errno.ENOTDIR: "not_directory_or_symlink_rejected",
             errno.EEXIST: "already_exists",
+            errno.ENOSPC: "no_space",
+            errno.EROFS: "read_only_filesystem",
+            errno.EIO: "io_error",
         }.get(error.errno, "filesystem_error")
         error.diagnostic = FilesystemDiagnostic(
             path, context, operation, (reason,),
@@ -110,9 +113,12 @@ def check_metadata(info, path, context, operation, code, *, directory=False,
                    parent=False, writable=False):
     euid = os.geteuid()
     mode = stat.S_IMODE(info.st_mode)
-    kind = ("symlink" if stat.S_ISLNK(info.st_mode) else
-            "directory" if stat.S_ISDIR(info.st_mode) else
-            "regular_file" if stat.S_ISREG(info.st_mode) else "other")
+    kind = next((name for name, check in (
+        ("symlink", stat.S_ISLNK), ("directory", stat.S_ISDIR),
+        ("regular_file", stat.S_ISREG), ("fifo", stat.S_ISFIFO),
+        ("socket", stat.S_ISSOCK), ("character_device", stat.S_ISCHR),
+        ("block_device", stat.S_ISBLK),
+    ) if check(info.st_mode)), "unknown")
     failed = []
     if directory and not stat.S_ISDIR(info.st_mode):
         failed.append("symlink" if kind == "symlink" else "nondirectory")
@@ -228,7 +234,7 @@ def read_private(path, maximum, context="private file"):
                     path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as file:
         secure_file(file.fileno(), path=path, context=context)
-        body = file.read(maximum + 1)
+        body = local_call(path, context, "read file", file.read, maximum + 1)
         require(len(body) <= maximum, "size_limit")
         return body
 
@@ -443,7 +449,7 @@ class Store:
                 parent = local_call(self.path.parent, "state", "open parent for sync", os.open,
                                     self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
                 try:
-                    os.fsync(parent)
+                    local_call(self.path.parent, "state", "sync parent", os.fsync, parent)
                 finally:
                     os.close(parent)
             self.lock = local_call(
@@ -452,7 +458,8 @@ class Store:
             )
             secure_file(self.lock, writable=True, path=self.path / "lock", context="state lock")
             try:
-                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                local_call(self.path / "lock", "state lock", "lock file", fcntl.flock,
+                           self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise SafeError("already_running") from None
             return self
@@ -476,7 +483,7 @@ class Store:
             return empty_state(self.config)
         with os.fdopen(fd, "rb") as file:
             secure_file(file.fileno(), writable=True, path=self.path / "state.json", context="state")
-            body = file.read(MAX_STATE + 1)
+            body = local_call(self.path / "state.json", "state", "read file", file.read, MAX_STATE + 1)
             require(len(body) <= MAX_STATE, "size_limit")
             return validate_state(parse_json(body), self.config)
 
@@ -497,16 +504,21 @@ class Store:
                 os.close(old)
         name = ".state-" + uuid.uuid4().hex
         try:
-            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
+            path = self.path / name
+            fd = local_call(path, "state", "create temporary file", os.open,
+                            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                            0o600, dir_fd=self.fd)
             with os.fdopen(fd, "wb") as file:
-                file.write(body)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(name, "state.json", src_dir_fd=self.fd, dst_dir_fd=self.fd)
-            os.fsync(self.fd)
+                local_call(path, "state", "write temporary file", file.write, body)
+                local_call(path, "state", "flush temporary file", file.flush)
+                local_call(path, "state", "sync temporary file", os.fsync, file.fileno())
+            local_call(self.path / "state.json", "state", "replace file", os.replace,
+                       name, "state.json", src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            local_call(self.path, "state", "sync directory", os.fsync, self.fd)
         finally:
             try:
-                os.unlink(name, dir_fd=self.fd)
+                local_call(self.path / name, "state", "remove temporary file", os.unlink,
+                           name, dir_fd=self.fd)
             except FileNotFoundError:
                 pass
 
@@ -525,10 +537,10 @@ class Store:
             fd = local_call(path, "backups", "open directory for sync", os.open,
                             path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
-                os.fsync(fd)
+                local_call(path, "backups", "sync directory", os.fsync, fd)
             finally:
                 os.close(fd)
-        os.fsync(self.fd)
+        local_call(self.path, "state", "sync directory", os.fsync, self.fd)
         self.prune_backups(directory, backup)
 
     def prune_backups(self, directory, newest):
