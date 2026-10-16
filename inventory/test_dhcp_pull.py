@@ -1,10 +1,12 @@
 import copy
+import errno
 import http.client
 import io
 import json
 import os
 from pathlib import Path
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -657,6 +659,90 @@ class PullTests(SimpleTestCase):
         with self.assertRaises(pull.SafeError):
             self.run_pull()
 
+    def test_state_lock_and_backup_file_diagnostics_identify_exact_leaf(self):
+        self.run_pull()
+        directory = self.config["state_dir"]
+        backup, = (directory / "backups").iterdir()
+        for path, context in (
+            (directory / "lock", "state lock"), (directory / "state.json", "state"),
+            (backup / "response.json", "backups"), (backup / "reservations.json", "backups"),
+        ):
+            path.chmod(0o644)
+            try:
+                with self.subTest(path=path), self.assertRaises(pull.SafeError) as raised:
+                    if context == "backups":
+                        with pull.Store(self.config) as store:
+                            store.prune_backups(directory / "backups", backup)
+                    else:
+                        self.run_pull()
+                self.assertEqual(raised.exception.code, "unsafe_file")
+                self.assertEqual(raised.exception.diagnostic.path, path)
+                self.assertEqual(raised.exception.diagnostic.context, context)
+                self.assertIn("mode=0o0644", raised.exception.diagnostic.render())
+                self.assertIn("mode=0o0600 nlink=1", raised.exception.diagnostic.render())
+            finally:
+                path.chmod(0o600)
+        with pull.Store(self.config) as store:
+            path = directory / "state.json"
+            path.chmod(0o400)
+            try:
+                with self.assertRaises(pull.SafeError) as raised:
+                    store.save(self.state())
+                self.assertEqual(raised.exception.diagnostic.path, path)
+                self.assertEqual(raised.exception.code, "unsafe_file")
+            finally:
+                path.chmod(0o600)
+        backup.chmod(0o750)
+        try:
+            with pull.Store(self.config) as store, self.assertRaises(pull.SafeError) as raised:
+                store.prune_backups(directory / "backups", backup)
+            self.assertEqual(raised.exception.code, "unsafe_backup")
+            self.assertEqual(raised.exception.diagnostic.path, backup)
+        finally:
+            backup.chmod(0o700)
+
+    def test_backup_oserror_keeps_persistence_code_context_and_no_remote_details(self):
+        original = Path.lstat
+        directory = self.config["state_dir"] / "backups"
+
+        def lstat(path):
+            if path == directory:
+                raise PermissionError(errno.EACCES, "private-token-and-body")
+            return original(path)
+
+        output = io.StringIO()
+        with patch.object(Path, "lstat", autospec=True, side_effect=lstat), \
+                patch.object(pull, "load_config", return_value=self.config), patch("sys.stderr", output):
+            self.assertEqual(pull.main(["--config", "/private/pull.ini"]), 1)
+        text = output.getvalue()
+        self.assertIn("DHCP pull stopped: persistence_failed.", text)
+        self.assertIn(f'backups: lstat directory path="{directory}"', text)
+        self.assertIn("permission_denied", text)
+        self.assertNotIn("private-token-and-body", text)
+        self.assertNotIn("set", self.dsm.calls)
+        self.assertEqual(self.transport.posts, [])
+
+    def test_state_replace_and_sync_failures_keep_local_context(self):
+        with pull.Store(self.config) as store:
+            for function, operation, expected_path in (
+                ("replace", "replace file", store.path / "state.json"),
+                ("fsync", "sync temporary file", None),
+            ):
+                with self.subTest(function=function), \
+                        patch.object(pull.os, function, side_effect=OSError(errno.ENOSPC, "private-body")):
+                    with self.assertRaises(OSError) as raised:
+                        store.save(pull.empty_state(self.config))
+                diagnostic = raised.exception.diagnostic
+                self.assertEqual(diagnostic.operation, operation)
+                if expected_path is not None:
+                    self.assertEqual(diagnostic.path, expected_path)
+                else:
+                    self.assertEqual(diagnostic.path.parent, store.path)
+                    self.assertTrue(diagnostic.path.name.startswith(".state-"))
+                self.assertEqual(diagnostic.failed, ("no_space",))
+                self.assertNotIn("private-body", diagnostic.render())
+                self.assertEqual(list(store.path.glob(".state-*")), [])
+
     def test_version_reuse_with_changed_content_rejected(self):
         self.run_pull()
         self.transport.current = envelope(offset=20)
@@ -710,6 +796,217 @@ class PullTests(SimpleTestCase):
         self.assertEqual(sum(not child.name.startswith("dsm-eth0-2999") for child in directory.iterdir()), 1)
 
 
+class FilesystemDiagnosticTests(SimpleTestCase):
+    def setUp(self):
+        effective_uid = patch("synology.dhcp_pull.os.geteuid", return_value=1234)
+        effective_uid.start()
+        self.addCleanup(effective_uid.stop)
+
+    @staticmethod
+    def metadata(mode=stat.S_IFDIR | 0o755, uid=0, nlink=1):
+        return os.stat_result((mode, 0, 0, nlink, uid, 0, 0, 0, 0, 0))
+
+    def cli_error(self, error, code, expected_exit=1):
+        output = io.StringIO()
+        with patch.object(pull, "load_config", return_value={}), \
+                patch.object(pull, "run", side_effect=error), patch("sys.stderr", output):
+            self.assertEqual(pull.main(["--config", "/private/pull.ini"]), expected_exit)
+        text = output.getvalue()
+        self.assertTrue(text.startswith("DHCP pull stopped: " + code + "."))
+        self.assertEqual(len(text.splitlines()), 1)
+        return text
+
+    def test_exact_first_failing_ancestor_including_root(self):
+        path = Path("/private/nested/pull.ini")
+        parents = [Path("/"), Path("/private"), Path("/private/nested")]
+        for index, bad in enumerate(parents):
+            checked = []
+
+            def lstat(parent):
+                checked.append(parent)
+                return self.metadata(mode=stat.S_IFDIR | (0o777 if parent == bad else 0o755))
+
+            with self.subTest(parent=bad), patch.object(Path, "lstat", autospec=True, side_effect=lstat):
+                with self.assertRaises(pull.SafeError) as raised:
+                    pull.secure_parents(path, "config")
+                error = raised.exception
+                self.assertEqual(error.code, "unsafe_path")
+                self.assertEqual(error.diagnostic.path, bad)
+                self.assertEqual(checked, parents[:index + 1])
+                text = self.cli_error(error, "unsafe_path")
+                self.assertIn(f'path="{bad}"', text)
+                self.assertIn("config: validate ancestor", text)
+                self.assertIn("mode=0o0777", text)
+                self.assertIn("mode&0o0022=0", text)
+
+    def test_parent_reasons_and_all_observed_metadata(self):
+        for mode, uid, failed in (
+            (stat.S_IFLNK | 0o755, 0, ("symlink",)),
+            (stat.S_IFREG | 0o755, 0, ("nondirectory",)),
+            (stat.S_IFIFO | 0o700, 0, ("nondirectory",)),
+            (stat.S_IFDIR | 0o755, 42, ("untrusted_owner",)),
+            (stat.S_IFDIR | 0o775, 0, ("group_or_other_writable",)),
+            (stat.S_IFDIR | 0o757, 0, ("group_or_other_writable",)),
+            (stat.S_IFLNK | 0o777, 42,
+             ("symlink", "untrusted_owner", "group_or_other_writable")),
+        ):
+            def lstat(parent):
+                return self.metadata(mode, uid) if parent == Path("/bad") else self.metadata()
+
+            with self.subTest(mode=mode, uid=uid), \
+                    patch.object(Path, "lstat", autospec=True, side_effect=lstat):
+                with self.assertRaises(pull.SafeError) as raised:
+                    pull.secure_parents(Path("/bad/child/leaf"), "CA")
+                diagnostic = raised.exception.diagnostic
+                self.assertEqual(diagnostic.path, Path("/bad"))
+                self.assertEqual(diagnostic.failed, failed)
+                text = self.cli_error(raised.exception, "unsafe_path")
+                self.assertIn(f"uid={uid}", text)
+                self.assertIn(f"mode=0o{stat.S_IMODE(mode):04o}", text)
+                self.assertIn("euid=1234", text)
+                self.assertIn("uid=0 or 1234", text)
+                self.assertIn("type=", text)
+
+    def test_nonabsolute_path_is_not_inspected(self):
+        with patch.object(Path, "lstat") as lstat:
+            with self.assertRaises(pull.SafeError) as raised:
+                pull.secure_parents(Path("relative/leaf"), "state")
+        lstat.assert_not_called()
+        self.assertEqual(raised.exception.code, "unsafe_path")
+        self.assertIn("nonabsolute_path", raised.exception.diagnostic.render())
+        self.assertIn("expected absolute path", raised.exception.diagnostic.render())
+
+    def test_allowed_parent_metadata_is_unchanged(self):
+        for uid in (0, 1234):
+            for mode in (0o700, 0o755, 0o555, 0o2755):
+                with self.subTest(uid=uid, mode=mode), \
+                        patch.object(Path, "lstat", return_value=self.metadata(stat.S_IFDIR | mode, uid)):
+                    pull.secure_parents(Path("/private/leaf"))
+
+    def test_file_rejections_and_allowed_modes_are_unchanged(self):
+        for mode, uid, nlink, failed in (
+            (stat.S_IFREG | 0o644, 1234, 1, "mode_not_private"),
+            (stat.S_IFREG | 0o600, 0, 1, "untrusted_owner"),
+            (stat.S_IFREG | 0o600, 1234, 2, "link_count_not_one"),
+            (stat.S_IFDIR | 0o600, 1234, 1, "not_regular_file"),
+            (stat.S_IFIFO | 0o600, 1234, 1, "not_regular_file"),
+            (stat.S_IFLNK | 0o600, 1234, 1, "symlink"),
+        ):
+            with self.subTest(mode=mode, uid=uid, nlink=nlink), \
+                    patch.object(pull.os, "fstat", return_value=self.metadata(mode, uid, nlink)):
+                with self.assertRaises(pull.SafeError) as raised:
+                    pull.secure_file(10, path=Path("/private/pull.ini"), context="config")
+                text = self.cli_error(raised.exception, "unsafe_file")
+                self.assertIn(failed, text)
+                self.assertIn("config: validate file", text)
+                self.assertIn("uid=1234 (euid) mode=0o0400 or 0o0600 nlink=1", text)
+        for writable, mode, allowed in (
+            (False, 0o400, True), (False, 0o600, True), (True, 0o600, True),
+            (True, 0o400, False), (False, 0o660, False), (True, 0o1600, False),
+        ):
+            with self.subTest(writable=writable, mode=mode), \
+                    patch.object(pull.os, "fstat", return_value=self.metadata(stat.S_IFREG | mode, 1234)):
+                if allowed:
+                    pull.secure_file(10, writable)
+                else:
+                    with self.assertRaises(pull.SafeError):
+                        pull.secure_file(10, writable)
+
+    def test_state_directory_reports_checked_metadata_and_closes_fd(self):
+        for mode, uid, failed in (
+            (0o755, 1234, "mode_not_private"), (0o700, 0, "untrusted_owner"),
+        ):
+            with self.subTest(mode=mode, uid=uid), patch.object(pull, "secure_parents"), \
+                    patch.object(Path, "mkdir", side_effect=FileExistsError), \
+                    patch.object(pull.os, "open", return_value=10), \
+                    patch.object(pull.os, "fstat", return_value=self.metadata(stat.S_IFDIR | mode, uid)), \
+                    patch.object(pull.os, "close") as close:
+                with self.assertRaises(pull.SafeError) as raised:
+                    with pull.Store({"state_dir": Path("/private/state")}):
+                        self.fail("Unsafe directory was accepted")
+                text = self.cli_error(raised.exception, "unsafe_directory")
+                self.assertIn('state: validate directory path="/private/state"', text)
+                self.assertIn(failed, text)
+                self.assertIn("expected type=directory uid=1234 (euid) mode=0o0700", text)
+                close.assert_called_once_with(10)
+
+    def test_backup_directory_type_owner_and_mode(self):
+        for mode, uid, failed in (
+            (stat.S_IFLNK | 0o777, 1234, "symlink"),
+            (stat.S_IFREG | 0o700, 1234, "nondirectory"),
+            (stat.S_IFDIR | 0o700, 42, "untrusted_owner"),
+            (stat.S_IFDIR | 0o750, 1234, "mode_not_private"),
+        ):
+            with self.subTest(mode=mode, uid=uid), patch.object(Path, "mkdir"), \
+                    patch.object(Path, "lstat", return_value=self.metadata(mode, uid)):
+                with self.assertRaises(pull.SafeError) as raised:
+                    pull.Store({"state_dir": Path("/private/state")}).backup({}, {})
+                text = self.cli_error(raised.exception, "unsafe_directory")
+                self.assertIn('path="/private/state/backups"', text)
+                self.assertIn(failed, text)
+
+    def test_local_oserror_context_uses_allowlisted_reasons_not_exception_text(self):
+        for number, reason in (
+            (errno.ENOENT, "missing"), (errno.EACCES, "permission_denied"),
+            (errno.EPERM, "permission_denied"), (errno.ELOOP, "symlink_rejected"),
+            (errno.ENOTDIR, "not_directory_or_symlink_rejected"), (errno.EIO, "io_error"),
+            (errno.ENOSPC, "no_space"), (errno.EROFS, "read_only_filesystem"),
+            (errno.EBADF, "filesystem_error"),
+        ):
+            original = OSError(number, "secret-token\nAuthorization: private-server-body")
+            with self.subTest(errno=number), patch.object(Path, "lstat", side_effect=original):
+                with self.assertRaises(OSError) as raised:
+                    pull.secure_parents(Path("/private/leaf"), "config")
+                self.assertIs(raised.exception, original)
+                self.assertEqual(raised.exception.diagnostic.path, Path("/"))
+                text = self.cli_error(raised.exception, "local_or_transport_failure")
+                self.assertIn(reason, text)
+                self.assertIn(f"errno={number}", text)
+                self.assertIn("lstat ancestor", text)
+                self.assertNotIn("secret-token", text)
+                self.assertNotIn("Authorization", text)
+                self.assertNotIn("private-server-body", text)
+        with patch.object(pull, "secure_parents"), \
+                patch.object(pull.os, "open", side_effect=OSError(errno.ELOOP, "private-data")):
+            with self.assertRaises(OSError) as raised:
+                pull.read_private("/private/ca.pem", 100, "CA")
+            text = self.cli_error(raised.exception, "local_or_transport_failure")
+            self.assertIn('CA: open file (no symlinks) path="/private/ca.pem"', text)
+            self.assertIn("symlink_rejected", text)
+            self.assertNotIn("private-data", text)
+
+    def test_unusual_paths_are_escaped_bounded_and_single_line(self):
+        for path in ("/private/line\nbreak\r\t\x1b\x00\u2028\u202e.pem", "/private/" + "\n" * 10000):
+            error = pull.SafeError("unsafe_path", pull.FilesystemDiagnostic(
+                Path(path), "config", "validate ancestor", ("group_or_other_writable",),
+            ))
+            text = self.cli_error(error, "unsafe_path")
+            self.assertLess(len(text), 500)
+            self.assertTrue(text[:-1].isascii())
+            self.assertNotIn("\x1b", text)
+            self.assertIn("\\n", text)
+        self.assertIn("[truncated]", text)
+
+    def test_code_only_and_unknown_exceptions_keep_exact_redacted_output(self):
+        for error, code, exit_code in (
+            (pull.SafeError("already_running"), "already_running", 3),
+            (pull.SafeError("unsafe_path"), "unsafe_path", 1),
+            (pull.SafeError("unsafe_file"), "unsafe_file", 1),
+            (OSError("private-data"), "local_or_transport_failure", 1),
+            (ValueError("private-data"), "local_or_transport_failure", 1),
+            (subprocess.TimeoutExpired("private-data", 1), "local_or_transport_failure", 1),
+        ):
+            self.assertEqual(self.cli_error(error, code, exit_code), f"DHCP pull stopped: {code}.\n")
+
+    def test_local_diagnostic_cannot_be_sent_as_remote_ack(self):
+        diagnostic = pull.FilesystemDiagnostic(
+            Path("/private/state"), "state", "validate directory", ("mode_not_private",),
+        )
+        with self.assertRaises(pull.SafeError) as raised:
+            pull.acknowledgement(envelope(), "failed", diagnostic)
+        self.assertEqual(raised.exception.code, "invalid_state")
+
+
 class SchemaConfigTests(SimpleTestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix=".dhcp-tests-", dir=Path.cwd())
@@ -747,8 +1044,12 @@ class SchemaConfigTests(SimpleTestCase):
 
     def test_private_config_regular_file_ownership_mode_and_size(self):
         self.path.chmod(0o644)
-        with self.assertRaises(pull.SafeError):
+        with self.assertRaises(pull.SafeError) as raised:
             pull.load_config(self.path)
+        self.assertEqual(raised.exception.code, "unsafe_file")
+        self.assertEqual(raised.exception.diagnostic.path, self.path)
+        self.assertEqual(raised.exception.diagnostic.context, "config")
+        self.assertIn("mode=0o0644", raised.exception.diagnostic.render())
         self.path.chmod(0o400)
         self.assertEqual(pull.load_config(self.path)["site_id"], 7)
         self.path.chmod(0o600)
@@ -768,6 +1069,38 @@ class SchemaConfigTests(SimpleTestCase):
         with patch("synology.dhcp_pull.os.geteuid", return_value=os.geteuid() + 1):
             with self.assertRaises(pull.SafeError):
                 pull.load_config(self.path)
+
+    def test_config_ancestor_symlink_is_checked_lexically_not_resolved(self):
+        link = self.root / "linked"
+        link.symlink_to(self.root, target_is_directory=True)
+        for path in (link / self.path.name, link / ".." / self.root.name / self.path.name):
+            with self.subTest(path=path), self.assertRaises(pull.SafeError) as raised:
+                pull.load_config(path)
+            self.assertEqual(raised.exception.code, "unsafe_path")
+            self.assertEqual(raised.exception.diagnostic.path, link)
+            self.assertIn("symlink", raised.exception.diagnostic.failed)
+            self.assertEqual(raised.exception.diagnostic.context, "config")
+
+    def test_config_open_failure_and_nonabsolute_settings_have_safe_context(self):
+        missing = self.root / "missing.ini"
+        with self.assertRaises(OSError) as raised:
+            pull.load_config(missing)
+        self.assertEqual(raised.exception.diagnostic.path, missing)
+        self.assertEqual(raised.exception.diagnostic.failed, ("missing",))
+        for old, new, context in (
+            (str(self.root / "state"), "relative/state", "state"),
+            ("timeout = 3", "timeout = 3\nca_file = relative.pem", "CA"),
+        ):
+            self.write(self.text.replace(old, new))
+            with self.assertRaises(pull.SafeError) as raised:
+                pull.load_config(self.path)
+            self.assertEqual(raised.exception.code, "invalid_config")
+            self.assertEqual(raised.exception.diagnostic.context, context)
+            self.assertEqual(raised.exception.diagnostic.failed, ("nonabsolute_path",))
+
+    def test_relative_config_still_works_with_safe_ancestors(self):
+        relative = self.path.relative_to(Path.cwd())
+        self.assertEqual(pull.load_config(relative), self.config)
 
     def test_strict_envelope_schema_metadata_subnet_checksum(self):
         good = envelope()
@@ -877,7 +1210,7 @@ class TransportTests(SimpleTestCase):
                 patch("synology.dhcp_pull.urllib.request.build_opener") as build, \
                 patch("synology.dhcp_pull.read_private", return_value=b"private-pem-data") as read:
             transport = pull.Transport({**self.config, "ca_file": "/private/ca.pem"})
-        read.assert_called_once_with("/private/ca.pem", pull.MAX_BODY)
+        read.assert_called_once_with("/private/ca.pem", pull.MAX_BODY, "CA")
         context.assert_called_once_with(cadata="private-pem-data")
         build.return_value.open.return_value = FakeResponse(b"", 204)
         ack = pull.acknowledgement(envelope(), "rejected", "dsm_drift")

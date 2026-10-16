@@ -11,6 +11,7 @@ __pycache__/
 .venv/
 staticfiles/
 .coverage
+/.dhcp-tests-*/
 
 # Local operational data, not source or test fixtures.
 /backups/

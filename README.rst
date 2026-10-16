@@ -1318,11 +1318,17 @@ This example's site ID and subnet are independent. Configure the other NAS
 instances from their actual site IDs, interfaces and subnets, not by substituting
 subnet octets for IDs. The hostname above is intentionally non-routable.
 
-Config files must be regular, owned by the scheduling user and mode 0600 or
-0400. Use persistent local storage with private 0700 state directories; do not
+Config files and optional CA files must be regular, owned by the scheduling
+user, have one hard link, and be mode 0600 or 0400. Use persistent local storage
+with private 0700 state directories; do not
 use a shared directory or network mount. Parent directories must be owned by
 root or the scheduling user, not group/world writable, and must not contain
-symlinks. Protect both scripts from modification by untrusted accounts. Local
+symlinks. These checks cover **every ancestor from** ``/`` **to the immediate
+parent** of the configuration file, optional CA file and state directory, not
+just the leaf file or private state directory. State files and the lock must
+be regular, owned by the scheduling user, mode 0600 and have one hard link;
+backup directories must be private 0700 directories with protected 0600 files.
+Protect both scripts from modification by untrusted accounts. Local
 DSM permissions remain local: the script uses the fixed
 ``/usr/syno/bin/synowebapi`` through the existing helper. If DSM requires root,
 schedule under root; do not grant remote dnsgrid any sudo or DSM credentials.
@@ -1341,6 +1347,60 @@ timeouts on the NAS as well. Each DSM call has a 120-second deadline; a run can
 make multiple calls.
 Inputs, state, response sizes and diagnostics are bounded. Downloaded data is
 validated, never executed or interpreted as commands.
+
+Filesystem security troubleshooting
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+An older message containing only ``DHCP pull stopped: unsafe_path.`` does not
+identify the failing component or root cause. Run the updated client manually
+under the **same user as the scheduled task** to obtain local diagnostics before
+deciding what to change. For example (illustrative paths and numeric IDs only)::
+
+    DHCP pull stopped: unsafe_path. config: validate ancestor path="/example/shared"; failed=group_or_other_writable; observed type=directory uid=0 mode=0o0775 nlink=2 euid=1026; expected type=directory uid=0 or 1026 (euid) mode&0o0022=0
+
+Here the rejected component is ``/example/shared``, not necessarily the INI
+file passed to ``--config``. Its owner UID 0 is permitted, but mode ``0o0775``
+allows group writes. ``euid`` is the effective numeric UID running the client;
+ancestor owners must be UID 0 or that UID, and neither group nor other write
+bits (``0o0022``) may be set. A different message may identify a symlink,
+nondirectory, untrusted owner, or multiple failed conditions. Symlinks are
+checked lexically, not resolved away, including before ``..`` components.
+The first failing ancestor is reported, starting at ``/``; fixing one problem
+can reveal a later failing component.
+
+``unsafe_file`` identifies a checked config/CA, state, lock or backup file
+and reports its actual type, UID, octal mode and hard-link count against the
+expected values. For example, a state file observed as ``mode=0o0644`` fails
+the required ``mode=0o0600`` even if its owner is correct.
+``unsafe_directory`` similarly describes the state or backups directory;
+``unsafe_backup`` can identify an unexpected backup directory or contents.
+Known local ``lstat``/``open`` failures include the attempted component,
+operation and a fixed reason such as ``missing``, ``permission_denied`` or
+``symlink_rejected`` plus numeric errno, rather than raw exception text.
+These details accompany the existing error codes and do not change exit codes.
+
+Inspect the reported component and each ancestor using read-only commands
+under the scheduling account, substituting the actual path and quoting it::
+
+    id -u
+    ls -ld -- / /example /example/shared
+    stat -c 'path=%n uid=%u mode=%a type=%F links=%h' -- /example/shared
+
+Do not use ``stat -L`` when investigating symlinks. Do not paste escaped or
+truncated log paths into a shell as commands; consult the original configured
+path instead. Do not display or share INI contents or tokens for troubleshooting.
+Diagnostics intentionally include local paths and numeric metadata; control
+characters are escaped and long paths truncated to keep each entry bounded
+and single-line. Remote acknowledgements still contain only fixed allowlisted
+diagnostic codes, never these local details.
+
+Do **not** apply blanket ``chmod``/``chown`` changes to DSM-managed shared
+parents, make recursive permission changes, or weaken checks. Review the
+specific component with the NAS administrator and choose persistent private
+storage whose entire ancestor chain satisfies the requirements. The client
+does not repair permissions or audit DSM ACLs: its checks use filesystem type,
+numeric UID, POSIX mode bits and file hard-link count. Passing them is not a
+promise that every ACL or storage-level security property has been audited.
 
 Recovery and operational limitations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1386,8 +1446,9 @@ backup names, permissions or contents block writes rather than being removed.
 
 Exit 0 means a verified no-op/application and delivered report, 1 means failure
 or report retry, 2 means rejected/operator review, and 3 means the lock was busy.
-Scheduler logs contain bounded English codes, not raw DSM/server output or
-tokens. An unavailable hub, bad authentication, malformed response, corrupt state
+Scheduler logs contain bounded English codes and safe local filesystem details,
+not raw DSM/server output or tokens. An unavailable hub, bad authentication,
+malformed response, corrupt state
 or invalid mapping must not clear existing reservations. Client leases, pools,
 options, gateway and DNS settings remain outside this reservation-only workflow.
 All automated tests mock DSM/network operations; real DSM permissions, TLS/VPN

@@ -3,6 +3,7 @@
 import argparse
 import configparser
 from datetime import datetime
+import errno
 import fcntl
 import hashlib
 import http.client
@@ -50,8 +51,101 @@ NEW_REPORT = object()
 
 
 class SafeError(Exception):
-    def __init__(self, code):
+    def __init__(self, code, diagnostic=None):
         self.code = code
+        self.diagnostic = diagnostic
+
+
+class FilesystemDiagnostic:
+    """Only local paths and trusted, structured validation facts belong here."""
+    def __init__(self, path, context, operation, failed, observed=None, expected=None):
+        self.path = path
+        self.context = context
+        self.operation = operation
+        self.failed = failed
+        self.observed = observed
+        self.expected = expected
+
+    def render(self):
+        path = json.dumps(str(self.path), ensure_ascii=True)
+        if len(path) > 320:
+            path = path[:320] + '..." [truncated]'
+        detail = f"{self.context}: {self.operation} path={path}; failed={','.join(self.failed)}"
+        if self.observed:
+            detail += "; observed " + self.observed
+        if self.expected:
+            detail += "; expected " + self.expected
+        return detail
+
+
+def local_call(path, context, operation, function, *args, **kwargs):
+    """Annotate only known local operations, preserving OSError handling."""
+    try:
+        return function(*args, **kwargs)
+    except OSError as error:
+        reason = {
+            errno.ENOENT: "missing",
+            errno.EACCES: "permission_denied",
+            errno.EPERM: "permission_denied",
+            errno.ELOOP: "symlink_rejected",
+            errno.ENOTDIR: "not_directory_or_symlink_rejected",
+            errno.EEXIST: "already_exists",
+            errno.ENOSPC: "no_space",
+            errno.EROFS: "read_only_filesystem",
+            errno.EIO: "io_error",
+        }.get(error.errno, "filesystem_error")
+        error.diagnostic = FilesystemDiagnostic(
+            path, context, operation, (reason,),
+            observed=f"errno={error.errno}" if error.errno is not None else None,
+        )
+        raise
+
+
+def require_absolute(path, code, context):
+    if not path.is_absolute():
+        raise SafeError(code, FilesystemDiagnostic(
+            path, context, "validate path", ("nonabsolute_path",),
+            observed="relative path", expected="absolute path",
+        ))
+
+
+def check_metadata(info, path, context, operation, code, *, directory=False,
+                   parent=False, writable=False):
+    euid = os.geteuid()
+    mode = stat.S_IMODE(info.st_mode)
+    kind = next((name for name, check in (
+        ("symlink", stat.S_ISLNK), ("directory", stat.S_ISDIR),
+        ("regular_file", stat.S_ISREG), ("fifo", stat.S_ISFIFO),
+        ("socket", stat.S_ISSOCK), ("character_device", stat.S_ISCHR),
+        ("block_device", stat.S_ISBLK),
+    ) if check(info.st_mode)), "unknown")
+    failed = []
+    if directory and not stat.S_ISDIR(info.st_mode):
+        failed.append("symlink" if kind == "symlink" else "nondirectory")
+    elif not directory and not stat.S_ISREG(info.st_mode):
+        failed.append("symlink" if kind == "symlink" else "not_regular_file")
+    if info.st_uid not in ({0, euid} if parent else {euid}):
+        failed.append("untrusted_owner")
+    if parent:
+        if mode & 0o022:
+            failed.append("group_or_other_writable")
+        expected = f"type=directory uid=0 or {euid} (euid) mode&0o0022=0"
+    else:
+        modes = {0o700} if directory else {0o600} if writable else {0o400, 0o600}
+        if mode not in modes:
+            failed.append("mode_not_private")
+        expected = (f"type={'directory' if directory else 'regular_file'} uid={euid} (euid) "
+                    "mode=" + " or ".join(f"0o{value:04o}" for value in sorted(modes)))
+        if not directory:
+            if info.st_nlink != 1:
+                failed.append("link_count_not_one")
+            expected += " nlink=1"
+    if failed:
+        raise SafeError(code, FilesystemDiagnostic(
+            path, context, operation, tuple(failed),
+            observed=f"type={kind} uid={info.st_uid} mode=0o{mode:04o} nlink={info.st_nlink} euid={euid}",
+            expected=expected,
+        ))
 
 
 def require(condition, code="invalid_response"):
@@ -117,28 +211,30 @@ def equal(left, right):
         dsm_apply.canonical_lines(dsm_apply.validate_payload(right))
 
 
-def secure_parents(path):
+def secure_parents(path, context="local path"):
     """Reject symlinked or untrusted writable ancestors, not just the leaf."""
-    require(path.is_absolute(), "unsafe_path")
+    require_absolute(path, "unsafe_path", context)
     for parent in reversed(path.parents):
-        info = parent.lstat()
-        require(stat.S_ISDIR(info.st_mode) and info.st_uid in {0, os.geteuid()} and
-                not info.st_mode & 0o022, "unsafe_path")
+        info = local_call(parent, context, "lstat ancestor", parent.lstat)
+        check_metadata(info, parent, context, "validate ancestor", "unsafe_path",
+                       directory=True, parent=True)
 
 
-def secure_file(fd, writable=False):
-    info = os.fstat(fd)
-    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and
-            info.st_nlink == 1 and
-            stat.S_IMODE(info.st_mode) in ({0o600} if writable else {0o400, 0o600}), "unsafe_file")
+def secure_file(fd, writable=False, *, path="<open file>", context="local file"):
+    info = local_call(path, context, "fstat file", os.fstat, fd)
+    check_metadata(info, path, context, "validate file", "unsafe_file", writable=writable)
 
 
-def read_private(path, maximum):
-    path = Path(os.path.abspath(path))
-    secure_parents(path)
-    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as file:
-        secure_file(file.fileno())
-        body = file.read(maximum + 1)
+def read_private(path, maximum, context="private file"):
+    path = Path(path)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    secure_parents(path, context)
+    fd = local_call(path, context, "open file (no symlinks)", os.open,
+                    path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as file:
+        secure_file(file.fileno(), path=path, context=context)
+        body = local_call(path, context, "read file", file.read, maximum + 1)
         require(len(body) <= maximum, "size_limit")
         return body
 
@@ -146,7 +242,7 @@ def read_private(path, maximum):
 def load_config(path):
     parser = configparser.ConfigParser(interpolation=None)
     try:
-        parser.read_string(read_private(path, MAX_CONFIG).decode("utf-8"))
+        parser.read_string(read_private(path, MAX_CONFIG, "config").decode("utf-8"))
         require(parser.sections() == ["dhcp_pull"] and not parser.defaults(), "invalid_config")
         section = parser["dhcp_pull"]
         require(set(section) <= {
@@ -172,10 +268,10 @@ def load_config(path):
         config["timeout"] = int(config.get("timeout", "30"))
         require(1 <= config["timeout"] <= 120, "invalid_config")
         config["state_dir"] = Path(config["state_dir"])
-        require(config["state_dir"].is_absolute(), "invalid_config")
+        require_absolute(config["state_dir"], "invalid_config", "state")
         if config.get("ca_file"):
             config["ca_file"] = str(Path(config["ca_file"]))
-            require(Path(config["ca_file"]).is_absolute(), "invalid_config")
+            require_absolute(Path(config["ca_file"]), "invalid_config", "CA")
         return config
     except (ValueError, KeyError, configparser.Error, UnicodeError):
         raise SafeError("invalid_config") from None
@@ -190,7 +286,7 @@ class Transport:
     def __init__(self, config):
         self.config = config
         if config.get("ca_file"):
-            ca_data = read_private(config["ca_file"], MAX_BODY).decode("ascii")
+            ca_data = read_private(config["ca_file"], MAX_BODY, "CA").decode("ascii")
             context = ssl.create_default_context(cadata=ca_data)
         else:
             context = ssl.create_default_context()
@@ -337,27 +433,33 @@ class Store:
 
     def __enter__(self):
         try:
-            secure_parents(self.path)
+            secure_parents(self.path, "state")
             created = False
             try:
-                self.path.mkdir(mode=0o700)
+                local_call(self.path, "state", "mkdir", self.path.mkdir, mode=0o700)
                 created = True
             except FileExistsError:
                 pass
-            self.fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            info = os.fstat(self.fd)
-            require(info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700, "unsafe_directory")
+            self.fd = local_call(self.path, "state", "open directory (no symlinks)", os.open,
+                                 self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            info = local_call(self.path, "state", "fstat directory", os.fstat, self.fd)
+            check_metadata(info, self.path, "state", "validate directory", "unsafe_directory",
+                           directory=True)
             if created:
-                parent = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                parent = local_call(self.path.parent, "state", "open parent for sync", os.open,
+                                    self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
                 try:
-                    os.fsync(parent)
+                    local_call(self.path.parent, "state", "sync parent", os.fsync, parent)
                 finally:
                     os.close(parent)
-            self.lock = os.open("lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-                                0o600, dir_fd=self.fd)
-            secure_file(self.lock, writable=True)
+            self.lock = local_call(
+                self.path / "lock", "state lock", "open file (no symlinks)", os.open,
+                "lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=self.fd,
+            )
+            secure_file(self.lock, writable=True, path=self.path / "lock", context="state lock")
             try:
-                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                local_call(self.path / "lock", "state lock", "lock file", fcntl.flock,
+                           self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise SafeError("already_running") from None
             return self
@@ -375,12 +477,13 @@ class Store:
 
     def load(self):
         try:
-            fd = os.open("state.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
+            fd = local_call(self.path / "state.json", "state", "open file (no symlinks)", os.open,
+                            "state.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
         except FileNotFoundError:
             return empty_state(self.config)
         with os.fdopen(fd, "rb") as file:
-            secure_file(file.fileno(), writable=True)
-            body = file.read(MAX_STATE + 1)
+            secure_file(file.fileno(), writable=True, path=self.path / "state.json", context="state")
+            body = local_call(self.path / "state.json", "state", "read file", file.read, MAX_STATE + 1)
             require(len(body) <= MAX_STATE, "size_limit")
             return validate_state(parse_json(body), self.config)
 
@@ -390,70 +493,91 @@ class Store:
         require(len(body) <= MAX_STATE, "size_limit")
         # Never replace an unexpected leaf (including a hardlink).
         try:
-            old = os.open("state.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
+            old = local_call(self.path / "state.json", "state", "open file before replace", os.open,
+                             "state.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
         except FileNotFoundError:
             pass
         else:
             try:
-                secure_file(old, writable=True)
+                secure_file(old, writable=True, path=self.path / "state.json", context="state")
             finally:
                 os.close(old)
         name = ".state-" + uuid.uuid4().hex
         try:
-            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
+            path = self.path / name
+            fd = local_call(path, "state", "create temporary file", os.open,
+                            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                            0o600, dir_fd=self.fd)
             with os.fdopen(fd, "wb") as file:
-                file.write(body)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(name, "state.json", src_dir_fd=self.fd, dst_dir_fd=self.fd)
-            os.fsync(self.fd)
+                local_call(path, "state", "write temporary file", file.write, body)
+                local_call(path, "state", "flush temporary file", file.flush)
+                local_call(path, "state", "sync temporary file", os.fsync, file.fileno())
+            local_call(self.path / "state.json", "state", "replace file", os.replace,
+                       name, "state.json", src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            local_call(self.path, "state", "sync directory", os.fsync, self.fd)
         finally:
             try:
-                os.unlink(name, dir_fd=self.fd)
+                local_call(self.path / name, "state", "remove temporary file", os.unlink,
+                           name, dir_fd=self.fd)
             except FileNotFoundError:
                 pass
 
     def backup(self, response, payload):
         directory = self.path / "backups"
         try:
-            directory.mkdir(mode=0o700)
+            local_call(directory, "backups", "mkdir", directory.mkdir, mode=0o700)
         except FileExistsError:
             pass
-        info = directory.lstat()
-        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and
-                stat.S_IMODE(info.st_mode) == 0o700, "unsafe_directory")
-        backup = dsm_apply.backup_reservations(directory, response, payload)
+        info = local_call(directory, "backups", "lstat directory", directory.lstat)
+        check_metadata(info, directory, "backups", "validate directory", "unsafe_directory",
+                       directory=True)
+        backup = local_call(directory, "backups", "create backup", dsm_apply.backup_reservations,
+                            directory, response, payload)
         for path in (backup, directory):
-            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            fd = local_call(path, "backups", "open directory for sync", os.open,
+                            path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
-                os.fsync(fd)
+                local_call(path, "backups", "sync directory", os.fsync, fd)
             finally:
                 os.close(fd)
-        os.fsync(self.fd)
+        local_call(self.path, "state", "sync directory", os.fsync, self.fd)
         self.prune_backups(directory, backup)
 
     def prune_backups(self, directory, newest):
         """Only remove complete, private backups made by the shared helper."""
-        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = local_call(directory, "backups", "open directory (no symlinks)", os.open,
+                        directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         opened = []
         try:
             pattern = re.compile(
                 r"dsm-" + re.escape(self.config["ifname"]) +
                 r"-\d{8}T\d{12}Z-[A-Za-z0-9_-]{8}",
             )
-            names = os.listdir(fd)
+            names = local_call(directory, "backups", "list directory", os.listdir, fd)
             for name in names:
-                require(pattern.fullmatch(name), "unsafe_backup")
-                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                path = directory / name
+                if not pattern.fullmatch(name):
+                    raise SafeError("unsafe_backup", FilesystemDiagnostic(
+                        path, "backups", "validate name", ("unexpected_backup_name",),
+                        expected="backup name generated by the DSM helper",
+                    ))
+                child = local_call(path, "backups", "open directory (no symlinks)", os.open,
+                                   name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                 opened.append((name, child))
-                info = os.fstat(child)
-                require(info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700,
-                        "unsafe_backup")
-                require(set(os.listdir(child)) == {"response.json", "reservations.json"}, "unsafe_backup")
+                info = local_call(path, "backups", "fstat directory", os.fstat, child)
+                check_metadata(info, path, "backups", "validate directory", "unsafe_backup",
+                               directory=True)
+                if set(local_call(path, "backups", "list directory", os.listdir, child)) != {
+                        "response.json", "reservations.json"}:
+                    raise SafeError("unsafe_backup", FilesystemDiagnostic(
+                        path, "backups", "validate contents", ("unexpected_backup_contents",),
+                        expected="only response.json and reservations.json",
+                    ))
                 for filename in ("response.json", "reservations.json"):
-                    file = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=child)
+                    file = local_call(path / filename, "backups", "open file (no symlinks)", os.open,
+                                      filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=child)
                     try:
-                        secure_file(file, writable=True)
+                        secure_file(file, writable=True, path=path / filename, context="backups")
                     finally:
                         os.close(file)
             keep = {name for name in sorted(names, reverse=True)[:BACKUP_LIMIT]}
@@ -593,9 +717,9 @@ def run(config, reconcile=False):
             state["inflight"] = envelope
             state["baseline"] = live
             store.save(state)
-        except (ValueError, OSError, subprocess.SubprocessError):
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
             # No DSM write occurred. Never acknowledge an undurable attempt.
-            raise SafeError("persistence_failed") from None
+            raise SafeError("persistence_failed", getattr(error, "diagnostic", None)) from None
         diagnostic = "dsm_failed"
         try:
             dsm_apply.call_api("set", config["ifname"], desired["reservationData"], max_output=MAX_BODY)
@@ -627,10 +751,13 @@ def main(argv=None):
                2: "DHCP pull rejected; operator review required."}[result])
         return result
     except SafeError as error:
-        print("DHCP pull stopped: " + error.code + ".", file=sys.stderr)
+        detail = " " + error.diagnostic.render() if error.diagnostic is not None else ""
+        print("DHCP pull stopped: " + error.code + "." + detail, file=sys.stderr)
         return 3 if error.code == "already_running" else 1
-    except (OSError, ValueError, subprocess.SubprocessError, RecursionError, TypeError):
-        print("DHCP pull stopped: local_or_transport_failure.", file=sys.stderr)
+    except (OSError, ValueError, subprocess.SubprocessError, RecursionError, TypeError) as error:
+        diagnostic = getattr(error, "diagnostic", None) if isinstance(error, OSError) else None
+        detail = " " + diagnostic.render() if diagnostic is not None else ""
+        print("DHCP pull stopped: local_or_transport_failure." + detail, file=sys.stderr)
         return 1
 
 
