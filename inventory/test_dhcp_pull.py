@@ -111,6 +111,8 @@ class PullTests(SimpleTestCase):
         self.transport = FakeTransport()
         self.dsm = FakeDSM(payload(2, 10))
         self.addCleanup(patch.stopall)
+        # Execution identity is tested separately; keep real filesystem ownership checks.
+        patch("synology.dhcp_pull.require_root").start()
         patch("synology.dhcp_pull.Transport", return_value=self.transport).start()
         patch("synology.dsm_apply.call_api", side_effect=self.dsm).start()
 
@@ -882,7 +884,8 @@ class FilesystemDiagnosticTests(SimpleTestCase):
 
     def cli_error(self, error, code, expected_exit=1):
         output = io.StringIO()
-        with patch.object(pull, "load_config", return_value={}), \
+        with patch.object(pull, "require_root"), \
+                patch.object(pull, "load_config", return_value={}), \
                 patch.object(pull, "run", side_effect=error), patch("sys.stderr", output):
             self.assertEqual(pull.main(["--config", "/private/pull.ini"]), expected_exit)
         text = output.getvalue()
@@ -1081,6 +1084,91 @@ class FilesystemDiagnosticTests(SimpleTestCase):
         self.assertEqual(raised.exception.code, "invalid_state")
 
 
+class RootPreflightTests(SimpleTestCase):
+    def setUp(self):
+        self.identity = patch.object(pull.os, "geteuid", return_value=1001).start()
+        self.store = patch.object(pull, "Store").start()
+        self.transport = patch.object(pull, "Transport").start()
+        self.dsm = patch.object(dsm_apply, "call_api").start()
+        self.load_config = patch.object(pull, "load_config").start()
+        self.addCleanup(patch.stopall)
+
+    def assert_no_operations(self):
+        self.store.assert_not_called()
+        self.transport.assert_not_called()
+        self.dsm.assert_not_called()
+        self.load_config.assert_not_called()
+
+    def test_non_root_run_fails_before_state_transport_or_dsm(self):
+        for reconcile in (False, True):
+            outcome = {}
+            config = {"token": "test-only-not-a-credential"}
+            with self.subTest(reconcile=reconcile), self.assertRaises(pull.SafeError) as raised:
+                pull.run(config, reconcile, outcome)
+            self.assertEqual(raised.exception.code, "requires_root")
+            self.assertIsNone(raised.exception.diagnostic)
+            self.assertEqual(config, {"token": "test-only-not-a-credential"})
+            self.assertEqual(outcome, {})
+            self.assert_no_operations()
+
+    def test_non_root_cli_fails_before_config_read_with_fixed_instruction(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            self.assertEqual(pull.main(["--config", "/private/missing.ini", "--reconcile"]), 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), (
+            "DHCP pull stopped: requires_root. "
+            "Run as root or configure a DSM user-defined scheduled task as root.\n"
+        ))
+        self.assert_no_operations()
+
+    def test_help_without_root_does_not_run_preflight(self):
+        stdout = io.StringIO()
+        with patch("sys.stdout", stdout), self.assertRaises(SystemExit) as raised:
+            pull.main(["--help"])
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("--config", stdout.getvalue())
+        self.identity.assert_not_called()
+        self.assert_no_operations()
+
+    def test_root_cli_and_run_retain_normal_execution_and_exit_codes(self):
+        self.identity.return_value = 0
+        config = self.load_config.return_value
+        store = self.store.return_value.__enter__.return_value
+        for result, summary in (
+            (0, "DHCP pull completed."),
+            (1, "DHCP pull failed; retry required. Diagnostic: dsm_failed."),
+            (2, "DHCP pull rejected; operator review required. Diagnostic: dsm_drift."),
+        ):
+            diagnostic = "dsm_failed" if result == 1 else "dsm_drift"
+            store.load.return_value = {
+                "pending": None, "last_report": {"status": "failed", "diagnostic": diagnostic},
+            }
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with self.subTest(result=result), patch.object(pull, "execute", return_value=result) as execute, \
+                    patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+                self.assertEqual(pull.main(["--config", "/private/pull.ini"]), result)
+            execute.assert_called_once_with(config, False, store, store.load.return_value)
+            self.assertEqual(stdout.getvalue(), summary + "\n")
+            self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(self.identity.call_count, 6)
+
+    def test_root_requirement_does_not_affect_pure_schema_helpers(self):
+        value = envelope()
+        self.assertEqual(pull.validate_envelope(value, {
+            "site_id": 7, "ifname": "eth0", "subnet": "192.168.1.0/24",
+        }), value)
+        self.identity.assert_not_called()
+        self.assert_no_operations()
+
+    def test_requires_root_is_not_a_remote_diagnostic(self):
+        self.assertNotIn("requires_root", pull.DIAGNOSTICS)
+        with self.assertRaises(pull.SafeError) as raised:
+            pull.acknowledgement(envelope(), "failed", "requires_root")
+        self.assertEqual(raised.exception.code, "invalid_state")
+        self.assert_no_operations()
+
+
 class SchemaConfigTests(SimpleTestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix=".dhcp-tests-", dir=Path.cwd())
@@ -1260,7 +1348,9 @@ class SchemaConfigTests(SimpleTestCase):
             (subprocess.TimeoutExpired("secret-token", 120), 1),
         ):
             output = io.StringIO()
-            with patch("synology.dhcp_pull.run", side_effect=exception), patch("sys.stderr", output):
+            with patch("synology.dhcp_pull.os.geteuid", return_value=0), \
+                    patch("synology.dhcp_pull.load_config", return_value=self.config), \
+                    patch("synology.dhcp_pull.run", side_effect=exception), patch("sys.stderr", output):
                 self.assertEqual(pull.main(["--config", str(self.path)]), expected)
             self.assertNotIn("secret-token", output.getvalue())
             self.assertIn("DHCP pull stopped:", output.getvalue())

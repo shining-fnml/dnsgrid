@@ -153,6 +153,10 @@ def require(condition, code="invalid_response"):
         raise SafeError(code)
 
 
+def require_root():
+    require(os.geteuid() == 0, "requires_root")
+
+
 def digest(payload):
     return hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
@@ -651,6 +655,7 @@ def recorded_diagnostic(state):
 
 
 def run(config, reconcile=False, outcome=None):
+    require_root()
     with Store(config) as store:
         state = store.load()
         result = execute(config, reconcile, store, state)
@@ -772,6 +777,7 @@ def main(argv=None):
     parser.add_argument("--reconcile", action="store_true", help="operator-reviewed drift reconciliation for this run only")
     options = parser.parse_args(argv)
     try:
+        require_root()
         outcome = {}
         result = run(load_config(options.config), options.reconcile, outcome)
         diagnostic = outcome.get("diagnostic")
@@ -781,6 +787,8 @@ def main(argv=None):
         return result
     except SafeError as error:
         detail = " " + error.diagnostic.render() if error.diagnostic is not None else ""
+        if error.code == "requires_root":
+            detail = " Run as root or configure a DSM user-defined scheduled task as root."
         print("DHCP pull stopped: " + error.code + "." + detail, file=sys.stderr)
         return 3 if error.code == "already_running" else 1
     except (OSError, ValueError, subprocess.SubprocessError, RecursionError, TypeError) as error:
