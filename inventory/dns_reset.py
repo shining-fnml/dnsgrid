@@ -23,7 +23,7 @@ def ensure_ready(directory):
     if directory and os.path.lexists(Path(directory) / JOURNAL):
         raise ValidationError(
             "Local DNS reset recovery is outstanding. Run reset_dns_publication --recover "
-            "with both acknowledgements; do not delete its journal or lock files."
+            "with --confirm --ack-never-loaded; do not delete its journal or quarantine."
         )
 
 
@@ -57,17 +57,13 @@ def _file(path):
 
 
 def _generation(directory, name):
-    from .dns_delivery import _attempt
     path, manifest = read_generation(str(directory), name)
-    allowed = {"manifest.json", ".pin", ".delivery.json"} | {
-        zone["filename"] for zone in manifest["zones"]
-    }
+    allowed = {"manifest.json"} | {zone["filename"] for zone in manifest["zones"]}
     if allowed & PROTECTED:
         raise ValidationError(f"Protected filename in {path}; review manually.")
     children = list(path.iterdir())
     if any(child.name not in allowed for child in children):
         raise ValidationError(f"Unexpected contents in {path}; review or quarantine manually.")
-    _attempt(path, manifest)
     return {child.name: _file(child) for child in sorted(children)}
 
 
@@ -235,52 +231,49 @@ def _finish(root, record):
     return quarantine
 
 
-def reset(timestamp=None, token=None, *, confirmed=False, unloaded=False, nas_handled=False, recover=False):
-    if not (confirmed is True and unloaded is True and nas_handled is True):
+def reset(timestamp=None, token=None, *, confirmed=False, unloaded=False, recover=False):
+    if not (confirmed is True and unloaded is True):
         raise ValidationError(
-            "Explicit confirmation and acknowledgements that legacy serials were NEVER loaded "
-            "by any DNS server and NAS scheduling/stale deliveries have been handled are required."
+            "Explicit confirmation that legacy serials were NEVER loaded by any DNS server is required."
         )
-    from .dns_delivery import _lock
     from .services import _claim_revision
     config = Configuration.objects.get(pk=1)
     root = _root(config.dns_export_directory)
-    with _lock(str(root), recovery=True):
-        with transaction.atomic():
-            _claim_revision(config.revision, changed=False, reset_recovery=True)
-            if Configuration.load().dns_export_directory != str(root):
-                raise ValidationError("Export directory changed; generate a new preview.")
-            journal = root / JOURNAL
-            if recover:
-                if not os.path.lexists(journal):
-                    return None
-                try:
-                    record = json.loads(_read(journal, MAX_JOURNAL))
-                    if type(record) is not dict or set(record) != {"plan", "quarantine", "after"}:
-                        raise ValueError
-                except (ValueError, TypeError, UnicodeError, RecursionError) as error:
-                    raise ValidationError("Malformed reset journal; preserve it for administrator recovery.") from error
-            else:
-                plan, actual_token = preview(timestamp)
-                if not token or actual_token != token:
-                    raise ValidationError("Missing or stale preview token; generate a new preview.")
-                quarantine = root / f".dnsgrid-reset-{uuid.uuid4().hex}"
-                quarantine.mkdir(mode=0o700)
-                (quarantine / "generations").mkdir(mode=0o700)
-                _sync(quarantine)
-                after = Configuration.load()
-                after.soa_serial = plan["timestamp"]
-                after.dns_content_hash = content_fingerprint(after)
-                after.dns_published_generation = ""
-                record = {"plan": plan, "quarantine": quarantine.name, "after": _config_state(after)}
-                content = (json.dumps(record, sort_keys=True) + "\n").encode()
-                if len(content) > MAX_JOURNAL:
-                    raise ValidationError("Reset plan exceeds the recovery journal limit; review artifacts manually.")
-                _atomic(journal, content, mode=0o600)
-            quarantine = _finish(root, record)
-        # Commit DB before retiring the journal. A failure here is recoverable even
-        # when DB commit succeeded; the recorded after-state detects that case.
-        os.replace(journal, quarantine / "completed.json")
-        _sync(quarantine)
-        _sync(root)
-        return quarantine
+    with transaction.atomic():
+        _claim_revision(config.revision, changed=False, reset_recovery=True)
+        if Configuration.load().dns_export_directory != str(root):
+            raise ValidationError("Export directory changed; generate a new preview.")
+        journal = root / JOURNAL
+        if recover:
+            if not os.path.lexists(journal):
+                return None
+            try:
+                record = json.loads(_read(journal, MAX_JOURNAL))
+                if type(record) is not dict or set(record) != {"plan", "quarantine", "after"}:
+                    raise ValueError
+            except (ValueError, TypeError, UnicodeError, RecursionError) as error:
+                raise ValidationError("Malformed reset journal; preserve it for administrator recovery.") from error
+        else:
+            plan, actual_token = preview(timestamp)
+            if not token or actual_token != token:
+                raise ValidationError("Missing or stale preview token; generate a new preview.")
+            quarantine = root / f".dnsgrid-reset-{uuid.uuid4().hex}"
+            quarantine.mkdir(mode=0o700)
+            (quarantine / "generations").mkdir(mode=0o700)
+            _sync(quarantine)
+            after = Configuration.load()
+            after.soa_serial = plan["timestamp"]
+            after.dns_content_hash = content_fingerprint(after)
+            after.dns_published_generation = ""
+            record = {"plan": plan, "quarantine": quarantine.name, "after": _config_state(after)}
+            content = (json.dumps(record, sort_keys=True) + "\n").encode()
+            if len(content) > MAX_JOURNAL:
+                raise ValidationError("Reset plan exceeds the recovery journal limit; review artifacts manually.")
+            _atomic(journal, content, mode=0o600)
+        quarantine = _finish(root, record)
+    # Commit DB before retiring the journal. A failure here is recoverable even
+    # when DB commit succeeded; the recorded after-state detects that case.
+    os.replace(journal, quarantine / "completed.json")
+    _sync(quarantine)
+    _sync(root)
+    return quarantine

@@ -238,15 +238,9 @@ class DNSPublicationTests(TestCase):
         self.assertNotContains(response, "reload command succeeded")
         self.assertEqual(self.run.call_args_list[-1].args[0][-1], "reload")
 
-    def test_previews_do_not_validate_or_reload(self):
+    def test_export_preview_does_not_validate_or_reload(self):
         self.client.get(reverse("exports"))
         self.assertFalse(self.run.called)
-        self.assertEqual(self.client.post("/exports/deliver-dns/", {"revision": self.config.revision}).status_code, 404)
-        self.assertFalse(self.run.called)
-        from .dns_delivery import dns_sftp
-        with patch.object(dns_sftp, "deliver") as delivery:
-            self.publish()
-        delivery.assert_not_called()
 
     def test_vpn_reverse_validation_failure_installs_nothing(self):
         target = self.path / "28.172.in-addr.arpa"

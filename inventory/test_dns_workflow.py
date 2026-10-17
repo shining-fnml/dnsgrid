@@ -13,7 +13,7 @@ from django.test import TestCase
 from django.urls import reverse
 
 from .archives import restore, snapshot
-from .dns_publication import pending_generations, read_generation, validate_generation
+from .dns_publication import read_generation, validate_generation
 from .exporters import build_exports, publish_dns_zones
 from .models import Configuration
 
@@ -67,7 +67,6 @@ class DNSWorkflowTests(TestCase):
         self.assertEqual((path / "manifest.json").read_bytes(), raw)
         self.assertEqual(json.loads((self.path / "manifest.json").read_bytes()), manifest)
         self.assertEqual(Configuration.load().soa_serial, config.soa_serial)
-        self.assertFalse((path / ".pin").exists())
 
     def test_partial_zone_or_generation_failure_does_not_commit_latest(self):
         replace = os.replace
@@ -165,7 +164,7 @@ class DNSWorkflowTests(TestCase):
                 self.publish()
                 self.assertEqual((path / "manifest.json").read_bytes(), raw)
 
-    def test_safe_bounded_retention_preserves_unrelated_and_pins(self):
+    def test_safe_bounded_retention_preserves_unrelated_entries(self):
         self.publish()
         root = self.path / "generations"
         unrelated = root / "dnsgrid-2026100700"
@@ -174,23 +173,14 @@ class DNSWorkflowTests(TestCase):
         symlink = root / "dnsgrid-2026100600"
         symlink.symlink_to(unrelated, target_is_directory=True)
         first = root / "dnsgrid-2026100800"
-        (first / ".pin").write_text("pending")
         for serial in range(2026100801, 2026100812):
             Configuration.objects.update(soa_serial=serial)
             self.publish()
         owned = [p for p in root.iterdir() if not p.is_symlink() and (p / "manifest.json").exists()]
         self.assertEqual(len(owned), 10)
-        self.assertTrue(first.exists())
+        self.assertFalse(first.exists())
         self.assertTrue((unrelated / "keep").exists())
         self.assertTrue(symlink.is_symlink())
-        for p in owned:
-            (p / ".pin").write_text("unconfirmed")
-        Configuration.objects.update(soa_serial=2026100812)
-        _, errors = self.publish()
-        self.assertIn("retention", str(errors))
-        self.assertEqual(len([p for p in root.iterdir() if (p / "manifest.json").exists()]), 10)
-
-        self.assertEqual(len(pending_generations(str(self.path))), 10)
 
     def test_local_ui_and_legacy_archive_deployment_exclusion(self):
         response = self.client.get(reverse("exports"))

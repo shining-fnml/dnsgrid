@@ -129,7 +129,7 @@ def _owned_generations(root):
             _, manifest = read_generation(root.parent, entry.name)
         except (ValidationError, OSError):
             continue
-        allowed = {"manifest.json", ".pin", ".delivery.json"} | {zone["filename"] for zone in manifest["zones"]}
+        allowed = {"manifest.json"} | {zone["filename"] for zone in manifest["zones"]}
         if {child.name for child in entry.iterdir()} <= allowed:
             owned.append(entry)
     return sorted(owned, key=lambda entry: (entry.stat().st_mtime_ns, entry.name))
@@ -141,13 +141,12 @@ def _make_room(root, current, new):
     for path in owned:
         if needed <= 0:
             break
-        if path.name in (current, new) or (path / ".pin").exists():
+        if path.name in (current, new):
             continue
         _, manifest = read_generation(root.parent, path.name)
         for zone in manifest["zones"]:
             (path / zone["filename"]).unlink()
         (path / "manifest.json").unlink()
-        (path / ".delivery.json").unlink(missing_ok=True)
         path.rmdir()
         needed -= 1
     if needed > 0:
@@ -218,13 +217,3 @@ def commit_generation(config, zones):
     _atomic(root.parent / "manifest.json", (json.dumps(manifest, sort_keys=True) + "\n").encode())
     Configuration.objects.filter(pk=1).update(dns_published_generation=generation)
     return generation
-
-
-def pending_generations(directory):
-    root = Path(directory) / "generations"
-    if not root.exists():
-        return []
-    try:
-        return [path.name for path in _owned_generations(_directory(root)) if (path / ".pin").exists()]
-    except (ValidationError, OSError):
-        return []

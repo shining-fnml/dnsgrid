@@ -8,7 +8,10 @@
 # Ancestors must not be symlinks or group/world writable and must be owned by
 # root or scheduling user. Do not place files under /tmp or a shared directory.
 # The state directory is created if absent; its parent must already exist.
-# TLS verification is mandatory. A private CA file is optional; no insecure mode.
+# HTTPS is the default and verifies TLS certificates. HTTP is accepted only with
+# allow_http_over_vpn = true, when the entire connection is restricted to the VPN.
+# That setting is an operator assertion; the client does not verify VPN routing.
+# A private CA file is optional for HTTPS.
 # If supplied, ca_file must be a PEM file under the same private-file/ancestor
 # rules as the config; it is bounded to 1 MiB and loaded from validated bytes.
 # timeout bounds each socket operation. The body deadline is checked between
@@ -66,6 +69,7 @@
 
 [dhcp_pull]
 base_url = https://dnsgrid.example.invalid
+allow_http_over_vpn = false
 site_id = 1
 ifname = eth0
 subnet = 192.168.1.0/24

@@ -1,5 +1,4 @@
 import copy
-import tempfile
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -64,18 +63,6 @@ class DNSSerialTests(TestCase):
         for candidate, previous in ((0, 2**31), (2**31, 0), (MAX_SERIAL, 2**31 - 1)):
             with self.assertRaisesMessage(ValidationError, "Ambiguous RFC 1982"):
                 compare_serial(candidate, previous)
-
-    def test_baseline_lowering_rejects_active_delivery_before_changing_state(self):
-        from .dns_delivery import _lock
-        with tempfile.TemporaryDirectory() as directory:
-            Configuration.objects.update(dns_export_directory=directory)
-            before = snapshot()
-            with _lock(directory), self.assertRaisesMessage(ValidationError, "Another DNS delivery"):
-                lower_dns_serial(1, 2026100800, 1692746706, confirmed=True)
-            self.assertEqual(snapshot(), before)
-            with patch("inventory.services.initial_serial", return_value=1692746706):
-                config = lower_dns_serial(1, 2026100800, 1692746706, confirmed=True)
-            self.assertEqual(config.soa_serial, 1692746706)
 
     def test_content_mutations_but_not_metadata_or_gets_advance(self):
         host = Host(name="alpha", site_id=1, row=1, column=0)

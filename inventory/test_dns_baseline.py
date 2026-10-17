@@ -42,7 +42,7 @@ class DNSBaselineTests(TestCase):
         pending = self.client.session.get("pending", {})
         return self.client.post(reverse("confirm"), {
             "nonce": pending.get("nonce", ""),
-            "dns_unloaded_ack": "yes", "delivery_cleanup_ack": "yes", **extra,
+            "dns_unloaded_ack": "yes", **extra,
         })
 
     def lower(self, **extra):
@@ -65,17 +65,14 @@ class DNSBaselineTests(TestCase):
                     self.lower(**extra)
                 self.assertEqual(list(Configuration.objects.values()), before)
 
-    def test_lowering_preserves_inventory_installer_state_and_immutable_generations(self):
+    def test_lowering_preserves_inventory_and_immutable_generations(self):
         directory = tempfile.TemporaryDirectory(prefix=".baseline-fixture-")
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
         generation = root / "generations" / f"dnsgrid-{self.legacy}"
         generation.mkdir(parents=True)
-        (generation / "forward.zone").write_bytes(b"legacy immutable generation")
-        (root / "installer-state.json").write_bytes(b'{"serial":1692746706}')
-        from .dns_delivery import _lock
-        with _lock(str(root)):
-            pass
+        artifact = generation / "forward.zone"
+        artifact.write_bytes(b"legacy immutable generation")
         Configuration.objects.update(
             dns_export_directory=str(root),
             dns_published_generation=f"dnsgrid-{self.legacy}",
@@ -84,7 +81,6 @@ class DNSBaselineTests(TestCase):
         before_config = Configuration.objects.values().get(pk=1)
         before_hosts = list(Host.objects.values())
         before_sites = list(Site.objects.values())
-        before_files = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
         self.lower()
         config = Configuration.load()
         self.assertEqual(config.soa_serial, self.baseline)
@@ -96,10 +92,7 @@ class DNSBaselineTests(TestCase):
                 self.assertEqual(getattr(config, field), value)
         self.assertEqual(list(Host.objects.values()), before_hosts)
         self.assertEqual(list(Site.objects.values()), before_sites)
-        self.assertEqual(
-            {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()},
-            before_files,
-        )
+        self.assertEqual(artifact.read_bytes(), b"legacy immutable generation")
 
     def test_settings_button_and_preview_require_superuser(self):
         self.assertContains(self.client.get(reverse("configuration")), reverse("dns-baseline-preview"))
@@ -116,8 +109,6 @@ class DNSBaselineTests(TestCase):
         self.assertContains(response, str(self.legacy))
         self.assertContains(response, str(self.baseline))
         self.assertContains(response, 'name="dns_unloaded_ack"')
-        self.assertContains(response, 'name="delivery_cleanup_ack"')
-        self.assertContains(response, "No installer state is reset")
         self.assertEqual(self.client.session["pending"]["payload"], {
             "expected_serial": self.legacy, "baseline": self.baseline,
         })
@@ -125,14 +116,12 @@ class DNSBaselineTests(TestCase):
         self.confirm(baseline=1, expected_serial=1)
         self.assertEqual(Configuration.load().soa_serial, self.baseline)
 
-    def test_each_acknowledgment_is_required_server_side_and_consumes_preview(self):
-        for name in ("dns_unloaded_ack", "delivery_cleanup_ack"):
-            with self.subTest(name=name):
-                self.preview()
-                response = self.confirm(**{name: ""})
-                self.assertRedirects(response, reverse("configuration"))
-                self.assertEqual(Configuration.load().soa_serial, self.legacy)
-                self.assertNotIn("pending", self.client.session)
+    def test_dns_unloaded_acknowledgment_is_required_server_side(self):
+        self.preview()
+        response = self.confirm(dns_unloaded_ack="")
+        self.assertRedirects(response, reverse("configuration"))
+        self.assertEqual(Configuration.load().soa_serial, self.legacy)
+        self.assertNotIn("pending", self.client.session)
 
     def test_confirmation_checks_superuser_again(self):
         self.preview()
