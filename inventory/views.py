@@ -507,9 +507,11 @@ def download(request, filename):
             return HttpResponse("Inventory changed. Reload export previews before downloading.", status=409)
         try:
             artifacts = build_exports(config=config)
-        except ValueError as error:
-            return HttpResponse(f"Exports are unavailable: {error}", status=409,
-                                content_type="text/plain; charset=utf-8")
+        except ValueError:
+            return HttpResponse(
+                "Exports are unavailable. Review the error on the Export previews page.",
+                status=409, content_type="text/plain; charset=utf-8",
+            )
     if filename not in artifacts:
         from django.http import Http404
         raise Http404

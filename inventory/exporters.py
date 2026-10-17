@@ -275,7 +275,7 @@ def desired_gandi(config=None, hosts=None):
             if name in names:
                 raise ValueError(
                     f"The Gandi name {fqdn} would be published twice; "
-                    "use distinct LAN and VPN domains."
+                    "LAN and VPN names must not collide."
                 )
             names.add(name)
             records.append({

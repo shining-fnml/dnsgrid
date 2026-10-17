@@ -448,7 +448,7 @@ class OperatorViewsTests(TestCase):
         self.assertEqual(response.context["artifacts"], {})
         download = self.client.get(reverse("download", args=["gandi.json"]))
         self.assertEqual(download.status_code, 409)
-        self.assertIn(message, download.content.decode())
+        self.assertIn("Exports are unavailable", download.content.decode())
         response = self.client.post(reverse("gandi-preview"), follow=True)
         self.assertContains(response, message)
         self.assertNotIn("pending", self.client.session)
