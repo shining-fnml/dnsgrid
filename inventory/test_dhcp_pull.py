@@ -1042,6 +1042,25 @@ class SchemaConfigTests(SimpleTestCase):
         with self.assertRaises(pull.SafeError):
             pull.load_config(self.path)
 
+    def test_http_requires_explicit_vpn_opt_in_and_https_remains_default(self):
+        self.assertEqual(self.config["base_url"], "https://example.invalid/prefix")
+        self.assertFalse(self.config["allow_http_over_vpn"])
+        self.write(self.text.replace("https://", "http://"))
+        with self.assertRaises(pull.SafeError):
+            pull.load_config(self.path)
+        self.write(self.text.replace("https://", "http://") + "allow_http_over_vpn = false\n")
+        with self.assertRaises(pull.SafeError):
+            pull.load_config(self.path)
+        self.write(self.text.replace("https://", "http://") + "allow_http_over_vpn = true\n")
+        config = pull.load_config(self.path)
+        self.assertEqual(config["base_url"], "http://example.invalid/prefix")
+        self.assertTrue(config["allow_http_over_vpn"])
+        self.write(self.text + "allow_http_over_vpn = true\n")
+        self.assertEqual(pull.load_config(self.path)["base_url"], "https://example.invalid/prefix")
+        self.write(self.text + "allow_http_over_vpn = yes\n")
+        with self.assertRaises(pull.SafeError):
+            pull.load_config(self.path)
+
     def test_private_config_regular_file_ownership_mode_and_size(self):
         self.path.chmod(0o644)
         with self.assertRaises(pull.SafeError) as raised:
@@ -1204,6 +1223,20 @@ class TransportTests(SimpleTestCase):
         self.assertEqual(request.get_header("If-none-match"), '"v1"')
         self.assertNotIn(self.config["token"], request.full_url)
         self.assertEqual(transport.opener.open.call_args.kwargs["timeout"], 3)
+
+    def test_explicit_http_uses_same_authenticated_request_without_tls_downgrade(self):
+        config = {**self.config, "base_url": "http://example.invalid/prefix",
+                  "allow_http_over_vpn": True}
+        with patch("synology.dhcp_pull.urllib.request.build_opener") as build:
+            transport = pull.Transport(config)
+        transport.opener.open.return_value = FakeResponse()
+        transport.request("GET", "latest", conditional='"v1"')
+        request = transport.opener.open.call_args.args[0]
+        self.assertEqual(request.full_url, "http://example.invalid/prefix/api/dhcp/sites/7/latest/")
+        self.assertEqual(request.get_header("Authorization"), "Bearer " + config["token"])
+        self.assertEqual(request.get_header("If-none-match"), '"v1"')
+        self.assertNotIn(config["token"], request.full_url)
+        self.assertEqual(build.call_args.args[0].proxies, {})
 
     def test_optional_ca_and_exact_ack_json(self):
         with patch("synology.dhcp_pull.ssl.create_default_context") as context, \

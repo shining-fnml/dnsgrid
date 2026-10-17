@@ -351,12 +351,8 @@ def confirm(request):
             update_settings(payload["config"], payload["sites"], expected_revision=revision)
         elif pending["kind"] == "dns-baseline":
             from .services import lower_dns_serial
-            if (request.POST.get("dns_unloaded_ack") != "yes"
-                    or request.POST.get("delivery_cleanup_ack") != "yes"):
-                raise ValidationError(
-                    "Confirm that no DNS server loaded the legacy serials and that the retired "
-                    "DSM DNS task is stopped with legacy deliveries quarantined."
-                )
+            if request.POST.get("dns_unloaded_ack") != "yes":
+                raise ValidationError("Confirm that no DNS server loaded the legacy serials.")
             lower_dns_serial(
                 expected_revision=revision, expected_serial=payload["expected_serial"],
                 baseline=payload["baseline"], confirmed=True,

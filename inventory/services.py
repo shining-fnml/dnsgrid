@@ -1,5 +1,4 @@
 import copy
-from contextlib import nullcontext
 
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
@@ -310,9 +309,8 @@ def lower_dns_serial(expected_revision, expected_serial, baseline, confirmed=Fal
         raise ValidationError("Administrator confirmation that no DNS server loaded the legacy serials is required.")
     validate_serial(expected_serial)
     validate_serial(baseline)
-    from .dns_delivery import _lock
     directory = Configuration.load().dns_export_directory
-    with (_lock(directory) if directory else nullcontext()), transaction.atomic():
+    with transaction.atomic():
         _claim_revision(expected_revision, changed=False)
         current = Configuration.load()
         if current.dns_export_directory != directory:

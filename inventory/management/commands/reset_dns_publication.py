@@ -6,7 +6,7 @@ from inventory import dns_reset
 
 
 class Command(BaseCommand):
-    help = "Preview or explicitly reset LOCAL test DNS publication history; never modifies the NAS."
+    help = "Preview or explicitly reset LOCAL test DNS publication history; never contacts DNS servers."
 
     def add_arguments(self, parser):
         parser.add_argument("--confirm", action="store_true", help="Execute the destructive local reset.")
@@ -14,8 +14,6 @@ class Command(BaseCommand):
         parser.add_argument("--preview-token", help="Exact artifact/configuration token shown in the preview.")
         parser.add_argument("--ack-never-loaded", action="store_true",
                             help="Acknowledge legacy serials were NEVER loaded by any DNS server.")
-        parser.add_argument("--ack-nas-handled", action="store_true",
-                            help="Acknowledge DSM scheduling and stale test deliveries have been handled.")
         parser.add_argument("--recover", action="store_true", help="Resume the outstanding reset, rolling forward.")
 
     def handle(self, *args, **options):
@@ -26,7 +24,7 @@ class Command(BaseCommand):
                 quarantine = dns_reset.reset(
                     options["timestamp"], options["preview_token"],
                     confirmed=options["confirm"], unloaded=options["ack_never_loaded"],
-                    nas_handled=options["ack_nas_handled"], recover=options["recover"],
+                    recover=options["recover"],
                 )
                 if quarantine is None:
                     self.stdout.write("No outstanding local reset; nothing changed.")
@@ -48,14 +46,14 @@ class Command(BaseCommand):
                 self.stdout.write(
                     "To execute within 15 minutes, review the artifacts and use:\n"
                     f"python manage.py reset_dns_publication --confirm --timestamp {plan['timestamp']} "
-                    f"--preview-token {token} --ack-never-loaded --ack-nas-handled"
+                    f"--preview-token {token} --ack-never-loaded"
                 )
             self.stdout.write(
-                "NAS files/state, backups, lock files, unrelated files, inventory, users, settings and credentials are not reset. "
+                "Backups, unrelated files, inventory, users, settings and credentials are not reset. "
                 "This command does not prove what DNS servers have loaded."
             )
         except (ValidationError, OSError, DatabaseError) as error:
             raise CommandError(
                 f"{error} If a reset journal exists, preserve it and its quarantine; "
-                "resolve the error and use --recover --confirm with both acknowledgements. Never delete lock files."
+                "resolve the error and use --recover --confirm --ack-never-loaded."
             ) from error

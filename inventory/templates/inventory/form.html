@@ -28,8 +28,8 @@
 {% if request.user.is_superuser %}
 <section aria-labelledby="dns-baseline-heading">
 <h2 id="dns-baseline-heading">Administrator-only DNS timestamp baseline</h2>
-<p class="warning">Only for legacy serials that no DNS server has loaded. Stop the retired DSM DNS task and quarantine legacy deliveries before changing the baseline. Never lower an installed serial: coordinate a DNS migration instead.</p>
-<p>Preview shows the exact current serial and Unix timestamp baseline. Confirmation does not reset installer state, delete inventory, or remove immutable generations.</p>
+<p class="warning">Only for legacy serials that no DNS server has loaded. Never lower an installed serial: coordinate a DNS migration instead.</p>
+<p>Preview shows the exact current serial and Unix timestamp baseline. Confirmation does not delete inventory or remove immutable generations.</p>
 <form method="post" action="{% url 'dns-baseline-preview' %}">
 {% csrf_token %}<input type="hidden" name="revision" value="{{ revision }}">
 <button class="danger">Preview DNS timestamp baseline lowering</button>

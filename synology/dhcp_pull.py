@@ -246,11 +246,16 @@ def load_config(path):
         require(parser.sections() == ["dhcp_pull"] and not parser.defaults(), "invalid_config")
         section = parser["dhcp_pull"]
         require(set(section) <= {
-            "base_url", "site_id", "ifname", "subnet", "token", "state_dir", "timeout", "ca_file",
+            "base_url", "allow_http_over_vpn", "site_id", "ifname", "subnet", "token",
+            "state_dir", "timeout", "ca_file",
         }, "invalid_config")
         config = dict(section)
+        allow_http = config.get("allow_http_over_vpn", "false")
+        require(allow_http in {"true", "false"}, "invalid_config")
+        config["allow_http_over_vpn"] = allow_http == "true"
         url = urllib.parse.urlsplit(config["base_url"])
-        require(url.scheme == "https" and url.hostname and not url.username and not url.password
+        require((url.scheme == "https" or (url.scheme == "http" and config["allow_http_over_vpn"]))
+                and url.hostname and not url.username and not url.password
                 and not url.query and not url.fragment and
                 not any(ord(char) <= 32 or ord(char) == 127 for char in config["base_url"]),
                 "invalid_config")

@@ -15,7 +15,6 @@ from django.db import OperationalError, close_old_connections
 from django.test import TestCase, TransactionTestCase
 
 from . import dns_reset
-from .dns_delivery import _lock, publish_and_deliver, retry_delivery
 from .dns_serial import MAX_SERIAL, content_fingerprint
 from .exporters import publish_dns_zones
 from .models import Configuration, Host, Site
@@ -31,8 +30,6 @@ class DNSResetTests(TestCase):
         self.root = Path(directory.name)
         Configuration.objects.update(
             dns_export_directory=str(self.root), soa_serial=2026101004,
-            dns_sftp_host="nas.example.test", dns_sftp_user="dns",
-            dns_sftp_inbox="/inbox", dns_sftp_outbox="/outbox",
             named_checkzone="/usr/bin/named-checkzone",
             rndc="/usr/bin/rndc", rndc_key="/etc/bind/rndc.key",
         )
@@ -44,43 +41,36 @@ class DNSResetTests(TestCase):
         self.clock = patch("inventory.dns_reset.initial_serial", return_value=self.timestamp)
         self.clock.start()
         self.addCleanup(self.clock.stop)
-        self.transport = patch("inventory.dns_delivery.dns_sftp.deliver",
-                               return_value=("unconfirmed", "SFTP delivery unconfirmed; check NAS result."))
-        self.send = self.transport.start()
-        self.addCleanup(self.transport.stop)
-        publish_and_deliver(str(Configuration.load().revision))
+        publish_dns_zones(str(Configuration.load().revision))
         self.old_generation = Configuration.load().dns_published_generation
         self.old_path = self.root / "generations" / self.old_generation
-        self.old_attempt = json.loads((self.old_path / ".delivery.json").read_text())
 
     def execute(self, **changes):
         plan, token = dns_reset.preview()
         return dns_reset.reset(**{
             "timestamp": plan["timestamp"], "token": token, "confirmed": True,
-            "unloaded": True, "nas_handled": True, **changes,
+            "unloaded": True, **changes,
         })
 
     def recover(self):
-        return dns_reset.reset(confirmed=True, unloaded=True, nas_handled=True, recover=True)
+        return dns_reset.reset(confirmed=True, unloaded=True, recover=True)
 
     def files(self):
         return {str(p.relative_to(self.root)): p.read_bytes()
                 for p in self.root.rglob("*") if p.is_file()}
 
     def test_preview_is_read_only_and_lists_exact_artifacts(self):
-        (self.root / ".dnsgrid-delivery.lock").unlink()
         before, config = self.files(), list(Configuration.objects.values())
         output = io.StringIO()
         call_command("reset_dns_publication", stdout=output)
         self.assertEqual(self.files(), before)
         self.assertEqual(list(Configuration.objects.values()), config)
         for text in ("READ-ONLY PREVIEW", f"2026101004 -> {self.timestamp}",
-                     str(self.old_path / ".pin"), str(self.old_path / ".delivery.json"),
-                     "--ack-never-loaded", "--ack-nas-handled"):
+                     str(self.old_path / "manifest.json"), "--ack-never-loaded"):
             self.assertIn(text, output.getvalue())
 
     def test_confirmation_and_exact_preview_are_required(self):
-        for changes in ({"confirmed": False}, {"unloaded": False}, {"nas_handled": False},
+        for changes in ({"confirmed": False}, {"unloaded": False},
                         {"token": ""}, {"token": "stale"}):
             before = self.files()
             with self.assertRaises(ValidationError):
@@ -96,7 +86,6 @@ class DNSResetTests(TestCase):
         Host.objects.create(name="retained", site_id=1, row=1, column=0)
         before_config = Configuration.objects.values().get(pk=1)
         hosts, sites = list(Host.objects.values()), list(Site.objects.values())
-        lock_inode = (self.root / ".dnsgrid-delivery.lock").stat().st_ino
         (self.root / "forward.zone").write_text("legacy loose test zone")
         quarantine = self.execute()
         config = Configuration.load()
@@ -110,33 +99,21 @@ class DNSResetTests(TestCase):
         self.assertEqual(list(Site.objects.values()), sites)
         for name in ("unrelated.txt", "installed.json", "transaction.json", "backup.zip"):
             self.assertEqual((self.root / name).read_text(), "preserve")
-        self.assertEqual((self.root / ".dnsgrid-delivery.lock").stat().st_ino, lock_inode)
         self.assertFalse(self.old_path.exists())
-        for name in (".pin", ".delivery.json", "manifest.json"):
-            self.assertTrue((quarantine / "generations" / self.old_generation / name).is_file())
+        self.assertTrue((quarantine / "generations" / self.old_generation / "manifest.json").is_file())
         self.assertTrue((quarantine / "forward.zone").exists())
         self.assertTrue((quarantine / "completed.json").exists())
         self.assertIsNone(self.recover())
 
-    def test_fresh_timestamp_delivery_and_unchanged_idempotence_and_explicit_retry(self):
+    def test_reset_allows_publication_from_the_new_timestamp_baseline(self):
         self.execute()
-        self.send.reset_mock()
-        with self.assertRaises(OSError):
-            retry_delivery(Configuration.load().revision, self.old_generation)
-        self.send.assert_not_called()
-        publish_and_deliver(str(Configuration.load().revision))
-        self.send.assert_called_once()
+        written, errors = publish_dns_zones(str(Configuration.load().revision))
+        self.assertEqual(errors, [])
         config = Configuration.load()
         self.assertEqual(config.dns_published_generation, f"dnsgrid-{self.timestamp}")
         path = self.root / "generations" / config.dns_published_generation
-        attempt = json.loads((path / ".delivery.json").read_text())
-        self.assertNotEqual(attempt["delivery"], self.old_attempt["delivery"])
-        raw = (path / "manifest.json").read_bytes()
-        publish_and_deliver(str(config.revision))
-        self.send.assert_called_once()
-        retry_delivery(config.revision, config.dns_published_generation)
-        self.assertEqual(self.send.call_count, 2)
-        self.assertEqual((path / "manifest.json").read_bytes(), raw)
+        self.assertTrue((path / "manifest.json").is_file())
+        self.assertTrue(written)
         self.assertEqual(Configuration.load().soa_serial, self.timestamp)
 
     def test_stale_config_artifact_and_timestamp_previews(self):
@@ -146,24 +123,20 @@ class DNSResetTests(TestCase):
                 if change == "config":
                     Configuration.objects.update(ttl=Configuration.load().ttl + 1)
                 elif change == "artifact":
-                    (self.old_path / ".pin").write_text("changed")
+                    (self.old_path / "manifest.json").write_text("changed")
                 with patch("inventory.dns_reset.initial_serial", return_value=(
                         self.timestamp + 901 if change == "time" else self.timestamp)):
                     with self.assertRaises(ValidationError):
                         dns_reset.reset(plan["timestamp"], token, confirmed=True,
-                                        unloaded=True, nas_handled=True)
+                                       unloaded=True)
         self.assertFalse((self.root / dns_reset.JOURNAL).exists())
 
     def test_unsafe_paths_symlinks_and_malformed_generation_fail_without_cleanup(self):
-        for name in ("unexpected.txt", ".pin", ".delivery.json", "manifest.json"):
+        for name in ("unexpected.txt", "manifest.json"):
             target = self.old_path / name
             old = target.read_bytes() if target.exists() else None
             target.write_text("malformed")
             try:
-                # A plain pin is allowed, but a symlink must never be followed.
-                if name == ".pin":
-                    target.unlink()
-                    target.symlink_to(self.root / "outside")
                 with self.assertRaises((ValidationError, OSError)):
                     dns_reset.preview()
                 self.assertTrue(self.old_path.is_dir())
@@ -182,13 +155,6 @@ class DNSResetTests(TestCase):
         with self.assertRaises(ValidationError):
             dns_reset.preview()
         Configuration.objects.update(dns_export_directory=original)
-
-    def test_lock_contention_rejects_reset_without_deleting_lock(self):
-        inode = (self.root / ".dnsgrid-delivery.lock").stat().st_ino
-        with _lock(str(self.root)):
-            with self.assertRaisesMessage(ValidationError, "Another"):
-                self.execute()
-        self.assertEqual((self.root / ".dnsgrid-delivery.lock").stat().st_ino, inode)
 
     def test_filesystem_partial_failure_blocks_writers_and_rolls_forward(self):
         replace = os.replace
@@ -209,7 +175,6 @@ class DNSResetTests(TestCase):
         self.assertEqual(Configuration.load().soa_serial, 2026101004)
         for action in (
             lambda: publish_dns_zones(str(Configuration.load().revision)),
-            lambda: retry_delivery(Configuration.load().revision, self.old_generation),
             lambda: save_host(Host(name="blocked", site_id=1, row=1, column=0),
                               Configuration.load().revision),
         ):
@@ -253,9 +218,9 @@ class DNSResetTests(TestCase):
         with self.assertRaisesMessage(ValidationError, "fingerprint"):
             self.recover()
         journal.write_text(original_record)
-        pin = self.root / record["quarantine"] / "generations" / self.old_generation / ".pin"
-        pin.write_text("tampered")
-        with self.assertRaisesMessage(ValidationError, "changed"):
+        manifest = self.root / record["quarantine"] / "generations" / self.old_generation / "manifest.json"
+        manifest.write_text("tampered")
+        with self.assertRaisesMessage(ValidationError, "Invalid or corrupted immutable generation"):
             self.recover()
         journal.write_text("{}")
         with self.assertRaisesMessage(ValidationError, "Malformed"):
@@ -275,7 +240,7 @@ class DNSResetTests(TestCase):
 
 
 class DNSResetConcurrencyTests(TransactionTestCase):
-    def test_reset_excludes_local_publication_and_delivery_during_moves(self):
+    def test_reset_excludes_local_publication_during_moves(self):
         Configuration.load()
         for index in range(1, 5):
             Site.objects.update_or_create(pk=index, defaults={"name": f"Site{index}", "g": index})
@@ -300,7 +265,7 @@ class DNSResetConcurrencyTests(TransactionTestCase):
                 close_old_connections()
                 try:
                     return dns_reset.reset(plan["timestamp"], token, confirmed=True,
-                                           unloaded=True, nas_handled=True)
+                                           unloaded=True)
                 finally:
                     close_old_connections()
 
@@ -313,8 +278,6 @@ class DNSResetConcurrencyTests(TransactionTestCase):
                             self.assertTrue(entered.wait(timeout=10))
                             with self.assertRaises((ValidationError, OperationalError)):
                                 publish_dns_zones("1")
-                            with self.assertRaises((ValidationError, OperationalError)):
-                                retry_delivery(1, "dnsgrid-2026101004")
                         finally:
                             release.set()
                         self.assertTrue(future.result(timeout=10).is_dir())

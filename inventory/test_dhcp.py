@@ -590,7 +590,7 @@ class DHCPTests(TestCase):
 
 
 class DHCPMigrationTests(TransactionTestCase):
-    def test_additive_migration_preserves_configuration_sites_and_hosts(self):
+    def test_dhcp_migration_preserves_inventory_and_removes_retired_settings(self):
         executor = MigrationExecutor(connection)
         executor.migrate([("inventory", "0012_host_static")])
         old = executor.loader.project_state([("inventory", "0012_host_static")]).apps
@@ -611,8 +611,15 @@ class DHCPMigrationTests(TransactionTestCase):
         hosts_data = list(old.get_model("inventory", "Host").objects.order_by("pk").values())
         try:
             executor = MigrationExecutor(connection)
-            executor.migrate([("inventory", "0013_dhcp_publications")])
-            self.assertEqual(Configuration.objects.values().get(pk=1), configuration_data)
+            executor.migrate([("inventory", "0014_remove_dns_sftp_settings")])
+            expected_configuration = {
+                field: value for field, value in configuration_data.items()
+                if field not in {
+                    "dns_sftp_host", "dns_sftp_user", "dns_sftp_port",
+                    "dns_sftp_inbox", "dns_sftp_outbox",
+                }
+            }
+            self.assertEqual(Configuration.objects.values().get(pk=1), expected_configuration)
             self.assertEqual(list(Site.objects.order_by("pk").values()), sites_data)
             self.assertEqual(list(Host.objects.order_by("pk").values()), hosts_data)
             self.assertTrue(Host.objects.get(pk=host.pk).static)
@@ -620,4 +627,4 @@ class DHCPMigrationTests(TransactionTestCase):
             self.assertFalse(DHCPResult.objects.exists())
             self.assertFalse(DHCPState.objects.exists())
         finally:
-            MigrationExecutor(connection).migrate([("inventory", "0013_dhcp_publications")])
+            MigrationExecutor(connection).migrate([("inventory", "0014_remove_dns_sftp_settings")])

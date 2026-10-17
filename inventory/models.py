@@ -136,13 +136,6 @@ class Configuration(models.Model):
         default=initial_serial, validators=[MinValueValidator(0), MaxValueValidator(MAX_SERIAL)]
     )
     dns_content_hash = models.CharField(max_length=64, blank=True, default="", editable=False)
-    dns_sftp_host = models.CharField(max_length=253, blank=True, default="")
-    dns_sftp_user = models.CharField(max_length=64, blank=True, default="")
-    dns_sftp_port = models.PositiveIntegerField(
-        default=22, validators=[MinValueValidator(1), MaxValueValidator(65535)]
-    )
-    dns_sftp_inbox = models.CharField(max_length=4096, blank=True, default="")
-    dns_sftp_outbox = models.CharField(max_length=4096, blank=True, default="")
     named_checkzone = models.CharField(max_length=4096, blank=True, default="")
     rndc = models.CharField(max_length=4096, blank=True, default="")
     rndc_key = models.CharField(max_length=4096, blank=True, default="")
@@ -195,17 +188,6 @@ class Configuration(models.Model):
             getattr(self, field) for field in tool_fields
         ):
             errors["named_checkzone"] = "Configure named_checkzone, rndc, and rndc_key together."
-        from .dns_sftp import validate_destination, validate_remote_path
-        try:
-            validate_destination(self.dns_sftp_host, self.dns_sftp_user, self.dns_sftp_port)
-        except ValidationError as error:
-            errors["dns_sftp_host"] = error.messages
-        for field in ("dns_sftp_inbox", "dns_sftp_outbox"):
-            if getattr(self, field):
-                try:
-                    validate_remote_path(getattr(self, field))
-                except ValidationError as error:
-                    errors[field] = error.messages
         for field in ("lan_prefix", "vpn_prefix"):
             try:
                 setattr(self, field, normalize_prefix(getattr(self, field)))
