@@ -1,12 +1,31 @@
-# Copy dhcp_pull.py and dsm_apply.py side by side onto the NAS.
-# Run once from DSM Task Scheduler as the owner with DSM permissions:
-# python3 /private/path/dhcp_pull.py --config /private/path/dhcp_pull.ini
+# Copy reviewed dhcp_pull.py and dsm_apply.py side by side onto the NAS.
+# The DSM helper requires root. Use a DSM user-defined scheduled task as root:
+# /bin/python /volume1/dnsgrid/bin/dhcp_pull.py --config /volume1/dnsgrid/etc/dhcp_pull.ini
+# For a supervised manual run, prefix that command with sudo.
+# Verify the interpreter is Python 3.8+ and use your actual absolute paths.
+# Non-root runs stop locally with requires_root (exit 1) before config/network/state.
+# --help and pure schema helpers do not require root.
 # No daemon, third-party packages, remote commands or configurable DSM executable.
 #
-# Config: regular file, owner = scheduling user, mode 0600 (or 0400).
-# State directory: same owner, mode 0700; state/lock files mode 0600.
+# Scripts, import directory/parents, interpreter and executable dependencies must
+# be trusted, root-owned and not writable by untrusted users, including via ACLs.
+# Use a controlled working directory/environment. Audit stale __pycache__/bytecode;
+# chown does not make untrusted code safe, and -B does not prevent cache loading.
+# Prefer a new empty trusted code directory; do not blindly delete old caches.
+# The root preflight does not check code integrity; imports happen before it.
+# Config: single-link regular file, owner = effective UID (root), use mode 0600.
+# Config/CA also accept 0400. State directories: same owner, mode 0700;
+# state/lock/backup files: single-link regular files, root-owned, mode 0600.
 # Ancestors must not be symlinks or group/world writable and must be owned by
-# root or scheduling user. Do not place files under /tmp or a shared directory.
+# root or the effective UID (both UID 0 for supported runs); not necessarily 0700.
+# This covers every ancestor from /, not just the immediate parent.
+# Do not place files under /tmp or a shared directory.
+# See README "NAS installation and schedule" for bounded installation/migration:
+# inspect explicit paths and deployment-specific parents before chmod/chown.
+# Preserve existing state.json, lock and backups when migrating from non-root;
+# transfer verified private paths to root with 0700 directories/0600 files.
+# Cover optional CA too. No recursive chmod/chown, blanket removal, changes to
+# DSM helper/shared system parents or sudoers rules. Do not expose tokens.
 # The state directory is created if absent; its parent must already exist.
 # HTTPS is the default and verifies TLS certificates. HTTP is accepted only with
 # allow_http_over_vpn = true, when the entire connection is restricted to the VPN.

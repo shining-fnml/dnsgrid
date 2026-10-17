@@ -1040,8 +1040,17 @@ environment proxies are disabled for both schemes.
 NAS installation and schedule
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+The supported NAS DHCP pull workflow **must run as root** (effective UID 0).
+The fixed DSM helper, ``/usr/syno/bin/synowebapi``, requires root execution.
+Non-root runs stop locally with ``requires_root`` and exit status 1 before
+reading config, opening state, contacting dnsgrid or calling DSM. This code is
+never sent in machine acknowledgements. ``--help`` still works without root;
+importing the modules and using pure schema helpers does not require root.
+Do not change the DSM helper's ownership/permissions, add sudoers rules, or
+give remote dnsgrid sudo access or DSM credentials.
+
 Copy ``synology/dhcp_pull.py`` and ``synology/dsm_apply.py`` side by side into a
-private, administrator-owned directory on **each** NAS. Use Python 3.8 or later
+trusted, root-owned directory on **each** NAS. Use Python 3.8 or later
 on DSM/Linux. No Django, daemon or third-party Python package is needed. Copy
 ``synology/dhcp_pull.ini.example`` to a private configuration file and edit its
 ``[dhcp_pull]`` section for that NAS::
@@ -1053,7 +1062,7 @@ on DSM/Linux. No Django, daemon or third-party Python package is needed. Copy
     ifname = ovs_eth0
     subnet = 192.168.4.0/24
     token = CHANGE_ME_BEFORE_USE
-    state_dir = /var/lib/dnsgrid-dhcp
+    state_dir = /volume1/dnsgrid/var
     timeout = 30
     # ca_file = /private/path/internal-ca.pem
 
@@ -1061,28 +1070,109 @@ This example's site ID and subnet are independent. Configure the other NAS
 instances from their actual site IDs, interfaces and subnets, not by substituting
 subnet octets for IDs. The hostname above is intentionally non-routable.
 
-Config files and optional CA files must be regular, owned by the scheduling
-user, have one hard link, and be mode 0600 or 0400. Use persistent local storage
-with private 0700 state directories; do not
-use a shared directory or network mount. Parent directories must be owned by
-root or the scheduling user, not group/world writable, and must not contain
-symlinks. These checks cover **every ancestor from** ``/`` **to the immediate
-parent** of the configuration file, optional CA file and state directory, not
-just the leaf file or private state directory. State files and the lock must
-be regular, owned by the scheduling user, mode 0600 and have one hard link;
-backup directories must be private 0700 directories with protected 0600 files.
-Protect both scripts from modification by untrusted accounts. Local
-DSM permissions remain local: the script uses the fixed
-``/usr/syno/bin/synowebapi`` through the existing helper. If DSM requires root,
-schedule under root; do not grant remote dnsgrid any sudo or DSM credentials.
+The filesystem helpers check leaf ownership against the **effective UID**, not
+merely whether the owner is root. Since supported runs have euid 0, config,
+optional CA, state, lock and backups must all be root-owned. Config and CA must
+be regular single-link files; install them as 0600 (0400 is also accepted for
+these read-only inputs). State directories, including backups, require exactly
+0700; state, lock and backup files require exactly 0600 and one hard link.
+Use persistent private local storage, not a shared directory or network mount.
+Ancestors have different rules: each must be a directory owned by UID 0 or
+the effective UID, with no group/other write bits (``mode & 0o022 == 0``).
+With root execution that means root-owned ancestors. Ancestors need not be
+0700. These checks cover **every ancestor from** ``/`` **to the immediate
+parent** of config, optional CA and state; symlinks are rejected, not resolved
+away. The state directory can be created by the client if its parent exists.
 
-In DSM **Task Scheduler**, create a user-defined script task every five minutes,
-using your installed Python 3 absolute path and fixed arguments, for example::
+Root also executes the scripts and imported code. Both scripts, their import
+directory and all its parents must be trusted, root-owned and not writable by
+untrusted users, including through DSM ACLs. The interpreter, imported modules,
+startup hooks and other executable dependencies must likewise be trusted and
+protected. Use a controlled working directory and environment; do not inherit
+untrusted ``PYTHONPATH`` or Python startup settings. Audit existing
+``__pycache__`` directories and bytecode too: changing ownership does not make
+old untrusted code safe, and ``python -B`` only prevents new cache writes, not
+loading existing bytecode. Prefer installing reviewed source into a new empty
+trusted code directory rather than reusing untrusted caches. Do not blindly
+delete a cache tree. The root preflight is only an execution prerequisite,
+**not a code-integrity check**; Python imports occur before it.
 
-    /usr/local/bin/python3 /private/path/dhcp_pull.py --config /private/path/dhcp_pull.ini
+For a fresh installation, the following uses **illustrative explicit paths**.
+First inspect the actual deployment's parents with ``ls -ld`` and ``stat``
+without dereferencing symlinks, including ``/`` and ``/volume1``. Check DSM ACLs
+separately. Stop if any component is a symlink, untrusted or writable by other
+accounts. Do not change DSM-managed/shared parent permissions to make this
+example work; choose a suitable private location with the NAS administrator.
+The directories below must not already exist; for an existing deployment use
+the migration guidance instead. After verifying the parent, create only these
+bounded private directories::
 
-Run it once manually first and inspect its result, status page and DSM
-reservations. An exclusive local lock prevents overlapping scheduled runs.
+    sudo install -d -o root -g root -m 0755 /volume1/dnsgrid
+    sudo install -d -o root -g root -m 0755 /volume1/dnsgrid/bin
+    sudo install -d -o root -g root -m 0700 /volume1/dnsgrid/etc
+    sudo install -d -o root -g root -m 0700 /volume1/dnsgrid/var
+
+Inspect each new directory again. From a reviewed release staged at
+``/verified-release/synology`` (replace this with your verified absolute source
+path), install only the named regular source files, after checking source and
+destination paths for symlinks and confirming destination files are absent::
+
+    sudo install -o root -g root -m 0644 /verified-release/synology/dhcp_pull.py /volume1/dnsgrid/bin/dhcp_pull.py
+    sudo install -o root -g root -m 0644 /verified-release/synology/dsm_apply.py /volume1/dnsgrid/bin/dsm_apply.py
+    sudo install -o root -g root -m 0600 /verified-release/synology/dhcp_pull.ini.example /volume1/dnsgrid/etc/dhcp_pull.ini
+
+Edit the config privately as root, including its token, without putting secrets
+in shell arguments or logs. If using ``ca_file``, install the reviewed PEM at
+an explicitly verified private path such as
+``/volume1/dnsgrid/etc/internal-ca.pem``, root-owned, single-link and mode 0600,
+and set that absolute path in the config. Its entire ancestor chain is checked
+independently. Do not change the system CA store's permissions.
+
+For **migration from non-root**, disable the old scheduled task and ensure no
+client is still running before inspecting or changing anything. Preserve a
+private backup of the existing config and complete state tree, including
+``state.json``, ``lock`` and every DSM backup. Do not delete ``state.json`` or
+reset state to bypass checks; keep the same site/interface/subnet and state
+path. Inspect all entries, including hidden files, without following symlinks;
+reject symlinks, hard-linked files, unexpected entries and special files before
+any ownership/permission changes. Secure the deployment-specific parent chain
+against untrusted changes first, without altering system/shared parents.
+
+After checking each exact path, transfer only the verified private deployment
+directories to root ownership, keeping code directories non-group/world-writable
+and config/state directories 0700. Reinstall reviewed source into a new empty
+root-owned import directory if the old code or caches were untrusted, and update
+the task's script path accordingly. For the example deployment, these are
+bounded leaf changes **only after verifying each is a regular single-link file
+and its parents are trusted**, not a recursive migration command::
+
+    sudo chown root:root /volume1/dnsgrid/etc/dhcp_pull.ini
+    sudo chmod 0600 /volume1/dnsgrid/etc/dhcp_pull.ini
+    sudo chown root:root /volume1/dnsgrid/var/state.json
+    sudo chmod 0600 /volume1/dnsgrid/var/state.json
+    sudo chown root:root /volume1/dnsgrid/var/lock
+    sudo chmod 0600 /volume1/dnsgrid/var/lock
+
+Skip absent files; do not create or truncate state/lock files for migration.
+Apply the same reviewed, exact-path procedure to an optional CA, the existing
+``backups`` directory and **each** retained backup directory/file (0700/0600).
+Do not use recursive ``chown``/``chmod``, wildcard changes or blanket deletion.
+Reinspect metadata and ACLs before running; unexpected backup contents should be
+investigated, not removed to force an apply.
+
+Run once under supervision first, using your verified installed Python 3
+absolute path (``/bin/python`` here only if it is Python 3.8 or later)::
+
+    cd /volume1/dnsgrid/bin && sudo /bin/python /volume1/dnsgrid/bin/dhcp_pull.py --config /volume1/dnsgrid/etc/dhcp_pull.ini
+
+In DSM **Task Scheduler**, create a **user-defined script task with user root**
+every five minutes. Use the same verified interpreter and installed script
+paths, without sudo inside the already-root task::
+
+    cd /volume1/dnsgrid/bin && /bin/python /volume1/dnsgrid/bin/dhcp_pull.py --config /volume1/dnsgrid/etc/dhcp_pull.ini
+
+Inspect the manual run's result, status page and DSM reservations before
+enabling the schedule. An exclusive local lock prevents overlapping runs.
 HTTP socket timeouts are configured locally (30 seconds by default, at most
 120); the response deadline can exceed that by one socket timeout. Hostname
 resolution uses the operating system's resolver limits, so configure DNS retry
@@ -1105,7 +1195,7 @@ identify the failing component or root cause. Run the updated client manually
 under the **same user as the scheduled task** to obtain local diagnostics before
 deciding what to change. For example (illustrative paths and numeric IDs only)::
 
-    DHCP pull stopped: unsafe_path. config: validate ancestor path="/example/shared"; failed=group_or_other_writable; observed type=directory uid=0 mode=0o0775 nlink=2 euid=1026; expected type=directory uid=0 or 1026 (euid) mode&0o0022=0
+    DHCP pull stopped: unsafe_path. config: validate ancestor path="/example/shared"; failed=group_or_other_writable; observed type=directory uid=0 mode=0o0775 nlink=2 euid=0; expected type=directory uid=0 or 0 (euid) mode&0o0022=0
 
 Here the rejected component is ``/example/shared``, not necessarily the INI
 file passed to ``--config``. Its owner UID 0 is permitted, but mode ``0o0775``
