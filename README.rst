@@ -1091,6 +1091,12 @@ make multiple calls.
 Inputs, state, response sizes and diagnostics are bounded. Downloaded data is
 validated, never executed or interpreted as commands.
 
+When a run ends ``failed`` or ``rejected``, the final summary includes the
+recorded allowlisted diagnostic code when available, for example
+``DHCP pull failed; retry required. Diagnostic: dsm_failed.`` After the hub
+acknowledges the result, ``last_report`` in ``state.json`` keeps the same
+optional ``diagnostic`` code. Exit codes and acknowledgements are unchanged.
+
 Filesystem security troubleshooting
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

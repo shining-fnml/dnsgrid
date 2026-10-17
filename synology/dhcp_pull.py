@@ -375,12 +375,16 @@ def validate_state(state, config):
     require(type(state["blocked"]) is bool, "invalid_state")
     last = state["last_report"]
     if last is not None:
-        require(isinstance(last, dict) and set(last) == {"version", "sha256", "status"}, "invalid_state")
+        require(isinstance(last, dict) and set(last) in (
+            {"version", "sha256", "status"}, {"version", "sha256", "status", "diagnostic"},
+        ), "invalid_state")
         require(isinstance(last["version"], str) and
                 re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", last["version"]), "invalid_state")
         require(isinstance(last["sha256"], str) and
                 re.fullmatch(r"[0-9a-f]{64}", last["sha256"]), "invalid_state")
         require(last["status"] in {"applied", "failed", "rejected"}, "invalid_state")
+        if "diagnostic" in last:
+            require(last["status"] != "applied" and last["diagnostic"] in DIAGNOSTICS, "invalid_state")
     for key in ("fetched", "applied", "inflight"):
         if state[key] is not None:
             validate_envelope(state[key], config)
@@ -622,7 +626,8 @@ def report(transport, store, state):
                 receipt["status"] == state["pending"]["status"], "invalid_ack")
     except SafeError:
         return False
-    state["last_report"] = {key: state["pending"][key] for key in ("version", "sha256", "status")}
+    state["last_report"] = {key: state["pending"][key]
+                            for key in ("version", "sha256", "status", "diagnostic") if key in state["pending"]}
     state["pending"] = None
     store.save(state)
     return True
@@ -636,113 +641,129 @@ def reject(transport, store, state, envelope, code):
     return 2
 
 
-def run(config, reconcile=False):
+def recorded_diagnostic(state):
+    """Return the allowlisted diagnostic of the pending or last delivered failure, if any."""
+    record = state["pending"] if state["pending"] is not None else state["last_report"]
+    if record is None or record["status"] == "applied":
+        return None
+    diagnostic = record.get("diagnostic")
+    return diagnostic if diagnostic in DIAGNOSTICS else None
+
+
+def run(config, reconcile=False, outcome=None):
     with Store(config) as store:
         state = store.load()
-        transport = Transport(config)
-        conditional = etag(state["applied"]) if state["applied"] else None
-        status, received_tag, body = transport.request("GET", "latest", conditional=conditional)
-        if status == 304:
-            require(conditional is not None and not body)
-            require(received_tag is None or received_tag == conditional)
-            envelope = state["applied"]
-        else:
-            raw = parse_json(body)
-            try:
-                envelope = validate_envelope(raw, config)
-            except SafeError as error:
-                if error.code != "mapping_mismatch":
-                    raise
-                require(received_tag is None or received_tag == etag(raw))
-                queue_ack(state, raw, "rejected", "mapping_mismatch")
-                store.save(state)
-                report(transport, store, state)
-                return 2
-            require(received_tag is None or received_tag == etag(envelope))
+        result = execute(config, reconcile, store, state)
+        if outcome is not None and result != 0:
+            outcome["diagnostic"] = recorded_diagnostic(state)
+        return result
+
+
+def execute(config, reconcile, store, state):
+    transport = Transport(config)
+    conditional = etag(state["applied"]) if state["applied"] else None
+    status, received_tag, body = transport.request("GET", "latest", conditional=conditional)
+    if status == 304:
+        require(conditional is not None and not body)
+        require(received_tag is None or received_tag == conditional)
+        envelope = state["applied"]
+    else:
+        raw = parse_json(body)
         try:
-            response, live = read_live(config)
-        except (ValueError, OSError, subprocess.SubprocessError, SafeError):
-            state["fetched"] = envelope
-            queue_ack(state, envelope, "failed", "dsm_failed")
+            envelope = validate_envelope(raw, config)
+        except SafeError as error:
+            if error.code != "mapping_mismatch":
+                raise
+            require(received_tag is None or received_tag == etag(raw))
+            queue_ack(state, raw, "rejected", "mapping_mismatch")
             store.save(state)
             report(transport, store, state)
-            return 1
-        if state["inflight"] is not None:
-            attempt = state["inflight"]
-            if equal(live, attempt["payload"]):
-                state["applied"] = attempt
-                queue_ack(state, attempt, "applied")
-                state["blocked"] = False
-            elif equal(live, state["baseline"]):
-                state["blocked"] = False
-            else:
-                state["blocked"] = True
-                state["fetched"] = attempt
-                queue_ack(state, attempt, "failed", "recovery_required")
-            state["inflight"] = None
-            state["baseline"] = None
-            store.save(state)
-        drift = state["applied"] is not None and not equal(live, state["applied"]["payload"])
-        if drift and state["pending"] is not None and state["pending"]["status"] == "applied":
-            queue_ack(state, state["applied"], "rejected", "dsm_drift")
-            store.save(state)
-        if (drift or state["blocked"]) and not reconcile:
-            # Preserve an undelivered report, but never claim applied after drift.
-            if state["pending"] is not None:
-                if not report(transport, store, state):
-                    return 1
-            return reject(transport, store, state, envelope, "dsm_drift")
-        if not report(transport, store, state):
-            return 1
-        # Reusing a version with different content or authorization is invalid.
-        for known in (state["applied"], state["fetched"]):
-            if known is not None and known["version"] == envelope["version"]:
-                require(known == envelope)
+            return 2
+        require(received_tag is None or received_tag == etag(envelope))
+    try:
+        response, live = read_live(config)
+    except (ValueError, OSError, subprocess.SubprocessError, SafeError):
         state["fetched"] = envelope
-        desired = envelope["payload"]
-        new_count = len(desired["reservationData"])
-        baseline = max(len(live["reservationData"]),
-                       len(state["applied"]["payload"]["reservationData"]) if state["applied"] else 0)
-        if (new_count == 0 or new_count * 2 < baseline) and not envelope["destructive_authorized"]:
-            return reject(transport, store, state, envelope, "destructive_not_authorized")
-        if equal(live, desired):
-            delivered = {"version": envelope["version"], "sha256": envelope["sha256"], "status": "applied"}
-            if state["applied"] == envelope and not state["blocked"] and state["last_report"] == delivered:
-                return 0
-            state["applied"] = envelope
+        queue_ack(state, envelope, "failed", "dsm_failed")
+        store.save(state)
+        report(transport, store, state)
+        return 1
+    if state["inflight"] is not None:
+        attempt = state["inflight"]
+        if equal(live, attempt["payload"]):
+            state["applied"] = attempt
+            queue_ack(state, attempt, "applied")
             state["blocked"] = False
-            queue_ack(state, envelope, "applied")
-            store.save(state)
-            return 0 if report(transport, store, state) else 1
-        try:
-            store.backup(response, live)
-            _, latest = read_live(config)
-            if not equal(live, latest):
-                return reject(transport, store, state, envelope, "baseline_changed")
-            state["inflight"] = envelope
-            state["baseline"] = live
-            store.save(state)
-        except (ValueError, OSError, subprocess.SubprocessError) as error:
-            # No DSM write occurred. Never acknowledge an undurable attempt.
-            raise SafeError("persistence_failed", getattr(error, "diagnostic", None)) from None
-        diagnostic = "dsm_failed"
-        try:
-            dsm_apply.call_api("set", config["ifname"], desired["reservationData"], max_output=MAX_BODY)
-            diagnostic = "verification_failed"
-            _, verified = read_live(config)
-            require(equal(verified, desired), diagnostic)
-        except (ValueError, OSError, subprocess.SubprocessError, SafeError):
-            queue_ack(state, envelope, "failed", diagnostic)
-            store.save(state)
-            report(transport, store, state)
-            return 1
-        state["applied"] = envelope
+        elif equal(live, state["baseline"]):
+            state["blocked"] = False
+        else:
+            state["blocked"] = True
+            state["fetched"] = attempt
+            queue_ack(state, attempt, "failed", "recovery_required")
         state["inflight"] = None
         state["baseline"] = None
+        store.save(state)
+    drift = state["applied"] is not None and not equal(live, state["applied"]["payload"])
+    if drift and state["pending"] is not None and state["pending"]["status"] == "applied":
+        queue_ack(state, state["applied"], "rejected", "dsm_drift")
+        store.save(state)
+    if (drift or state["blocked"]) and not reconcile:
+        # Preserve an undelivered report, but never claim applied after drift.
+        if state["pending"] is not None:
+            if not report(transport, store, state):
+                return 1
+        return reject(transport, store, state, envelope, "dsm_drift")
+    if not report(transport, store, state):
+        return 1
+    # Reusing a version with different content or authorization is invalid.
+    for known in (state["applied"], state["fetched"]):
+        if known is not None and known["version"] == envelope["version"]:
+            require(known == envelope)
+    state["fetched"] = envelope
+    desired = envelope["payload"]
+    new_count = len(desired["reservationData"])
+    baseline = max(len(live["reservationData"]),
+                   len(state["applied"]["payload"]["reservationData"]) if state["applied"] else 0)
+    if (new_count == 0 or new_count * 2 < baseline) and not envelope["destructive_authorized"]:
+        return reject(transport, store, state, envelope, "destructive_not_authorized")
+    if equal(live, desired):
+        delivered = {"version": envelope["version"], "sha256": envelope["sha256"], "status": "applied"}
+        if state["applied"] == envelope and not state["blocked"] and state["last_report"] == delivered:
+            return 0
+        state["applied"] = envelope
         state["blocked"] = False
         queue_ack(state, envelope, "applied")
         store.save(state)
         return 0 if report(transport, store, state) else 1
+    try:
+        store.backup(response, live)
+        _, latest = read_live(config)
+        if not equal(live, latest):
+            return reject(transport, store, state, envelope, "baseline_changed")
+        state["inflight"] = envelope
+        state["baseline"] = live
+        store.save(state)
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        # No DSM write occurred. Never acknowledge an undurable attempt.
+        raise SafeError("persistence_failed", getattr(error, "diagnostic", None)) from None
+    diagnostic = "dsm_failed"
+    try:
+        dsm_apply.call_api("set", config["ifname"], desired["reservationData"], max_output=MAX_BODY)
+        diagnostic = "verification_failed"
+        _, verified = read_live(config)
+        require(equal(verified, desired), diagnostic)
+    except (ValueError, OSError, subprocess.SubprocessError, SafeError):
+        queue_ack(state, envelope, "failed", diagnostic)
+        store.save(state)
+        report(transport, store, state)
+        return 1
+    state["applied"] = envelope
+    state["inflight"] = None
+    state["baseline"] = None
+    state["blocked"] = False
+    queue_ack(state, envelope, "applied")
+    store.save(state)
+    return 0 if report(transport, store, state) else 1
 
 
 def main(argv=None):
@@ -751,9 +772,12 @@ def main(argv=None):
     parser.add_argument("--reconcile", action="store_true", help="operator-reviewed drift reconciliation for this run only")
     options = parser.parse_args(argv)
     try:
-        result = run(load_config(options.config), options.reconcile)
+        outcome = {}
+        result = run(load_config(options.config), options.reconcile, outcome)
+        diagnostic = outcome.get("diagnostic")
+        detail = " Diagnostic: " + diagnostic + "." if diagnostic in DIAGNOSTICS else ""
         print({0: "DHCP pull completed.", 1: "DHCP pull failed; retry required.",
-               2: "DHCP pull rejected; operator review required."}[result])
+               2: "DHCP pull rejected; operator review required."}[result] + detail)
         return result
     except SafeError as error:
         detail = " " + error.diagnostic.render() if error.diagnostic is not None else ""

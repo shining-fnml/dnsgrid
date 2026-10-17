@@ -341,6 +341,80 @@ class PullTests(SimpleTestCase):
         self.assertEqual(self.run_pull(), 0)
         self.assertEqual(len(self.transport.posts), reports)
 
+    def main_output(self, expected_exit, reconcile=False):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        argv = ["--config", "/private/pull.ini"] + (["--reconcile"] if reconcile else [])
+        with patch.object(pull, "load_config", return_value=self.config), \
+                patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            self.assertEqual(pull.main(argv), expected_exit)
+        self.assertEqual(stderr.getvalue(), "")
+        return stdout.getvalue()
+
+    def test_failed_run_surfaces_recorded_diagnostic_in_summary_and_last_report(self):
+        for attribute, diagnostic in (("fail_read", "dsm_failed"), ("fail_set", "dsm_failed"),
+                                      ("wrong_verification", "verification_failed")):
+            with self.subTest(diagnostic=diagnostic, attribute=attribute):
+                self.install_state()
+                self.dsm = FakeDSM(payload(2, 10))
+                setattr(self.dsm, attribute, True)
+                patch("synology.dsm_apply.call_api", side_effect=self.dsm).start()
+                text = self.main_output(1)
+                self.assertEqual(text, f"DHCP pull failed; retry required. Diagnostic: {diagnostic}.\n")
+                self.assertNotIn("private-output", text)
+                self.assertNotIn(self.config["token"], text)
+                self.assertNotIn("example.invalid", text)
+                self.assertEqual(self.state()["last_report"], {
+                    "version": "v1", "sha256": self.transport.current["sha256"],
+                    "status": "failed", "diagnostic": diagnostic,
+                })
+                self.assertEqual(set(self.transport.posts[-1]),
+                                 {"schema_version", "version", "sha256", "status", "diagnostic", "report_id"})
+
+    def test_rejected_run_surfaces_recorded_diagnostic(self):
+        self.assertEqual(self.main_output(0), "DHCP pull completed.\n")
+        self.assertNotIn("diagnostic", self.state()["last_report"])
+        self.transport.not_modified = True
+        self.dsm.live = payload(2, 30)
+        self.assertEqual(self.main_output(2),
+                         "DHCP pull rejected; operator review required. Diagnostic: dsm_drift.\n")
+        self.assertEqual(self.state()["last_report"]["diagnostic"], "dsm_drift")
+        self.dsm.live = self.transport.current["payload"]
+        self.assertEqual(self.main_output(0, reconcile=True), "DHCP pull completed.\n")
+        self.assertNotIn("diagnostic", self.state()["last_report"])
+
+    def test_undelivered_failure_surfaces_pending_diagnostic(self):
+        self.dsm.fail_read = True
+        self.transport.fail_post = True
+        self.assertEqual(self.main_output(1), "DHCP pull failed; retry required. Diagnostic: dsm_failed.\n")
+        self.assertIsNone(self.state()["last_report"])
+        self.assertEqual(self.state()["pending"]["diagnostic"], "dsm_failed")
+
+    def test_undelivered_success_has_no_diagnostic(self):
+        self.transport.fail_post = True
+        self.assertEqual(self.main_output(1), "DHCP pull failed; retry required.\n")
+
+    def test_last_report_diagnostic_state_validation(self):
+        published = envelope()
+        base = {"version": published["version"], "sha256": published["sha256"]}
+        for last, valid in (
+            (dict(base, status="failed"), True),
+            (dict(base, status="failed", diagnostic="dsm_failed"), True),
+            (dict(base, status="rejected", diagnostic="dsm_drift"), True),
+            (dict(base, status="failed", diagnostic="secret-token"), False),
+            (dict(base, status="failed", diagnostic=None), False),
+            (dict(base, status="applied", diagnostic="dsm_failed"), False),
+            (dict(base, status="failed", extra="x"), False),
+        ):
+            with self.subTest(last=last):
+                state = pull.empty_state(self.config)
+                state.update(fetched=published, last_report=last)
+                if valid:
+                    self.assertEqual(pull.validate_state(state, self.config)["last_report"], last)
+                else:
+                    with self.assertRaises(pull.SafeError) as raised:
+                        pull.validate_state(state, self.config)
+                    self.assertEqual(raised.exception.code, "invalid_state")
+
     def test_manually_restored_drift_reconcile_reports_success_without_set(self):
         self.assertEqual(self.run_pull(), 0)
         count = self.dsm.calls.count("set")
