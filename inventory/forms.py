@@ -20,7 +20,10 @@ class HostForm(forms.Form):
         required=False, label="Static host",
         help_text="Freeze this entry and exclude it from DHCP reservations. Revoke static protection separately before editing.",
     )
-    public_export = forms.BooleanField(required=False, label="Publish on Gandi (VPN only)")
+    public_export = forms.BooleanField(
+        required=False, label="Publish on Gandi (VPN only)",
+        help_text="For VPN members, publish both the VPN and LAN names on Gandi.",
+    )
     mac = MACAddressField(max_length=32, required=False, label="MAC address")
     notes = forms.CharField(max_length=4000, required=False, widget=forms.Textarea(attrs={"rows": 3}))
     revision = forms.IntegerField(widget=forms.HiddenInput)

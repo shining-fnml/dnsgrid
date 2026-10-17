@@ -109,6 +109,32 @@ class ModelTests(InventoryTestCase):
                 with self.subTest(field=field, value=value), self.assertRaises(ValidationError):
                     candidate.full_clean()
 
+    def test_gandi_publication_requires_paired_lan_name_inside_zone(self):
+        host = self.insert(name="pub", vpn=True, public_export=True)
+        for lan_domain, message in (
+            ("intranet.other.test", "The LAN domain must belong to the Gandi zone"),
+            ("intranetexample.tld", "The LAN domain must belong to the Gandi zone"),
+            ("vpn.example.tld", "The LAN and VPN domains must differ"),
+        ):
+            candidate = Configuration.load()
+            candidate.lan_domain = lan_domain
+            with self.subTest(lan_domain=lan_domain):
+                with self.assertRaisesMessage(ValidationError, message):
+                    candidate.full_clean()
+                Configuration.objects.filter(pk=1).update(lan_domain=lan_domain)
+                with self.assertRaisesMessage(ValidationError, message):
+                    Host.objects.get(pk=host.pk).full_clean()
+                fresh = self.host(name="other", row=2, vpn=True, public_export=True)
+                with self.assertRaisesMessage(ValidationError, message):
+                    fresh.full_clean()
+                for vpn, public in ((True, False), (False, True)):
+                    self.host(name="other", row=2, vpn=vpn, public_export=public).full_clean()
+                Configuration.objects.filter(pk=1).update(lan_domain="intranet.example.tld")
+        Host.objects.filter(pk=host.pk).update(public_export=False)
+        candidate = Configuration.load()
+        candidate.lan_domain = "intranet.other.test"
+        candidate.full_clean()
+
     def test_host_fqdn_length_limit(self):
         # 189 domain characters leave exactly 63 characters plus the separating dot.
         domain = ".".join(["a" * 63, "b" * 63, "c" * 61])

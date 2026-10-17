@@ -39,12 +39,17 @@ class ExportTests(TestCase):
         self.assertEqual(json.loads(output["gandi.json"]), [{
             "rrset_name": "alpha.vpn", "rrset_type": "A",
             "rrset_ttl": 300, "rrset_values": ["172.28.1.50"],
+        }, {
+            "rrset_name": "alpha.intranet", "rrset_type": "A",
+            "rrset_ttl": 300, "rrset_values": ["192.168.1.50"],
         }])
         self.assertNotIn("PRIVATE-NOTE", "".join(output.values()))
         self.assertNotIn(self.host.status, "".join(output.values()))
 
     def test_hub_private_zone_origins_are_configured_lan_and_vpn(self):
         self.config.lan_domain = "intranet.linuxcondom.net"
+        self.config.vpn_domain = "vpn.linuxcondom.net"
+        self.config.gandi_zone = "linuxcondom.net"
         output = build_exports(self.config, [self.host])
         self.assertIn("$ORIGIN intranet.linuxcondom.net.", output["forward.zone"])
         self.assertIn("alpha.intranet.linuxcondom.net. 300 A 192.168.1.50", output["forward.zone"])
@@ -59,7 +64,7 @@ class ExportTests(TestCase):
             self.assertIn("alpha.intranet.example.tld. 300 A", output["forward.zone"])
             self.assertIn("50.1.168.192.in-addr.arpa. 300 PTR", output["reverse-1.zone"])
             self.assertEqual(json.loads(output["dsm-reservations-site-1.json"])["reservationData"][0]["hostname"], "alpha")
-            self.assertEqual(len(json.loads(output["gandi.json"])), 1)
+            self.assertEqual(len(json.loads(output["gandi.json"])), 2)
             self.assertNotIn(status, "".join(output.values()))
             self.assertEqual(output, original)
             self.assertEqual(self.host.name, "alpha")
@@ -75,7 +80,10 @@ class ExportTests(TestCase):
                 self.assertEqual(
                     "50.1.28.172.in-addr.arpa. 300 PTR alpha.vpn.\n" in output["reverse-vpn.zone"], vpn,
                 )
-                self.assertEqual(len(desired_gandi(self.config, [self.host])), int(vpn and public))
+                self.assertEqual(
+                    [record["rrset_name"] for record in desired_gandi(self.config, [self.host])],
+                    ["alpha.vpn", "alpha.intranet"] if vpn and public else [],
+                )
                 self.assertEqual(json.loads(output["dsm-reservations-site-1.json"])["reservationData"], [])
                 self.assertIn("alpha.intranet.example.tld. 300 A", output["forward.zone"])
 
@@ -112,7 +120,11 @@ class ExportTests(TestCase):
         self.assertIn("50.4.29.10.in-addr.arpa. 600 PTR alpha.vpn.\n", output["reverse-vpn.zone"])
         self.assertTrue(output["reverse-vpn.zone"].endswith("29.10.in-addr.arpa. NS dns.other.test.\n"))
         self.assertEqual(json.loads(output["dsm-reservations-site-4.json"])["reservationData"][0]["ip"], "10.24.4.50")
-        self.assertEqual(desired_gandi(self.config, [self.host])[0]["rrset_values"], ["10.29.4.50"])
+        self.assertEqual(
+            [(record["rrset_name"], record["rrset_ttl"], record["rrset_values"])
+             for record in desired_gandi(self.config, [self.host])],
+            [("alpha.vpn", 600, ["10.29.4.50"]), ("alpha.lan", 600, ["10.24.4.50"])],
+        )
 
     def test_site_move_updates_reservations_and_zones(self):
         beta = Host.objects.create(
@@ -219,6 +231,56 @@ class ExportTests(TestCase):
         self.config.gandi_zone = "unrelated.test"
         with self.assertRaises(ValueError):
             desired_gandi(self.config, [self.host])
+
+    def test_lan_name_outside_zone_is_rejected_on_label_boundary(self):
+        for lan_domain in ("intranet.other.test", "intranet.badexample.tld", "intranetexample.tld"):
+            self.config.lan_domain = lan_domain
+            with self.subTest(lan_domain=lan_domain), self.assertRaisesMessage(
+                ValueError, f"LAN hostname alpha.{lan_domain} must be inside",
+            ):
+                build_exports(self.config, [self.host])
+        self.host.public_export = False
+        self.assertEqual(json.loads(build_exports(self.config, [self.host])["gandi.json"]), [])
+
+    def test_colliding_gandi_names_are_rejected(self):
+        self.config.lan_domain = self.config.vpn_domain
+        with self.assertRaisesMessage(ValueError, "alpha.vpn.example.tld would be published twice"):
+            desired_gandi(self.config, [self.host])
+        self.config.lan_domain = "Intranet.Example.TLD."
+        self.assertEqual(len(desired_gandi(self.config, [self.host])), 2)
+
+    def test_gandi_pairs_are_ordered_by_host_then_vpn_and_lan(self):
+        beta = Host.objects.create(
+            name="beta", site=Site.objects.get(pk=2), row=1, column=1,
+            vpn=True, public_export=True,
+        )
+        gamma = Host.objects.create(
+            name="gamma", site=Site.objects.get(pk=3), row=1, column=2, vpn=True,
+        )
+        delta = Host.objects.create(
+            name="delta", site=Site.objects.get(pk=4), row=1, column=4, public_export=True,
+        )
+        hosts = [self.host, beta, gamma, delta]
+        expected = [
+            ("beta.vpn", ["172.28.2.17"]), ("beta.intranet", ["192.168.2.17"]),
+            ("alpha.vpn", ["172.28.1.50"]), ("alpha.intranet", ["192.168.1.50"]),
+        ]
+        for order in (hosts, list(reversed(hosts))):
+            records = desired_gandi(self.config, order)
+            self.assertEqual([(r["rrset_name"], r["rrset_values"]) for r in records], expected)
+        self.assertEqual(
+            build_exports(self.config, hosts)["gandi.json"],
+            build_exports(self.config, list(reversed(hosts)))["gandi.json"],
+        )
+
+    def test_gandi_zone_apex_and_nested_domains(self):
+        self.config.gandi_zone = "example.tld"
+        self.config.vpn_domain = "example.tld"
+        self.config.lan_domain = "lan.site.example.tld"
+        self.assertEqual(
+            [record["rrset_name"] for record in desired_gandi(self.config, [self.host])],
+            ["alpha", "alpha.lan.site"],
+        )
 
     def test_empty_inventory_and_changed_site_group(self):
         Site.objects.filter(pk=4).update(g=17)
