@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -436,6 +437,37 @@ class OperatorViewsTests(TestCase):
         self.assertContains(response, "Could not preview Gandi")
         self.assertNotContains(response, "provider-detail-sentinel")
 
+
+    def test_invalid_gandi_pair_fails_closed_with_clear_message(self):
+        self.create_host(public_export=True)
+        Configuration.objects.filter(pk=1).update(lan_domain="intranet.other.test")
+        message = "LAN hostname router.intranet.other.test must be inside the configured Gandi zone"
+        response = self.client.get(reverse("exports"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, message)
+        self.assertEqual(response.context["artifacts"], {})
+        download = self.client.get(reverse("download", args=["gandi.json"]))
+        self.assertEqual(download.status_code, 409)
+        self.assertIn("Exports are unavailable", download.content.decode())
+        response = self.client.post(reverse("gandi-preview"), follow=True)
+        self.assertContains(response, message)
+        self.assertNotIn("pending", self.client.session)
+
+    def test_gandi_json_download_contains_vpn_and_lan_records(self):
+        self.create_host(public_export=True)
+        response = self.client.get(reverse("download", args=["gandi.json"]))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [(record["rrset_name"], record["rrset_values"])
+             for record in json.loads(response.content)],
+            [("router.vpn", ["172.28.1.1"]), ("router.intranet", ["192.168.1.1"])],
+        )
+
+    def test_public_export_rejected_when_lan_name_cannot_be_published(self):
+        Configuration.objects.filter(pk=1).update(lan_domain="intranet.other.test")
+        response = self.client.post(reverse("host-create"), self.host_data(public_export=True))
+        self.assertContains(response, "The LAN domain must belong to the Gandi zone")
+        self.assertFalse(Host.objects.exists())
 
 class QuickMoveViewsTests(TestCase):
     def setUp(self):

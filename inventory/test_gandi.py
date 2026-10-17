@@ -67,13 +67,19 @@ class GandiTests(TransactionTestCase):
     def test_preview_creation_and_idempotent_retry(self):
         plan = self.preview()
         self.assertEqual(set(plan), {"revision", "changes", "conflicts", "fingerprint"})
-        self.assertEqual(plan["changes"][0]["action"], "create")
+        self.assertEqual(
+            [(change["action"], change["name"]) for change in plan["changes"]],
+            [("create", "alpha.intranet"), ("create", "alpha.vpn")],
+        )
         self.assertEqual(self.client.writes, [])
         self.assertFalse(GandiRecord.objects.exists())
         self.apply(plan)
-        self.assertEqual(GandiRecord.objects.get().values, ["172.28.1.50"])
+        self.assertEqual(
+            {record.name: record.values for record in GandiRecord.objects.all()},
+            {"alpha.vpn": ["172.28.1.50"], "alpha.intranet": ["192.168.1.50"]},
+        )
         self.apply()
-        self.assertEqual(len(self.client.writes), 1)
+        self.assertEqual(len(self.client.writes), 2)
 
     def test_identical_unmanaged_and_cname_collisions(self):
         record = desired_gandi()[0]
@@ -90,12 +96,26 @@ class GandiTests(TransactionTestCase):
         self.owned()
         self.host.row = 3
         self.host.save()
-        self.assertEqual(self.preview()["changes"][0]["action"], "update")
+        self.assertEqual([change["action"] for change in self.preview()["changes"]],
+                         ["update", "update"])
         self.apply()
-        self.assertEqual(GandiRecord.objects.get().values, ["172.28.1.51"])
+        self.assertEqual(
+            {record.name: record.values for record in GandiRecord.objects.all()},
+            {"alpha.vpn": ["172.28.1.51"], "alpha.intranet": ["192.168.1.51"]},
+        )
+        self.config.lan_domain = "lan.example.tld"
+        self.config.save()
+        self.assertEqual(
+            [(change["action"], change["name"]) for change in self.preview()["changes"]],
+            [("delete", "alpha.intranet"), ("create", "alpha.lan")],
+        )
+        self.apply()
+        self.assertEqual(sorted(GandiRecord.objects.values_list("name", flat=True)),
+                         ["alpha.lan", "alpha.vpn"])
         self.host.public_export = False
         self.host.save()
-        self.assertEqual(self.preview()["changes"][0]["action"], "delete")
+        self.assertEqual([change["action"] for change in self.preview()["changes"]],
+                         ["delete", "delete"])
         self.apply()
         self.assertFalse(GandiRecord.objects.exists())
         self.assertEqual(self.client.records[self.config.gandi_zone], [])
@@ -122,12 +142,15 @@ class GandiTests(TransactionTestCase):
         self.client.records[self.config.gandi_zone].append(unrelated)
         self.config.gandi_zone = "other.test"
         self.config.vpn_domain = "vpn.other.test"
+        self.config.lan_domain = "intranet.other.test"
         self.config.save()
         plan = self.preview()
         self.assertEqual({change["action"] for change in plan["changes"]}, {"create", "delete"})
+        self.assertEqual(len(plan["changes"]), 4)
         self.apply(plan)
         self.assertEqual(self.client.records["example.tld"], [unrelated])
-        self.assertEqual(GandiRecord.objects.get().zone, "other.test")
+        self.assertEqual(set(GandiRecord.objects.values_list("zone", flat=True)), {"other.test"})
+        self.assertEqual(GandiRecord.objects.count(), 2)
 
     def test_partial_failure_keeps_successful_ownership(self):
         Host.objects.create(name="beta", site=Site.objects.get(pk=2), row=1, column=1,
@@ -136,12 +159,12 @@ class GandiTests(TransactionTestCase):
         with self.assertRaises(GandiError):
             self.apply()
         self.assertEqual(GandiRecord.objects.count(), 1)
-        self.assertEqual(GandiRecord.objects.get().name, "alpha.vpn")
+        self.assertEqual(GandiRecord.objects.get().name, "alpha.intranet")
         self.client.fail_at = None
-        self.assertEqual(len(self.preview()["changes"]), 1)
+        self.assertEqual(len(self.preview()["changes"]), 3)
         self.apply()
-        self.assertEqual(GandiRecord.objects.count(), 2)
-        self.assertEqual(len(self.client.writes), 2)
+        self.assertEqual(GandiRecord.objects.count(), 4)
+        self.assertEqual(len(self.client.writes), 4)
 
     def test_stale_remote_and_inventory_previews_are_refused(self):
         plan = self.preview()

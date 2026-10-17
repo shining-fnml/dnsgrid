@@ -515,9 +515,15 @@ the preview if inventory changes instead of mixing different revisions.
     reservations. The JSON export alone does not apply changes; it is input
     to the local NAS-side utility described below.
 ``gandi.json``
-    Desired LiveDNS A record sets for hosts with both VPN membership
-    and public export enabled. Names are relative to the configured
-    Gandi zone; VPN domains must be inside that zone.
+    Desired LiveDNS A record sets for VPN members with "Publish on Gandi
+    (VPN only)" enabled. Each such host gets two records, in grid address
+    order: its VPN FQDN (``vpn_domain``) with its VPN address, then its LAN
+    FQDN (``lan_domain``) with its LAN address. Names are relative to the
+    configured Gandi zone. The VPN domain must be inside that zone; while any
+    host publishes on Gandi, the LAN domain must also be inside it and differ
+    from the VPN domain. Settings, host edits, and archive restores that break
+    this are rejected, and an out-of-zone or duplicate name aborts the Gandi
+    export instead of omitting or rewriting records.
 
 The obsolete ``dhcpd.conf``, ``dhcpd-dsm.conf``, and
 ``dsm-request-site-ID.form`` exports (formerly

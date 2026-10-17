@@ -251,25 +251,39 @@ def publish_dns_zones(expected_revision):
 
 
 def desired_gandi(config=None, hosts=None):
+    """Return one VPN and one LAN A rrset per public-export VPN host, in host order."""
     config, hosts = _inputs(config, hosts)
     zone = config.gandi_zone.rstrip(".").lower()
-    records = []
+    records, names = [], set()
     for host in hosts:
         if not (host.vpn and host.public_export):
             continue
-        fqdn = host.vpn_fqdn(config).rstrip(".").lower()
-        if fqdn == zone:
-            name = "@"
-        elif fqdn.endswith("." + zone):
-            name = fqdn[: -(len(zone) + 1)]
-        else:
-            raise ValueError("The VPN hostname must be inside the configured Gandi zone.")
-        records.append({
-            "rrset_name": name,
-            "rrset_type": "A",
-            "rrset_ttl": config.ttl,
-            "rrset_values": [host.vpn_address(config)],
-        })
+        pairs = (
+            ("VPN", host.vpn_fqdn(config), host.vpn_address(config)),
+            ("LAN", host.lan_fqdn(config), host.lan_address(config)),
+        )
+        for kind, fqdn, address in pairs:
+            fqdn = fqdn.rstrip(".").lower()
+            if fqdn == zone:
+                name = "@"
+            elif fqdn.endswith("." + zone):
+                name = fqdn[: -(len(zone) + 1)]
+            else:
+                raise ValueError(
+                    f"The {kind} hostname {fqdn} must be inside the configured Gandi zone {zone}."
+                )
+            if name in names:
+                raise ValueError(
+                    f"The Gandi name {fqdn} would be published twice; "
+                    "LAN and VPN names must not collide."
+                )
+            names.add(name)
+            records.append({
+                "rrset_name": name,
+                "rrset_type": "A",
+                "rrset_ttl": config.ttl,
+                "rrset_values": [address],
+            })
     return records
 
 

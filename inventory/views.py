@@ -359,7 +359,10 @@ def confirm(request):
             )
         elif pending["kind"] == "gandi":
             from .gandi import sync
-            sync(expected_fingerprint=payload["fingerprint"])
+            try:
+                sync(expected_fingerprint=payload["fingerprint"])
+            except ValueError as error:
+                raise ValidationError(str(error)) from error
         elif pending["kind"] == "archive":
             from .archives import restore
             if request.POST.get("replace_ack") != "yes" or request.POST.get("ledger_ack") != "yes":
@@ -447,7 +450,11 @@ def exports(request):
         Configuration.objects.filter(pk=1).update(revision=F("revision"))
         config = Configuration.objects.get(pk=1)
         hosts = list(Host.objects.select_related("site"))
-        artifacts = build_exports(config=config, hosts=hosts)
+        try:
+            artifacts = build_exports(config=config, hosts=hosts)
+        except ValueError as error:
+            messages.error(request, f"Export previews are unavailable: {error}")
+            artifacts = {}
         report = build_vpn_report(config=config, hosts=hosts)
     return render(request, "inventory/exports.html", {
         "vpn_report": report,
@@ -498,7 +505,13 @@ def download(request, filename):
         config = Configuration.load()
         if request.GET.get("revision", str(config.revision)) != str(config.revision):
             return HttpResponse("Inventory changed. Reload export previews before downloading.", status=409)
-        artifacts = build_exports(config=config)
+        try:
+            artifacts = build_exports(config=config)
+        except ValueError:
+            return HttpResponse(
+                "Exports are unavailable. Review the error on the Export previews page.",
+                status=409, content_type="text/plain; charset=utf-8",
+            )
     if filename not in artifacts:
         from django.http import Http404
         raise Http404
@@ -520,6 +533,9 @@ def gandi_preview(request):
     from .gandi import plan_sync
     try:
         plan = plan_sync()
+    except ValueError as error:
+        messages.error(request, f"Could not preview Gandi: {error}")
+        return redirect("exports")
     except (RuntimeError, ValidationError):
         messages.error(request, "Could not preview Gandi. Check the configured zone, token, and network connection.")
         return redirect("exports")

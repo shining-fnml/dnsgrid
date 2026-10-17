@@ -70,6 +70,21 @@ def normalize_domain(value):
     return value
 
 
+def in_zone(name, zone):
+    """Return whether ``name`` equals ``zone`` or is below it on a label boundary."""
+    name, zone = name.rstrip(".").lower(), zone.rstrip(".").lower()
+    return name == zone or name.endswith("." + zone)
+
+
+def gandi_pair_error(config):
+    """Explain why public-export hosts cannot publish both LAN and VPN names, if so."""
+    if not in_zone(config.lan_domain, config.gandi_zone):
+        return "The LAN domain must belong to the Gandi zone while hosts publish on Gandi."
+    if config.lan_domain.rstrip(".").lower() == config.vpn_domain.rstrip(".").lower():
+        return "The LAN and VPN domains must differ while hosts publish on Gandi."
+    return None
+
+
 def normalize_prefix(value):
     if not isinstance(value, str):
         raise ValidationError("Enter exactly two decimal IPv4 octets.")
@@ -193,11 +208,12 @@ class Configuration(models.Model):
                 setattr(self, field, normalize_prefix(getattr(self, field)))
             except ValidationError as error:
                 errors[field] = error.messages
-        if not errors and not (
-            self.vpn_domain == self.gandi_zone
-            or self.vpn_domain.endswith("." + self.gandi_zone)
-        ):
+        if not errors and not in_zone(self.vpn_domain, self.gandi_zone):
             errors["vpn_domain"] = "The VPN domain must belong to the Gandi zone."
+        if not errors and any(host.vpn and host.public_export for host in hosts):
+            pair_error = gandi_pair_error(self)
+            if pair_error:
+                errors["lan_domain"] = pair_error
         longest_name = max(
             (len(host.name) for host in hosts),
             default=0,
@@ -314,6 +330,10 @@ class Host(models.Model):
             self.mac = normalize_mac(self.mac)
         except ValidationError as error:
             errors["mac"] = error.messages
+        if self.vpn and self.public_export:
+            pair_error = gandi_pair_error(config)
+            if pair_error:
+                errors["public_export"] = pair_error
         if self.row == 0 and self.column == 0:
             errors["row"] = "Position (0, 0) is reserved."
         if self.mac and any(host.mac == self.mac for host in hosts):

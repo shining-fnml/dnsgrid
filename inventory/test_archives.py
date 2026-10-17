@@ -279,10 +279,21 @@ class ArchiveDataTests(TestCase):
         Host.objects.filter(pk=11).update(name="z" * 63)
         candidate = copy.deepcopy(self.data)
         candidate["configuration"]["lan_domain"] = long_domain
+        for host in candidate["hosts"]:
+            host["public_export"] = False
         self.assertEqual(validate(candidate)["configuration"]["lan_domain"], long_domain)
         candidate["hosts"][0]["name"] = "z" * 63
         with self.assertRaises(ValidationError):
             validate(candidate)
+
+    def test_public_export_requires_incoming_lan_domain_inside_gandi_zone(self):
+        candidate = copy.deepcopy(self.data)
+        candidate["configuration"]["lan_domain"] = "intranet.other.test"
+        with self.assertRaisesMessage(ValidationError, "The LAN domain must belong to the Gandi zone"):
+            validate(candidate)
+        for host in candidate["hosts"]:
+            host["public_export"] = False
+        self.assertEqual(validate(candidate)["configuration"]["lan_domain"], "intranet.other.test")
 
     def test_host_validation_uses_incoming_not_outgoing_configuration(self):
         domain = "a" * 63 + "." + "b" * 63 + "." + "c" * 63 + "." + "d" * 56
