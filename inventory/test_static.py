@@ -264,7 +264,7 @@ class StaticHostViewTests(TestCase):
             name: form[name].value() for name in form.fields
             if name not in ("gandi_token", "clear_token")
         }
-        data["gandi_token_expires_on"] = ""
+        data.update(gandi_token_expires_on="", clear_token_expiry=False)
         data["lan_prefix"] = "10.20"
         response = self.client.post(reverse("configuration"), data)
         self.assertContains(response, "static host fixed")
