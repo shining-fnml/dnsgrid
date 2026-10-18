@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 from django.apps import apps
 from django.contrib.auth import get_user_model
-from django.db import connection
+from django.db import OperationalError, connection
 from django.test import Client, RequestFactory, TestCase
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
@@ -160,6 +160,27 @@ class GandiPatTests(TestCase):
             self.assert_error(self.get(), 503, "configuration_unavailable")
         self.assertFalse(Configuration.objects.exists())
         self.assert_no_writes(queries)
+
+    def test_database_lookup_failures_return_safe_private_json(self):
+        diagnostic = "fictitious-sensitive-diagnostic"
+        before = self.snapshot()
+        for lookup in (
+            "inventory.gandi_api.Configuration.objects.select_for_update",
+            "inventory.gandi_api.Host.objects.select_related",
+        ):
+            with self.subTest(lookup=lookup):
+                with patch(lookup, side_effect=OperationalError(diagnostic)), \
+                        CaptureQueriesContext(connection) as queries, \
+                        self.assertLogs("django.request", level="WARNING") as logs:
+                    response = self.get()
+                self.assert_error(response, 503, "configuration_unavailable")
+                self.assertNotIn(diagnostic, response.content.decode())
+                self.assertNotIn(diagnostic, str(dict(response.headers)))
+                for sensitive in (diagnostic, self.database_token, self.environment_token):
+                    self.assertNotIn(sensitive, "\n".join(logs.output))
+                self.assert_no_writes(queries)
+                self.assertEqual(self.snapshot(), before)
+                self.assert_success(self.get())
 
     def test_ambiguous_computed_peer_counts_disabled_matches_too(self):
         other = Host.objects.create(

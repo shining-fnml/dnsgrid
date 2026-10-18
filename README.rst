@@ -800,7 +800,9 @@ The response contract is:
   with ``expires_on`` instead set to JSON ``null`` when unknown.
 * Errors contain exactly ``{"error": "<code>"}``:
   ``403 unauthorized`` for peer/flag authorization failure;
-  ``503 configuration_unavailable`` when the singleton configuration is absent;
+  ``503 configuration_unavailable`` when the singleton configuration is absent
+  or database configuration is inaccessible/unavailable (including configuration
+  or host query failures, transaction failures and SQLite locks);
   ``503 credential_unavailable`` for an absent/invalid PAT or invalid active
   expiry metadata; and ``503 credential_expired`` for an expired PAT.
 * Other methods return ``405`` with ``{"error": "method_not_allowed"}``
