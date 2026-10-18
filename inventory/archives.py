@@ -40,7 +40,8 @@ WARNINGS = (
     "remain mandatory on the next Gandi preview/sync.",
     "No automatic DNS/DHCP/Gandi deployment is performed.",
     "Users, passwords, sessions, pending confirmations, tokens, environment secrets, and deployment settings are "
-    "excluded. The destination's saved Gandi token is preserved.",
+    "excluded. Gandi token expiration and warning settings are also excluded and preserved "
+    "with the destination's saved token.",
 )
 
 

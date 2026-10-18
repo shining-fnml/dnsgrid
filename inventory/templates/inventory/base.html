@@ -16,6 +16,14 @@
   {% endif %}
 </header>
 <main>
+  {% if gandi_credential %}
+  <p role="status" class="message{% if gandi_credential.status == 'expired' or gandi_credential.status == 'expiring' or gandi_credential.status == 'unavailable' %} warning{% endif %}">
+    Gandi PAT ({{ gandi_credential.source }}):
+    {% if gandi_credential.status == "unavailable" %}unavailable or invalid credential/expiration metadata.
+    {% elif gandi_credential.status == "unknown" %}expiration unknown.
+    {% else %}{{ gandi_credential.status }}; declared expiration {{ gandi_credential.expires_on|date:"Y-m-d" }} (start of day UTC).{% endif %}
+  </p>
+  {% endif %}
   {% for message in messages %}<p role="status" class="message {{ message.tags }}">{{ message }}</p>{% endfor %}
   {% block content %}{% endblock %}
 </main>
