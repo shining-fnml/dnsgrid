@@ -50,6 +50,18 @@ class ConfigurationForm(forms.Form):
         help_text="Leave blank to keep the saved token. DNSGRID_GANDI_TOKEN overrides it.",
     )
     clear_token = forms.BooleanField(required=False, label="Remove saved Gandi token")
+    gandi_token_expires_on = forms.DateField(
+        required=False, input_formats=["%Y-%m-%d"],
+        widget=forms.DateInput(attrs={"type": "date"}),
+        label="Saved Gandi token expiration (UTC)",
+        help_text="Declared, not verified by Gandi. Blank keeps the date when keeping the token; "
+                  "blank with a replacement token resets expiration to unknown.",
+    )
+    clear_token_expiry = forms.BooleanField(required=False, label="Remove saved token expiration")
+    gandi_token_warning_days = forms.IntegerField(
+        required=False, min_value=0, max_value=3650, initial=30,
+        label="Gandi expiration warning lead (days)",
+    )
     ttl = forms.IntegerField(min_value=60, max_value=86400, label="DNS TTL (seconds)")
     soa_ns = forms.CharField(max_length=253, label="SOA primary nameserver FQDN")
     soa_mailbox = forms.CharField(max_length=253, label="SOA mailbox (DNS name, not email)")
@@ -86,3 +98,15 @@ class ConfigurationForm(forms.Form):
                 validators=Site._meta.get_field("dsm_ifname").validators,
                 help_text="Optional; enables reservation API exports for this site's DSM server.",
             )
+
+    def clean(self):
+        data = super().clean()
+        if data.get("clear_token") and data.get("gandi_token"):
+            self.add_error("gandi_token", "Choose either replacement or removal, not both.")
+        if data.get("gandi_token_expires_on") and (
+            data.get("clear_token") or data.get("clear_token_expiry")
+        ):
+            self.add_error("gandi_token_expires_on", "Do not supply a date when removing the token or expiration.")
+        if data.get("gandi_token_warning_days") is None:
+            data["gandi_token_warning_days"] = self.initial.get("gandi_token_warning_days", 30)
+        return data

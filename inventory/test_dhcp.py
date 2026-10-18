@@ -619,7 +619,11 @@ class DHCPMigrationTests(TransactionTestCase):
                     "dns_sftp_inbox", "dns_sftp_outbox",
                 }
             }
-            self.assertEqual(Configuration.objects.values().get(pk=1), expected_configuration)
+            migrated = executor.loader.project_state([("inventory", "0014_remove_dns_sftp_settings")]).apps
+            self.assertEqual(
+                migrated.get_model("inventory", "Configuration").objects.values().get(pk=1),
+                expected_configuration,
+            )
             self.assertEqual(list(Site.objects.order_by("pk").values()), sites_data)
             self.assertEqual(list(Host.objects.order_by("pk").values()), hosts_data)
             self.assertTrue(Host.objects.get(pk=host.pk).static)
@@ -627,4 +631,5 @@ class DHCPMigrationTests(TransactionTestCase):
             self.assertFalse(DHCPResult.objects.exists())
             self.assertFalse(DHCPState.objects.exists())
         finally:
-            MigrationExecutor(connection).migrate([("inventory", "0014_remove_dns_sftp_settings")])
+            executor = MigrationExecutor(connection)
+            executor.migrate(executor.loader.graph.leaf_nodes())

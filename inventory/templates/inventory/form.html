@@ -6,6 +6,7 @@
 {% for warning in warnings %}<p class="warning">{{ warning }}</p>{% endfor %}
 {% elif settings_page %}
 <p>These settings affect every export. Site mappings must remain distinct. Saved Gandi token: {% if token_saved %}yes{% else %}no{% endif %}; the token is never displayed.</p>
+<p>Saved token expiration: {% if saved_token_expiry %}{{ saved_token_expiry|date:"Y-m-d" }} (start of day UTC){% else %}unknown{% endif %}. An environment PAT uses only DNSGRID_GANDI_TOKEN_EXPIRES_ON, never this saved date.</p>
 <p>Settings cannot change a static host's assigned LAN IP. VPN addresses are protected only for VPN members. Revoke static protection separately first. Non-VPN static hosts do not block VPN-prefix changes, and unrelated settings remain editable.</p>
 <p><a href="{% url 'archive-upload' %}">Preview application archive restore</a> · <a href="{% url 'exports' %}">Download application archive from Export previews</a></p>
 {% else %}

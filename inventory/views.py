@@ -30,6 +30,7 @@ CONFIG_FIELDS = (
     "ttl", "soa_ns", "soa_mailbox",
     "soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns", "dns_export_directory",
     "named_checkzone", "rndc", "rndc_key",
+    "gandi_token_warning_days",
 )
 
 
@@ -231,6 +232,12 @@ def configuration(request):
         config_data["gandi_token"] = (
             "" if data["clear_token"] else data["gandi_token"] or config.gandi_token
         )
+        expires_on = data["gandi_token_expires_on"]
+        if not expires_on and not (
+            data["clear_token"] or data["gandi_token"] or data["clear_token_expiry"]
+        ):
+            expires_on = config.gandi_token_expires_on
+        config_data["gandi_token_expires_on"] = expires_on.isoformat() if expires_on else None
         for key, value in config_data.items():
             if key == "soa_serial":
                 continue
@@ -259,6 +266,12 @@ def configuration(request):
                 changes.append({"label": "SOA serial", "before": config.soa_serial, "after": data["soa_serial"]})
             if config.gandi_token != candidate.gandi_token:
                 changes.append({"label": "Gandi token", "before": "Hidden", "after": "Set" if candidate.gandi_token else "Removed"})
+            if config.gandi_token_expires_on != candidate.gandi_token_expires_on:
+                changes.append({
+                    "label": "Saved Gandi token expiration (UTC)",
+                    "before": config.gandi_token_expires_on or "Unknown",
+                    "after": candidate.gandi_token_expires_on or "Unknown",
+                })
             for site, new in zip(sites, site_data):
                 if site.name != new["name"] or site.g != new["g"]:
                     changes.append({
@@ -288,6 +301,7 @@ def configuration(request):
         "form": form, "title": "Global settings", "settings_page": True,
         "revision": config.revision,
         "token_saved": bool(config.gandi_token),
+        "saved_token_expiry": config.gandi_token_expires_on,
         "archive_form": ArchiveUploadForm(initial={"revision": config.revision}, auto_id="archive_%s"),
         "archive_warnings": WARNINGS,
     })

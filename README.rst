@@ -767,6 +767,109 @@ records concurrently from other tools. The app never replaces a whole
 Gandi zone. Real sync requires configured credentials and connectivity;
 tests use a fake provider and never contact Gandi.
 
+VPN-only Gandi PAT retrieval
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``GET /api/gandi/pat/`` lets eligible inventory peers retrieve the same
+effective personal access token (PAT) used by Gandi synchronization. Clients
+fetch immediately before external TXT changes, keep the credential only in
+memory, and discard it afterwards. This is credential retrieval, not a DNS
+write API or a Gandi proxy; no production writes or proxy implementation are
+part of this feature. Clients need neither permanent token storage nor root
+privileges. No client credentials or DHCP credential mechanism are reused.
+
+Authorization uses only the actual connection peer, ``REMOTE_ADDR``. It must
+be a well-formed address matching **exactly one** inventory host's VPN address,
+computed from the current ``vpn_prefix.Site.g.Host.x``; that host must have
+both ``vpn`` and the existing ``public_export`` flag enabled. Missing,
+malformed, unknown or ambiguous peer addresses and ineligible flags are
+denied. Forwarding headers are ignored. There are no host/IP request
+parameters or authenticated-session bypasses.
+
+The VPN must enforce source-IP ownership, and the endpoint firewall must
+admit only the intended VPN. Preserve each peer's source address all the way
+to the application. NAT/proxy masking is unsupported: unmatched peers are
+denied. A proxy whose own address is authorized inherits that host's identity,
+so **never allow shared proxies or NAT gateways to be eligible peers**.
+HTTP entirely protected by the VPN is allowed; HTTPS is recommended where
+appropriate. Never expose this endpoint over public, unprotected HTTP.
+
+The response contract is:
+
+* ``200``: exactly ``{"token": "<string>", "expires_on": "YYYY-MM-DD"}``,
+  with ``expires_on`` instead set to JSON ``null`` when unknown.
+* Errors contain exactly ``{"error": "<code>"}``:
+  ``403 unauthorized`` for peer/flag authorization failure;
+  ``503 configuration_unavailable`` when the singleton configuration is absent
+  or database configuration is inaccessible/unavailable (including configuration
+  or host query failures, transaction failures and SQLite locks);
+  ``503 credential_unavailable`` for an absent/invalid PAT or invalid active
+  expiry metadata; and ``503 credential_expired`` for an expired PAT.
+* Other methods return ``405`` with ``{"error": "method_not_allowed"}``
+  and ``Allow: GET``.
+
+Error values never echo credential or configuration content.
+Every endpoint response, including errors, sets
+``Cache-Control: private, no-store``, ``Pragma: no-cache`` and ``Expires: 0``.
+There are no ETags, ``304`` responses, CORS or JSONP support.
+
+Recipients receive **all upstream permissions** of the PAT, not just TXT
+permissions or access to their own host. Use a suitably restricted Gandi PAT.
+Removing either eligibility flag stops future reads only; it cannot revoke
+already retrieved copies. Rotate the PAT at Gandi to revoke those copies.
+
+Token sources and expiration metadata
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A nonempty ``DNSGRID_GANDI_TOKEN`` overrides the saved token; an empty value
+falls back to the saved token, exactly as for synchronization.
+Retrieval and synchronization share bounded token validation: a token must
+contain 1–512 visible ASCII characters, with no whitespace, control characters
+or non-ASCII characters.
+``DNSGRID_GANDI_TOKEN_EXPIRES_ON`` is exclusively paired with the environment
+token and accepts only strict ``YYYY-MM-DD``. Absent or empty means unknown;
+an invalid value safely refuses retrieval without affecting synchronization.
+It is not applied to the saved token. The database token's separate expiry
+field is ``gandi_token_expires_on``; environment tokens never inherit it.
+
+The Settings expiration-date input is always blank on initial display.
+Leaving it blank preserves the date when keeping the saved token, but
+replacing the token with a blank date resets expiration to unknown.
+The explicit "Remove saved token expiration" checkbox clears the saved date.
+Removing the saved token also removes its date. Conflicting removal and new
+token input, or removal and new expiration-date input, are rejected.
+``gandi_token_warning_days`` defaults to 30 and accepts integers from 0
+through 3650.
+
+Dates use UTC: ``expires_on <= today`` is expired, starting at the beginning
+of the UTC expiry day. ``today < expires_on <= today + warning_days`` is
+expiring, including the warning-window boundary; later dates are valid.
+No date means unknown. Staff-only banners on operator pages distinguish
+unknown, valid, expiring and expired, plus a combined "unavailable or invalid
+credential/expiration metadata" state. They show only safe metadata for the
+active database/environment source, never the PAT.
+Expiration is administrator-supplied metadata, not verified upstream or
+inferred from assumptions about Gandi's API. Retrieval refuses expired
+credentials; existing Gandi synchronization ignores expiration metadata.
+
+Application-data archives remain unchanged: tokens, token-expiration fields
+and warning-day settings are excluded, and restore preserves the destination's
+values for all of them.
+
+Secret handling and logging
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Do not log PATs or endpoint request/response bodies, or put secrets in URLs,
+command-line arguments or shell history. Avoid shell token variables,
+terminal output and permanent files when consuming the response; pass it
+directly in memory to the client performing the external TXT change.
+Keep production debug/diagnostics off (leave ``DNSGRID_DEBUG`` unset).
+The configured ``dnsgrid.delivery`` logger writes publication diagnostics to
+stderr; that does not establish secrecy for the whole request path. Inspect
+deployment web-server, reverse-proxy, supervisor/container and APM logging
+and tracing settings to prevent body or credential capture, including on
+errors. Restrict access to any logs and database backups.
+
 Application-data portability
 ----------------------------
 

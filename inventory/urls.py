@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import dhcp_api, dhcp_views, views
+from . import dhcp_api, dhcp_views, gandi_api, views
 
 urlpatterns = [
     path("", views.grid, name="grid"),
@@ -23,6 +23,7 @@ urlpatterns = [
     ),
     path("api/dhcp/sites/<int:site_id>/latest/", dhcp_api.latest, name="dhcp-latest"),
     path("api/dhcp/sites/<int:site_id>/results/", dhcp_api.result, name="dhcp-result"),
+    path("api/gandi/pat/", gandi_api.pat, name="gandi-pat"),
     path("archive/download/", views.archive_download, name="archive-download"),
     path("archive/upload/", views.archive_upload, name="archive-upload"),
     path("exports/download/<str:filename>/", views.download, name="download"),

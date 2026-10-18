@@ -235,6 +235,7 @@ CONFIG_FIELDS = (
     "gandi_token", "ttl", "soa_ns", "soa_mailbox",
     "soa_refresh", "soa_retry", "soa_expire", "soa_minimum", "zone_ns", "dns_export_directory",
     "named_checkzone", "rndc", "rndc_key",
+    "gandi_token_expires_on", "gandi_token_warning_days",
 )
 
 
@@ -262,6 +263,11 @@ def update_settings(config_data, site_data, expected_revision):
                 dns_published_generation=current.dns_published_generation,
                 **{field: config_data.get(field, getattr(current, field)) for field in CONFIG_FIELDS},
             )
+            if not candidate.gandi_token or (
+                candidate.gandi_token != current.gandi_token
+                and "gandi_token_expires_on" not in config_data
+            ):
+                candidate.gandi_token_expires_on = None
             candidate.full_clean(validate_unique=False)
             if (
                 len(site_data) != 4

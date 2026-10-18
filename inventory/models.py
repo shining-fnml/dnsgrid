@@ -128,6 +128,10 @@ class Configuration(models.Model):
     vpn_prefix = models.CharField(max_length=7, default="172.28")
     gandi_zone = models.CharField(max_length=253, default="example.tld")
     gandi_token = models.CharField(max_length=512, blank=True, default="")
+    gandi_token_expires_on = models.DateField(null=True, blank=True)
+    gandi_token_warning_days = models.PositiveSmallIntegerField(
+        default=30, validators=[MinValueValidator(0), MaxValueValidator(3650)]
+    )
     ttl = models.PositiveIntegerField(
         default=300, validators=[MinValueValidator(1), MaxValueValidator(MAX_SERIAL)]
     )
@@ -163,6 +167,10 @@ class Configuration(models.Model):
         constraints = [
             models.CheckConstraint(condition=Q(id=1), name="configuration_singleton"),
             models.CheckConstraint(
+                condition=Q(gandi_token_warning_days__gte=0, gandi_token_warning_days__lte=3650),
+                name="configuration_gandi_warning_bounds",
+            ),
+            models.CheckConstraint(
                 condition=Q(revision__gte=1, revision__lte=MAX_SERIAL),
                 name="configuration_serial_bounds",
             ),
@@ -185,6 +193,8 @@ class Configuration(models.Model):
 
     def clean_for_hosts(self, hosts):
         errors = {}
+        if self.gandi_token_expires_on and not self.gandi_token:
+            errors["gandi_token_expires_on"] = "A saved token is required for its expiration date."
         for field in ("lan_domain", "vpn_domain", "gandi_zone", "soa_ns", "soa_mailbox", "zone_ns"):
             try:
                 setattr(self, field, normalize_domain(getattr(self, field)))

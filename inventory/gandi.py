@@ -6,7 +6,6 @@ the race with an external editor between a read and a write.
 
 import hashlib
 import json
-import os
 import re
 from urllib import error, parse, request
 
@@ -14,6 +13,7 @@ from django.db import transaction
 from django.db.models import F
 
 from .exporters import _inputs, desired_gandi
+from .gandi_credentials import CredentialError, effective_token
 from .models import Configuration, GandiRecord
 
 
@@ -31,12 +31,11 @@ class GandiClient:
 
     def __init__(self, config=None, timeout=15):
         config = config if config is not None else Configuration.load()
-        self.token = os.environ.get("DNSGRID_GANDI_TOKEN") or config.gandi_token
+        try:
+            self.token = effective_token(config)
+        except CredentialError as exc:
+            raise GandiError(str(exc)) from None
         self.timeout = timeout
-        if not self.token:
-            raise GandiError("A Gandi API token is required.")
-        if not isinstance(self.token, str) or "\r" in self.token or "\n" in self.token:
-            raise GandiError("The Gandi API token contains invalid characters.")
 
     def _request(self, method, zone, name=None, record_type=None, record=None):
         if (not isinstance(zone, str)

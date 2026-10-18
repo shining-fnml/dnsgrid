@@ -181,7 +181,10 @@ class DNSBaselineTests(TestCase):
                 response = self.client.get(reverse("configuration"))
                 form = response.context["form"]
                 data = {name: form[name].value() for name in form.fields}
-                data.update(soa_serial=candidate, gandi_token="", clear_token="")
+                data.update(
+                    soa_serial=candidate, gandi_token="", clear_token="",
+                    gandi_token_expires_on="", clear_token_expiry=False,
+                )
                 response = self.client.post(reverse("configuration"), data)
                 self.assertTemplateUsed(
                     response, "inventory/confirm.html" if valid else "inventory/form.html",
