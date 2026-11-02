@@ -18,7 +18,7 @@ class HostForm(forms.Form):
     vpn = forms.BooleanField(required=False, label="VPN member")
     static = forms.BooleanField(
         required=False, label="Static host",
-        help_text="Freeze this entry and exclude it from DHCP reservations. Revoke static protection separately before editing.",
+        help_text="Freeze this entry and exclude it from DHCP reservations, except mobile columns 6 and 7. Revoke static protection separately before editing.",
     )
     public_export = forms.BooleanField(
         required=False, label="Publish on Gandi (VPN only)",

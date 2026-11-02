@@ -6,6 +6,9 @@ from urllib.parse import urlencode
 from .models import Site, normalize_mac
 
 
+MOBILE_DHCP_COLUMNS = frozenset({6, 7})
+
+
 def reservation_payload(config, site, hosts):
     """Build the complete reservation list for one site's DSM interface."""
     Site._meta.get_field("dsm_ifname").clean(site.dsm_ifname, site)
@@ -14,7 +17,8 @@ def reservation_payload(config, site, hosts):
     reservations = []
     seen = set()
     for host in sorted(hosts, key=lambda host: (host.x, host.name, host.site_id)):
-        if host.site_id != site.pk or host.static:
+        mobile = host.column in MOBILE_DHCP_COLUMNS
+        if (host.site_id != site.pk and not mobile) or (host.static and not mobile):
             continue
         mac = normalize_mac(host.mac)
         if not mac:
