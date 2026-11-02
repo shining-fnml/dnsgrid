@@ -30,7 +30,8 @@ and must be replaced with deployment values.
    and VPN ``172.28.1.50``.
 2. Enter hosts, their VPN membership, optional MACs, and public-export
    flags. LAN DNS covers all inventory hosts; DHCP reservations require a
-   MAC and exclude static hosts. Status is descriptive and does not exclude hosts from exports.
+   MAC. Static hosts are excluded except in mobile columns 6 and 7. Status is
+   descriptive and does not exclude hosts from exports.
    Review and confirm changes, including any shifted hosts and addresses.
 3. Review Export previews. Explicit publication validates and installs the
    ``intranet.linuxcondom.net.`` and ``vpn.`` primary zones and generated LAN
@@ -127,9 +128,15 @@ Inventory and confirmations
   rejected as a whole; unrelated placements remain available.
   Revoke static as a separate preview/confirmation before making any other
   changes: combining revocation with edits or a move is rejected.
-  Static hosts are omitted from every DHCP reservation payload, even with
-  a MAC, but remain in inventory, eligible DNS forward/reverse records,
-  and the VPN report. Static does not change status or VPN membership.
+  Static hosts are omitted from DHCP reservation payloads, even with a MAC,
+  except hosts in mobile columns 6 and 7. Those mobile hosts appear in every
+  configured site's DHCP payload, with their final IPv4 octet preserved and
+  the target site's subnet octet substituted; this also applies to static
+  mobile hosts. Their grid site remains their primary address for DNS, which
+  continues to publish one address per host. Existing DHCP publications are
+  unchanged until the next explicit publication. Static hosts remain in
+  inventory, eligible DNS forward/reverse records, and the VPN report. Static
+  does not change status or VPN membership.
   Toggling static advances inventory revision and invalidates previews,
   but does not advance the DNS serial unless DNS content also changes.
 * ``running``, ``decommissioned``, and ``unconfirmed`` are informational.

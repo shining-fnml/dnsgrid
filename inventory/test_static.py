@@ -106,7 +106,7 @@ class StaticHostTests(TestCase):
         Host.objects.filter(pk=self.host.pk).update(vpn=False)
         update_settings({"vpn_prefix": "10.30"}, changed_sites, 2)
 
-    def test_all_dsm_variants_exclude_static_even_with_mac_but_dns_and_gandi_include(self):
+    def test_static_nonmobile_excluded_from_dhcp_but_dns_and_gandi_include(self):
         site = Site.objects.get(pk=1)
         site.dsm_ifname = "eth0"
         site.save()
@@ -126,6 +126,24 @@ class StaticHostTests(TestCase):
         self.assertIn("fixed.vpn.", outputs["vpn.zone"])
         self.assertIn("PTR fixed.vpn.", outputs["reverse-vpn.zone"])
         self.assertIn("fixed.vpn", outputs["gandi.json"])
+
+    def test_static_mobile_host_is_included_in_each_configured_dhcp_subnet(self):
+        Site.objects.filter(pk=1).update(g=0, dsm_ifname="eth0")
+        Site.objects.filter(pk=2).update(g=4, dsm_ifname="eth4")
+        self.host.column = 6
+        self.host.save()
+
+        exports = build_exports()
+        for site_id, subnet_octet in ((1, 0), (2, 4)):
+            with self.subTest(site_id=site_id):
+                reservations = json.loads(
+                    exports[f"dsm-reservations-site-{site_id}.json"],
+                )["reservationData"]
+                self.assertEqual(reservations, [{
+                    "mac": self.host.mac,
+                    "ip": f"192.168.{subnet_octet}.{self.host.x}",
+                    "hostname": "fixed",
+                }])
 
     def test_archive_v2_static_roundtrip_and_explicit_legacy_policy(self):
         data = snapshot()

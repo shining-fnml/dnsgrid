@@ -121,6 +121,57 @@ class DSMReservationTests(TestCase):
             ],
         })
 
+    def test_mobile_columns_are_translated_to_each_configured_dhcp_subnet(self):
+        Site.objects.filter(pk=1).update(g=0, dsm_ifname="eth0")
+        Site.objects.filter(pk=2).update(g=4, dsm_ifname="eth4")
+        Site.objects.filter(pk=3).update(g=7, dsm_ifname="eth7")
+        Site.objects.filter(pk=4).update(dsm_ifname="")
+        laptop = Host.objects.create(
+            name="laptop", site_id=1, row=1, column=6,
+            mac="02:00:00:00:00:10",
+        )
+        phone = Host.objects.create(
+            name="phone", site_id=2, row=2, column=7,
+            mac="02:00:00:00:00:11",
+        )
+        static_mobile = Host.objects.create(
+            name="static-mobile", site_id=3, row=3, column=6, static=True,
+            mac="02:00:00:00:00:12",
+        )
+        ordinary = Host.objects.create(
+            name="ordinary", site_id=1, row=4, column=5,
+            mac="02:00:00:00:00:13",
+        )
+
+        exports = build_exports()
+        for site_id, subnet_octet in ((1, 0), (2, 4), (3, 7)):
+            with self.subTest(site_id=site_id):
+                reservations = json.loads(
+                    exports[f"dsm-reservations-site-{site_id}.json"],
+                )["reservationData"]
+                by_name = {item["hostname"]: item["ip"] for item in reservations}
+                self.assertEqual(by_name["laptop"], f"192.168.{subnet_octet}.{laptop.x}")
+                self.assertEqual(by_name["phone"], f"192.168.{subnet_octet}.{phone.x}")
+                self.assertEqual(
+                    by_name["static-mobile"],
+                    f"192.168.{subnet_octet}.{static_mobile.x}",
+                )
+                if site_id == 1:
+                    self.assertEqual(by_name["ordinary"], f"192.168.0.{ordinary.x}")
+                else:
+                    self.assertNotIn("ordinary", by_name)
+        self.assertNotIn("dsm-reservations-site-4.json", exports)
+        laptop_record = (
+            f"{laptop.name}.{self.config.lan_domain}. {self.config.ttl} "
+            f"A 192.168.0.{laptop.x}"
+        )
+        self.assertIn(laptop_record, exports["forward.zone"].splitlines())
+        self.assertEqual(
+            sum(line.startswith(f"{laptop.name}.{self.config.lan_domain}. ")
+                for line in exports["forward.zone"].splitlines()),
+            1,
+        )
+
     def test_mapping_mutations_claim_revision_and_preserve_legacy_service_calls(self):
         sites = list(Site.objects.values("id", "name", "g", "dsm_ifname"))
         sites[0]["dsm_ifname"] = "bond0"
