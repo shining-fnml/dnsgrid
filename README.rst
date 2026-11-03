@@ -1,6 +1,9 @@
 dnsgrid
 =======
 
+Version 1.1.0. For the Debian 13 VPN-only production service using Nginx,
+Gunicorn and systemd, see `deploy/README.rst <deploy/README.rst>`_.
+
 dnsgrid is built for my own infrastructure and reflects my grid, addressing
 conventions, and host-management workflows. You are welcome to study it,
 adapt it, or reuse parts of it under the GNU AGPL-3.0 license in ``LICENSE``.
@@ -88,6 +91,9 @@ HTTPS redirects. Run ``python manage.py collectstatic`` and serve
 ``staticfiles/`` at ``/static/`` from that web server. A reverse proxy must
 preserve HTTPS information appropriately; do not trust client-supplied
 forwarded headers. Django's deployment checklist applies.
+For the VPN-only HTTP deployment agreed for this infrastructure, use
+``dnsgrid.production_wsgi:application`` with the private Unix socket and
+Nginx configuration in ``deploy/`` instead; keep ``DNSGRID_HTTPS=0``.
 
 If the owner later makes the repository public, the VPN hub can clone it
 over HTTPS without repository credentials::
@@ -790,7 +796,8 @@ be a well-formed address matching **exactly one** inventory host's VPN address,
 computed from the current ``vpn_prefix.Site.g.Host.x``; that host must have
 both ``vpn`` and the existing ``public_export`` flag enabled. Missing,
 malformed, unknown or ambiguous peer addresses and ineligible flags are
-denied. Forwarding headers are ignored. There are no host/IP request
+denied. Forwarding headers are ignored by the normal application entry
+point. There are no host/IP request
 parameters or authenticated-session bypasses.
 
 The VPN must enforce source-IP ownership, and the endpoint firewall must
@@ -798,6 +805,12 @@ admit only the intended VPN. Preserve each peer's source address all the way
 to the application. NAT/proxy masking is unsupported: unmatched peers are
 denied. A proxy whose own address is authorized inherits that host's identity,
 so **never allow shared proxies or NAT gateways to be eligible peers**.
+The supplied production Nginx/Unix-socket deployment is the explicit
+exception: Nginx replaces ``X-Real-IP`` with the connection source, and the
+dedicated production WSGI entry point restores ``REMOTE_ADDR`` only for
+private Unix-socket connections. Restrict socket access to the application
+and Nginx accounts; see ``deploy/README.rst``. Do not configure Django to
+trust arbitrary forwarding headers or enable this adapter on TCP.
 HTTP entirely protected by the VPN is allowed; HTTPS is recommended where
 appropriate. Never expose this endpoint over public, unprotected HTTP.
 

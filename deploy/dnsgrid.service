@@ -1,0 +1,27 @@
+[Unit]
+Description=dnsgrid production application
+After=network.target
+
+[Service]
+Type=simple
+User=dnsgrid
+Group=www-data
+SupplementaryGroups=dnsgrid
+WorkingDirectory=/var/www/dnsgrid
+EnvironmentFile=/etc/dnsgrid/dnsgrid.env
+Environment=PYTHONUNBUFFERED=1
+RuntimeDirectory=dnsgrid
+RuntimeDirectoryMode=0750
+UMask=0007
+ExecStart=/var/www/dnsgrid/.venv/bin/gunicorn --workers 2 --bind unix:/run/dnsgrid/gunicorn.sock --umask 007 --timeout 120 --error-logfile - --capture-output dnsgrid.production_wsgi:application
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=150
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
