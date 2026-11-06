@@ -12,6 +12,7 @@ class UnixProxy:
             if environ.get("REMOTE_ADDR"):
                 raise ValueError("A Unix-socket upstream is required.")
             address = str(ip_address(environ.get("HTTP_X_REAL_IP", "")))
+            server_address = str(ip_address(environ.get("HTTP_X_LOCAL_ADDRESS", "")))
         except ValueError:
             body = b"Invalid proxy connection.\n"
             start_response("400 Bad Request", [
@@ -21,4 +22,5 @@ class UnixProxy:
             ])
             return [body]
         environ["REMOTE_ADDR"] = address
+        environ["SERVER_ADDR"] = server_address
         return self.application(environ, start_response)

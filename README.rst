@@ -808,9 +808,13 @@ so **never allow shared proxies or NAT gateways to be eligible peers**.
 The supplied production Nginx/Unix-socket deployment is the explicit
 exception: Nginx replaces ``X-Real-IP`` with the connection source, and the
 dedicated production WSGI entry point restores ``REMOTE_ADDR`` only for
-private Unix-socket connections. Restrict socket access to the application
-and Nginx accounts; see ``deploy/README.rst``. Do not configure Django to
-trust arbitrary forwarding headers or enable this adapter on TCP.
+private Unix-socket connections. It also trusts Nginx's ``$server_addr``
+over that socket and permits the PAT request when the source and local
+listener IP are equal. This supports services on the hub that connect to
+its own VPN address; it does not authorize requests through loopback or
+another interface. Restrict socket access to the application and Nginx
+accounts; see ``deploy/README.rst``. Do not configure Django to trust
+arbitrary forwarding headers or enable this adapter on TCP.
 HTTP entirely protected by the VPN is allowed; HTTPS is recommended where
 appropriate. Never expose this endpoint over public, unprotected HTTP.
 

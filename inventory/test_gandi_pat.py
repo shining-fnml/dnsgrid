@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -52,6 +53,12 @@ class GandiPatTests(TestCase):
             self.url, REMOTE_ADDR=self.peer if peer is None else peer, **extra,
         )
 
+    def get_from_server(self, peer, server_address):
+        request = RequestFactory().get(
+            self.url, REMOTE_ADDR=peer, SERVER_ADDR=server_address,
+        )
+        return pat(request)
+
     def assert_private(self, response):
         self.assertEqual(response["Cache-Control"], "private, no-store")
         self.assertEqual(response["Pragma"], "no-cache")
@@ -99,6 +106,23 @@ class GandiPatTests(TestCase):
             with self.subTest(peer=peer):
                 self.assert_error(self.get(peer), 403, "unauthorized")
 
+    def test_server_vpn_address_is_authorized_only_when_peer_matches_it(self):
+        server_address = "172.28.0.1"
+        response = self.get_from_server(server_address, server_address)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.content), {
+            "token": self.database_token, "expires_on": None,
+        })
+        for peer, local in (
+            ("172.28.0.2", server_address),
+            (server_address, "172.28.0.2"),
+            ("not-an-address", server_address),
+        ):
+            with self.subTest(peer=peer, server_address=local):
+                response = self.get_from_server(peer, local)
+                self.assertEqual(response.status_code, 403)
+                self.assertEqual(json.loads(response.content), {"error": "unauthorized"})
+
     def test_malformed_noncanonical_and_ipv6_peers_are_denied(self):
         for peer in ("", "not-an-address", "::1", "2001:db8::1",
                      "::ffff:172.28.1.50", "::ffff:ac1c:132",
@@ -136,6 +160,8 @@ class GandiPatTests(TestCase):
             ("HTTP_X_FORWARDED_FOR", self.peer),
             ("HTTP_X_FORWARDED_FOR", f"{self.peer}, 203.0.113.1"),
             ("HTTP_X_REAL_IP", self.peer),
+            ("HTTP_X_LOCAL_ADDRESS", self.peer),
+            ("HTTP_SERVER_ADDR", self.peer),
             ("HTTP_FORWARDED", f'for="{self.peer}";proto=https'),
             ("HTTP_CLIENT_IP", self.peer),
             ("HTTP_TRUE_CLIENT_IP", self.peer),

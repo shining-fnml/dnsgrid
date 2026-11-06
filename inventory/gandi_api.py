@@ -1,6 +1,6 @@
 """Read-only credential disclosure authorized exclusively by the VPN peer."""
 
-from ipaddress import IPv4Address
+from ipaddress import IPv4Address, ip_address
 
 from django.db import DatabaseError, transaction
 from django.http import JsonResponse
@@ -19,9 +19,14 @@ def _response(data, status=200):
     return response
 
 
-def _authorized(peer, config):
+def _authorized(peer, config, server_address=None):
     if not isinstance(peer, str):
         return False
+    try:
+        if isinstance(server_address, str) and ip_address(peer) == ip_address(server_address):
+            return True
+    except ValueError:
+        pass
     try:
         address = IPv4Address(peer)
         matches = [
@@ -47,7 +52,9 @@ def pat(request):
             config = Configuration.objects.select_for_update().filter(pk=1).first()
             if config is None:
                 return _response({"error": "configuration_unavailable"}, 503)
-            if not _authorized(request.META.get("REMOTE_ADDR"), config):
+            if not _authorized(
+                request.META.get("REMOTE_ADDR"), config, request.META.get("SERVER_ADDR"),
+            ):
                 return _response({"error": "unauthorized"}, 403)
             try:
                 token = effective_token(config)
