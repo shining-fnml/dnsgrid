@@ -19,10 +19,12 @@ class UnixProxyTests(SimpleTestCase):
             with self.subTest(address=address):
                 environ = {
                     "REMOTE_ADDR": "", "HTTP_X_REAL_IP": address,
+                    "HTTP_X_LOCAL_ADDRESS": "172.28.0.1",
                     "HTTP_X_FORWARDED_FOR": "203.0.113.1",
                 }
                 self.assertEqual(self.proxy(environ, self.start_response), [b"ok"])
                 self.assertEqual(environ["REMOTE_ADDR"], address)
+                self.assertEqual(environ["SERVER_ADDR"], "172.28.0.1")
 
     def test_tcp_connections_and_invalid_or_missing_addresses_fail_closed(self):
         for environ in (
@@ -31,6 +33,7 @@ class UnixProxyTests(SimpleTestCase):
             {"REMOTE_ADDR": ""},
             {"HTTP_X_REAL_IP": "172.28.0.112, 203.0.113.1"},
             {"HTTP_X_REAL_IP": "invalid"},
+            {"HTTP_X_REAL_IP": "172.28.0.112", "HTTP_X_LOCAL_ADDRESS": "invalid"},
         ):
             with self.subTest(environ=environ):
                 self.assertEqual(
@@ -38,6 +41,17 @@ class UnixProxyTests(SimpleTestCase):
                     [b"Invalid proxy connection.\n"],
                 )
                 self.assertEqual(self.start_response.call_args.args[0], "400 Bad Request")
+        self.upstream.assert_not_called()
+
+    def test_application_cannot_receive_client_supplied_server_address(self):
+        environ = {
+            "REMOTE_ADDR": "172.28.0.112",
+            "HTTP_X_REAL_IP": "172.28.0.112",
+            "HTTP_X_LOCAL_ADDRESS": "172.28.0.1",
+        }
+        self.assertEqual(self.proxy(environ, self.start_response),
+                         [b"Invalid proxy connection.\n"])
+        self.assertNotIn("SERVER_ADDR", environ)
         self.upstream.assert_not_called()
 
     def test_production_entry_point_requires_persistent_secret_and_web_debug_off(self):

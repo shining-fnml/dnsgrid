@@ -159,11 +159,15 @@ Only Nginx should listen on ``172.28.0.1:8000``; Gunicorn has no TCP
 listener. The socket directory is ``dnsgrid:www-data`` mode 750, with a
 mode-770 socket accessible only to that user/group and root. Keep membership
 of ``www-data`` restricted: anyone who can connect to that socket can
-impersonate a VPN client. Nginx overwrites ``X-Real-IP`` and strips other
-forwarding headers; the production WSGI entry point trusts this header
-only on Unix-socket connections. The development entry point continues
-to ignore forwarded headers. Do not use the production entry point with a
-public or TCP upstream, and do not cache the PAT endpoint.
+impersonate a VPN client. Nginx overwrites ``X-Real-IP`` with the source
+address and ``X-Local-Address`` with ``$server_addr``, and strips other
+forwarding headers. The production WSGI entry point trusts both values
+only on Unix-socket connections. The PAT endpoint additionally permits the
+request when those source and local addresses match, allowing processes on
+the hub to connect through its VPN address. This is not a loopback bypass
+and does not authorize another local interface. The development entry
+point continues to ignore forwarded headers. Do not use the production
+entry point with a public or TCP upstream, and do not cache the PAT endpoint.
 
 Reboot the hub in a planned window and repeat the checks. The boot
 dependency and actual VPN configuration can only be verified on that host.
