@@ -26,6 +26,7 @@
         <a class="cell" href="{% url 'host-edit' cell.host.pk %}" aria-describedby="status-{{ cell.host.pk }}">
           <small>x={{ cell.x }} · {{ cell.host.site.name }}</small>
           <span class="host-name{% if cell.host.vpn %} vpn-name{% endif %}">{% if cell.host.status == 'decommissioned' %}({% endif %}{{ cell.host.name }}{% if cell.host.status == 'decommissioned' %}){% endif %}{% if cell.host.static %} <span class="static-marker" role="img" aria-label="Static host: read-only, excluded from DHCP" style="color: #b91c1c">●</span>{% endif %}</span>
+          {% if cell.host.cnames %}<span class="host-cnames">{{ cell.host.cnames|join:" - " }}</span>{% endif %}
           <span>{{ cell.lan }}</span>
           {% if cell.vpn %}<span class="vpn-address{% if cell.host.public_export %} published-address{% endif %}">VPN {{ cell.vpn }}</span>{% endif %}
           {% if cell.host.mac %}<small class="mac-address">{{ cell.host.mac }}</small>{% endif %}

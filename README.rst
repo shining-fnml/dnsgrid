@@ -127,6 +127,10 @@ Inventory and confirmations
 * Preview and confirm host changes, deletions, and global settings.
   Diffs show affected addresses and metadata. Inventory revisions
   reject stale forms and stale confirmations; refresh and preview again.
+* Host editing accepts optional CNAME aliases, one short DNS label per line.
+  Remove a line to remove the alias. Names are normalized to lowercase and
+  must be unique across all host names and aliases. The grid displays aliases
+  below the host name on one italic, non-bold line separated by `` - ``.
 * ``static`` defaults to false. A static host has a red dot labelled
   "Static host" in Grid; its detail page remains available. Static hosts
   cannot be edited, deleted, relocated, quick-moved, or shifted indirectly.
@@ -196,7 +200,7 @@ The persisted SOA serial is separate from the optimistic inventory revision.
 All zones share a Unix timestamp in seconds, an unsigned 32-bit integer
 (``0..4294967295``), not a calendar date or ``YYYYMMDDnn`` counter.
 DNS-changing service mutations compare deterministic zone contents excluding
-the serial: host names/addresses, VPN membership, site subnets, domains, TTL,
+the serial: host names, CNAME aliases, addresses, VPN membership, site subnets, domains, TTL,
 SOA and NS changes advance it, but descriptive metadata, public-export/Gandi-only
 settings and previews, downloads or unchanged republication do not. Allocation uses
 ``max(now, last + 1)``: same-second edits and clock rollback still advance.
@@ -214,7 +218,7 @@ Legacy archives without a serial follow the same rule; restore never regresses
 the destination serial under RFC 1982 (numeric wraparound can still advance).
 Higher legacy values are preserved, not rewritten
 automatically. Archives now include
-``soa_serial`` in JSON v2; supported older v1 archive shapes remain accepted. Restore may
+``soa_serial`` in JSON v3; supported older v1 and v2 archive shapes remain accepted. Restore may
 advance the serial when DNS content differs, independently of its revision.
 
 Exceptional administrator-confirmed baseline lowering
@@ -507,10 +511,10 @@ the preview if inventory changes instead of mixing different revisions.
 
 ``forward.zone``
     Preview/download artifact for the configured LAN BIND zone with SOA, NS,
-    and A records for every inventory host. Its installed filename is the zone
+    and A records and optional CNAME aliases for every inventory host. Its installed filename is the zone
     name (for example ``intranet.linuxcondom.net``).
 ``vpn.zone``
-    Private ``vpn.`` BIND zone with A records for VPN members only. It is
+    Private ``vpn.`` BIND zone with A records and optional CNAME aliases for VPN members only. It is
     independent of the public VPN/Gandi domain and installs as ``vpn.zone``.
 ``reverse-<g>.zone``
     One BIND /24 reverse zone per site, with LAN FQDN PTR records.
@@ -528,10 +532,10 @@ the preview if inventory changes instead of mixing different revisions.
     reservations. The JSON export alone does not apply changes; it is input
     to the local NAS-side utility described below.
 ``gandi.json``
-    Desired LiveDNS A record sets for VPN members with "Publish on Gandi
-    (VPN only)" enabled. Each such host gets two records, in grid address
-    order: its VPN FQDN (``vpn_domain``) with its VPN address, then its LAN
-    FQDN (``lan_domain``) with its LAN address. Names are relative to the
+    Desired LiveDNS A and CNAME record sets for VPN members with "Publish on Gandi
+    (VPN only)" enabled. Each such host gets its VPN FQDN (``vpn_domain``)
+    with its VPN address and its LAN FQDN (``lan_domain``) with its LAN address,
+    plus each alias pointing to the matching VPN or LAN FQDN. Names are relative to the
     configured Gandi zone. The VPN domain must be inside that zone; while any
     host publishes on Gandi, the LAN domain must also be inside it and differ
     from the VPN domain. Settings, host edits, and archive restores that break
@@ -545,7 +549,7 @@ HTTP form-injection workflow. Use the standalone NAS reservation JSON utility
 below instead.
 
 DNS zones begin with explicit ``$ORIGIN`` and ``$TTL`` directives and a
-multiline SOA. A and PTR records have explicit FQDN owners and TTLs, sorted
+multiline SOA. A, CNAME and PTR records have explicit FQDN owners and TTLs, sorted
 alphabetically by hostname; PTR targets are full LAN FQDNs or ``<hostname>.vpn.``
 for the VPN reverse zone. Each zone ends
 with its zone-apex NS record, configured separately from the SOA nameserver.
@@ -759,8 +763,8 @@ performs another read and rejects stale inventory, changed remote records,
 or ownership conflicts before applying record-level operations.
 
 The local ``GandiRecord`` ledger tracks only records created successfully
-by this installation. Existing unmanaged A records, even identical ones,
-and conflicting CNAMEs are never adopted or overwritten automatically.
+by this installation. Existing unmanaged A and CNAME records, even identical ones,
+and conflicting record types are never adopted or overwritten automatically.
 Updates/deletions require the remote value and TTL to match the last
 owned version. Unrelated records remain untouched. Changing names,
 domains, sites, or export flags reconciles old owned records as well as
@@ -897,7 +901,7 @@ errors. Restrict access to any logs and database backups.
 Application-data portability
 ----------------------------
 
-Export previews offers ``dnsgrid-archive-v2.json``. Settings includes an
+Export previews offers ``dnsgrid-archive-v3.json``. Settings includes an
 explicit application-archive file upload section and preview button; a
 standalone upload/restore form is also linked from Export previews.
 Only authenticated staff can use them. Downloads are read-only,
@@ -909,10 +913,10 @@ and trusted same-scope Gandi ownership.
 The deterministic UTF-8 JSON schema has exactly these top-level keys:
 
 * ``format``: exact string ``"dnsgrid.application-data"``.
-* ``schema_version``: integer ``2``. Supported legacy version ``1`` archives
-  are accepted with every host's ``static`` defaulting to false. Version 2
-  requires an explicit boolean ``static``; strings and integers are rejected,
-  not coerced. Version 1 does not accept a ``static`` field.
+* ``schema_version``: integer ``3``. Supported legacy versions ``1`` and ``2``
+  are accepted with no CNAME aliases. Version 1 defaults ``static`` to false;
+  versions 2 and 3 require an explicit boolean ``static``. Version 1 does not
+  accept a ``static`` field.
 * ``configuration``: ``id`` (always 1), ``lan_domain``, ``vpn_domain``,
   ``lan_prefix``, ``vpn_prefix``, ``gandi_zone``, ``ttl``, ``soa_ns``,
   ``soa_mailbox``, ``soa_refresh``, ``soa_retry``, ``soa_expire``,
@@ -926,16 +930,18 @@ The deterministic UTF-8 JSON schema has exactly these top-level keys:
   with an empty mapping; new exports include it.
 * ``hosts``: objects with ``id``, ``name``, ``site_id``, ``row``, ``column``,
   ``category``, ``status``, ``vpn``, ``public_export``, ``mac``, ``notes``, and
-  boolean ``static``.
+  boolean ``static``, and list ``cnames``.
   Every status is included, with IDs and positions preserved.
 * ``gandi_records``: ownership objects with ``id``, ``zone``, ``name``,
-  ``record_type`` (``A``), ``values``, and ``ttl``.
+  ``record_type`` (``A`` or ``CNAME``), ``values``, and ``ttl``.
 
 Lists are ordered by IDs; ownership values and JSON keys are sorted.
 Unknown fields, missing required fields, duplicate JSON keys, wrong types
 (including booleans for integers), invalid references, duplicates, and violated model invariants
 are rejected. Uploads and pending archive data are bounded to 8 MiB, 127
-hosts, 1,024 ownership records, and 1–16 IPv4 values per owned record.
+hosts, 1,024 ownership records, 1–16 IPv4 values per owned A record, and one
+absolute DNS target ending in a dot per owned CNAME. If current data exceeds the archive limits,
+download fails explicitly; use a database backup.
 The byte bound accommodates the complete grid with maximum-length Unicode
 notes and categories, including supplementary characters serialized as
 JSON escape pairs.
@@ -950,8 +956,8 @@ existing IDs and SQLite sequences are never reset, and allocation adds no
 revision increment of its own.
 Incoming settings and hosts are validated together, independent of the
 outgoing inventory. Each ownership record must belong to the incoming
-configured zone and a direct host label beneath its VPN domain.
-Historical owned IPv4 values need not match current desired addresses:
+configured zone and a direct host label beneath its LAN or VPN domain.
+Historical owned values need not match current desired records:
 they are retained so future sync can safely delete obsolete records.
 
 Confirmation replaces settings, fixed-site mappings, hosts, and the ledger
@@ -959,7 +965,7 @@ atomically with foreign-key-safe ordering. It preserves destination users
 and the saved token, as well as the destination's ``dns_export_directory``.
 This explicitly acknowledged administrative replacement is not a normal
 host edit: it may replace, relocate, or remove existing static hosts and
-change their assigned IPs. Version 2 preserves the incoming static flags;
+change their assigned IPs. Versions 2 and 3 preserve the incoming static flags;
 restoring version 1 makes incoming hosts nonstatic. Review that destructive
 replacement carefully and keep an offline backup.
 The resulting revision is

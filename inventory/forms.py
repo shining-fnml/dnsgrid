@@ -10,6 +10,11 @@ class MACAddressField(forms.CharField):
 
 class HostForm(forms.Form):
     name = forms.CharField(max_length=63)
+    cnames = forms.CharField(
+        required=False, label="CNAME aliases",
+        widget=forms.Textarea(attrs={"rows": 3}),
+        help_text="Optional short DNS names, one per line. Remove a name to delete the alias.",
+    )
     site = forms.ModelChoiceField(queryset=Site.objects.order_by("id"))
     row = forms.IntegerField(min_value=0, max_value=15)
     column = forms.IntegerField(min_value=0, max_value=7)
@@ -27,6 +32,9 @@ class HostForm(forms.Form):
     mac = MACAddressField(max_length=32, required=False, label="MAC address")
     notes = forms.CharField(max_length=4000, required=False, widget=forms.Textarea(attrs={"rows": 3}))
     revision = forms.IntegerField(widget=forms.HiddenInput)
+
+    def clean_cnames(self):
+        return self.cleaned_data["cnames"].splitlines()
 
 
 class HostMoveForm(forms.Form):

@@ -58,6 +58,10 @@ def _dns_zones(config, hosts):
     forward.extend(
         f"{host.lan_fqdn(config)}. {config.ttl} A {host.lan_address(config)}" for host in hosts
     )
+    forward.extend(
+        f"{alias}.{origin}. {config.ttl} CNAME {host.lan_fqdn(config)}."
+        for host in hosts for alias in host.cnames
+    )
     forward.append(f"{origin}. NS {config.zone_ns}.")
     # Downloads retain their historical names; directory deposits use zone names.
     zones = {"forward.zone": (origin, "\n".join(forward) + "\n")}
@@ -77,6 +81,10 @@ def _dns_zones(config, hosts):
     vpn.extend(
         f"{host.name}.{origin}. {config.ttl} A {host.vpn_address(config)}"
         for host in hosts if host.vpn
+    )
+    vpn.extend(
+        f"{alias}.{origin}. {config.ttl} CNAME {host.name}.{origin}."
+        for host in hosts if host.vpn for alias in host.cnames
     )
     vpn.append(f"{origin}. NS {config.zone_ns}.")
     zones[f"{origin}.zone"] = (f"{origin}.zone", "\n".join(vpn) + "\n")
@@ -251,7 +259,7 @@ def publish_dns_zones(expected_revision):
 
 
 def desired_gandi(config=None, hosts=None):
-    """Return one VPN and one LAN A rrset per public-export VPN host, in host order."""
+    """Return VPN and LAN A and CNAME rrsets for public-export VPN hosts."""
     config, hosts = _inputs(config, hosts)
     zone = config.gandi_zone.rstrip(".").lower()
     records, names = [], set()
@@ -264,26 +272,34 @@ def desired_gandi(config=None, hosts=None):
         )
         for kind, fqdn, address in pairs:
             fqdn = fqdn.rstrip(".").lower()
-            if fqdn == zone:
-                name = "@"
-            elif fqdn.endswith("." + zone):
-                name = fqdn[: -(len(zone) + 1)]
-            else:
+            if fqdn != zone and not fqdn.endswith("." + zone):
                 raise ValueError(
                     f"The {kind} hostname {fqdn} must be inside the configured Gandi zone {zone}."
                 )
-            if name in names:
-                raise ValueError(
-                    f"The Gandi name {fqdn} would be published twice; "
-                    "LAN and VPN names must not collide."
-                )
-            names.add(name)
-            records.append({
-                "rrset_name": name,
-                "rrset_type": "A",
-                "rrset_ttl": config.ttl,
-                "rrset_values": [address],
-            })
+            for record_fqdn, record_type, value in (
+                [(fqdn, "A", address)] + [
+                    (alias + fqdn[len(host.name):], "CNAME", fqdn + ".")
+                    for alias in host.cnames
+                ]
+            ):
+                if record_fqdn == zone:
+                    record_name = "@"
+                elif record_fqdn.endswith("." + zone):
+                    record_name = record_fqdn[:-(len(zone) + 1)]
+                else:
+                    raise ValueError(f"The Gandi name {record_fqdn} is outside {zone}.")
+                if record_name in names:
+                    raise ValueError(
+                        f"The Gandi name {record_fqdn} would be published twice; "
+                        "LAN and VPN names must not collide."
+                    )
+                names.add(record_name)
+                records.append({
+                    "rrset_name": record_name,
+                    "rrset_type": record_type,
+                    "rrset_ttl": config.ttl,
+                    "rrset_values": [value],
+                })
     return records
 
 

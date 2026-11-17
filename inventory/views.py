@@ -24,7 +24,7 @@ COLUMNS = (
     "Networking", "Peripherals", "Bare metal", "Virtual servers",
     "Console desktops", "TV desktops", "Laptops", "Phones",
 )
-HOST_FIELDS = ("name", "row", "column", "category", "status", "vpn", "static", "public_export", "mac", "notes")
+HOST_FIELDS = ("name", "cnames", "row", "column", "category", "status", "vpn", "static", "public_export", "mac", "notes")
 CONFIG_FIELDS = (
     "lan_domain", "vpn_domain", "lan_prefix", "vpn_prefix", "gandi_zone",
     "ttl", "soa_ns", "soa_mailbox",
@@ -108,6 +108,8 @@ def host_edit(request, host_id=None):
         "row": request.GET.get("row", 1), "column": request.GET.get("column", 0),
         "status": Host.Status.RUNNING,
     }
+    if host:
+        initial["cnames"] = "\n".join(host.cnames)
     initial.update(revision=config.revision, site=host.site_id if host else 1)
     form = HostForm(request.POST or None, initial=initial)
     if host and request.method == "POST" and request.POST.get("action") == "revoke-static":
@@ -151,7 +153,7 @@ def host_edit(request, host_id=None):
                 before = _address_summary(shifted, config)
                 shifted.row = shift["to_row"]
                 changes.append({"label": shifted.name, "before": before, "after": _address_summary(shifted, config)})
-            for field in ("site", "category", "status", "vpn", "static", "public_export", "mac", "notes"):
+            for field in ("site", "cnames", "category", "status", "vpn", "static", "public_export", "mac", "notes"):
                 before = str(getattr(host, field)) if host else "—"
                 after = str(getattr(candidate, field))
                 if before != after:
@@ -407,7 +409,7 @@ def cancel(request):
 
 @operator
 def archive_download(request):
-    from .archives import dumps, snapshot
+    from .archives import MAX_BYTES, MAX_LEDGER, dumps, snapshot
     revision = request.GET.get("revision", "")
     if not revision.isascii() or not revision.isdecimal() or len(revision) > 10:
         return HttpResponse("Provide the export preview revision.", status=400)
@@ -415,8 +417,11 @@ def archive_download(request):
         data = snapshot(expected_revision=int(revision))
     except ValidationError:
         return HttpResponse("Inventory changed. Reload export previews before downloading.", status=409)
-    response = HttpResponse(dumps(data), content_type="application/json; charset=utf-8")
-    response["Content-Disposition"] = 'attachment; filename="dnsgrid-archive-v2.json"'
+    content = dumps(data)
+    if len(data["gandi_records"]) > MAX_LEDGER or len(content.encode("utf-8")) > MAX_BYTES:
+        return HttpResponse("Application data exceeds the archive limits. Use a database backup.", status=400)
+    response = HttpResponse(content, content_type="application/json; charset=utf-8")
+    response["Content-Disposition"] = 'attachment; filename="dnsgrid-archive-v3.json"'
     return response
 
 

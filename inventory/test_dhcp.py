@@ -592,13 +592,18 @@ class DHCPTests(TestCase):
 class DHCPMigrationTests(TransactionTestCase):
     def test_dhcp_migration_preserves_inventory_and_removes_retired_settings(self):
         executor = MigrationExecutor(connection)
+        self.addCleanup(lambda: MigrationExecutor(connection).migrate(
+            MigrationExecutor(connection).loader.graph.leaf_nodes(),
+        ))
         executor.migrate([("inventory", "0012_host_static")])
         old = executor.loader.project_state([("inventory", "0012_host_static")]).apps
-        config = old.get_model("inventory", "Configuration").objects.get(pk=1)
+        config, _ = old.get_model("inventory", "Configuration").objects.get_or_create(pk=1)
         config.revision = 17
         config.lan_prefix = "10.24"
         config.save()
-        site = old.get_model("inventory", "Site").objects.get(pk=1)
+        site, _ = old.get_model("inventory", "Site").objects.get_or_create(
+            pk=1, defaults={"name": "Site 1", "g": 1},
+        )
         site.dsm_ifname = "bond0"
         site.g = 42
         site.save()
@@ -625,8 +630,9 @@ class DHCPMigrationTests(TransactionTestCase):
                 expected_configuration,
             )
             self.assertEqual(list(Site.objects.order_by("pk").values()), sites_data)
-            self.assertEqual(list(Host.objects.order_by("pk").values()), hosts_data)
-            self.assertTrue(Host.objects.get(pk=host.pk).static)
+            migrated_host = migrated.get_model("inventory", "Host")
+            self.assertEqual(list(migrated_host.objects.order_by("pk").values()), hosts_data)
+            self.assertTrue(migrated_host.objects.get(pk=host.pk).static)
             self.assertFalse(DHCPPublication.objects.exists())
             self.assertFalse(DHCPResult.objects.exists())
             self.assertFalse(DHCPState.objects.exists())

@@ -244,7 +244,7 @@ class VpnReportViewTests(VpnReportFixture, TestCase):
                 patch("inventory.vpn_report.build_vpn_report", side_effect=report):
             response = self.client.get(reverse("exports"))
             self.assertEqual(response.status_code, 200)
-            self.assertContains(response, "JSON v2")
+            self.assertContains(response, "JSON v3")
             self.assertContains(response, "static protection does not block an archive replacement")
         self.assertIs(snapshots["exports"]["config"], snapshots["report"]["config"])
         self.assertIs(snapshots["exports"]["hosts"], snapshots["report"]["hosts"])

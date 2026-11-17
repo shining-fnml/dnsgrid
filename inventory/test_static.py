@@ -145,9 +145,9 @@ class StaticHostTests(TestCase):
                     "hostname": "fixed",
                 }])
 
-    def test_archive_v2_static_roundtrip_and_explicit_legacy_policy(self):
+    def test_archive_static_roundtrip_and_explicit_legacy_policy(self):
         data = snapshot()
-        self.assertEqual(data["schema_version"], 2)
+        self.assertEqual(data["schema_version"], 3)
         self.assertTrue(validate(data)["hosts"][0]["static"])
         for value in (1, "true", None, [], {}):
             candidate = copy.deepcopy(data)
@@ -158,8 +158,9 @@ class StaticHostTests(TestCase):
         self.assert_rejected_unchanged(lambda: validate(candidate))
         legacy = copy.deepcopy(candidate)
         legacy["schema_version"] = 1
+        legacy["hosts"][0].pop("cnames")
         normalized = validate(legacy)
-        self.assertEqual(normalized["schema_version"], 2)
+        self.assertEqual(normalized["schema_version"], 3)
         self.assertFalse(normalized["hosts"][0]["static"])
         legacy["hosts"][0]["static"] = False
         self.assert_rejected_unchanged(lambda: validate(legacy))
@@ -172,7 +173,7 @@ class StaticHostTests(TestCase):
             lambda data: data["configuration"].update(dns_nas_host="retired"),
             lambda data: data["sites"][0].pop("dsm_ifname"),
             lambda data: data.update(schema_version=True),
-            lambda data: data.update(schema_version=3),
+            lambda data: data.update(schema_version=4),
             lambda data: data.update(schema_version="2"),
         ):
             candidate = snapshot()
