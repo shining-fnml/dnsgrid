@@ -97,6 +97,8 @@ def _canonical(record):
                 or not all(isinstance(value, str) for value in values)
                 or not re.fullmatch(r"[A-Z][A-Z0-9]*", record_type)):
             raise ValueError
+        if record_type == "CNAME":
+            values = [value.lower() for value in values]
         return {
             "rrset_name": name,
             "rrset_type": record_type,
@@ -141,6 +143,10 @@ def _make_plan(config, hosts, client):
     }
     zones = sorted({config.gandi_zone} | {key[0] for key in ledger})
     remote = {zone: _remote(client, zone) for zone in zones}
+    safe_deletions = {
+        key for key, record in ledger.items()
+        if key not in desired and remote[key[0]].get((key[1], key[2])) == record
+    }
     changes, conflicts = [], []
     for key in sorted(set(desired) | set(ledger)):
         zone, name, record_type = key
@@ -150,6 +156,7 @@ def _make_plan(config, hosts, client):
         other_types = [
             kind for remote_name, kind in remote[zone]
             if remote_name == name and kind != record_type
+            and (zone, name, kind) not in safe_deletions
         ]
         # DNS permits A alongside TXT/MX; only CNAME (or an intended CNAME)
         # forbids other record types.
@@ -168,6 +175,7 @@ def _make_plan(config, hosts, client):
             changes.append({"action": "delete" if after is None else "update",
                             "zone": zone, "name": name, "type": record_type,
                             "before": before, "after": after})
+    changes.sort(key=lambda change: (change["action"] != "delete", change["zone"], change["name"], change["type"]))
     plan = {"revision": config.revision, "changes": changes, "conflicts": conflicts}
     state = {
         "plan": plan,

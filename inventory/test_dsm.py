@@ -199,6 +199,7 @@ class DSMReservationTests(TestCase):
         legacy["schema_version"] = 1
         for host in legacy["hosts"]:
             host.pop("static")
+            host.pop("cnames")
         for site in legacy["sites"]:
             site.pop("dsm_ifname")
         restored = loads(dumps(legacy).encode())

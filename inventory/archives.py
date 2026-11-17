@@ -7,12 +7,12 @@ import json
 from django.core.exceptions import ValidationError
 from django.db import transaction
 
-from .models import MAX_PORTABLE_ID, MAX_SERIAL, Configuration, GandiRecord, Host, Site
+from .models import MAX_PORTABLE_ID, MAX_SERIAL, Configuration, GandiRecord, Host, Site, normalize_domain
 from .services import _claim_revision
 from .dns_serial import compare_serial, initial_serial, track_dns_content, validate_serial
 
 FORMAT = "dnsgrid.application-data"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_BYTES = 8 * 1024 * 1024
 MAX_LEDGER = 1024
 MAX_ID = MAX_PORTABLE_ID
@@ -24,14 +24,14 @@ CONFIG_FIELDS = (
 )
 HOST_FIELDS = (
     "id", "name", "site_id", "row", "column", "category", "status",
-    "vpn", "public_export", "mac", "notes", "static",
+    "vpn", "public_export", "mac", "notes", "static", "cnames",
 )
 SITE_FIELDS = ("id", "name", "g", "dsm_ifname")
 LEDGER_FIELDS = ("id", "zone", "name", "record_type", "values", "ttl")
 WARNINGS = (
     "This replaces all target settings, sites, hosts, and ownership records, not merges them.",
     "Explicit archive replacement is an exception to static-host protection: outgoing static hosts "
-    "may be replaced or removed. Incoming version 2 static flags are preserved; version 1 hosts default to non-static.",
+    "may be replaced or removed. Incoming version 2 and 3 static flags are preserved; version 1 hosts default to non-static.",
     "Use a trusted archive for the SAME Gandi domain and VPN control scope only. "
     "The ownership ledger grants the ability to update/delete matching provider records, "
     "including historical records no longer desired by any host.",
@@ -115,9 +115,10 @@ def validate(data):
         _fail("Unknown or missing archive fields.")
     if type(data["format"]) is not str or data["format"] != FORMAT:
         _fail("Unsupported archive format identifier.")
-    if type(data["schema_version"]) is not int or data["schema_version"] not in (1, SCHEMA_VERSION):
+    if type(data["schema_version"]) is not int or data["schema_version"] not in (1, 2, SCHEMA_VERSION):
         _fail("Unsupported archive schema version.")
     legacy = data["schema_version"] == 1
+    old_alias_schema = data["schema_version"] < 3
     for field, limit in (("sites", 4), ("hosts", 127), ("gandi_records", MAX_LEDGER)):
         if type(data[field]) is not list or len(data[field]) > limit:
             _fail(f"Invalid or excessive {field} count.")
@@ -172,12 +173,16 @@ def validate(data):
     site_map = {site.pk: site for site in sites}
     hosts = []
     for raw in data["hosts"]:
-        fields = tuple(field for field in HOST_FIELDS if field != "static") if legacy else HOST_FIELDS
+        fields = tuple(
+            field for field in HOST_FIELDS
+            if not (legacy and field == "static") and not (old_alias_schema and field == "cnames")
+        )
         _object(raw, fields, integer=("id", "site_id", "row", "column"),
-                boolean=("vpn", "public_export", "static"))
+                boolean=("vpn", "public_export", "static"), arrays=("cnames",))
         raw = {**raw, "static": False} if legacy else raw
+        raw = {**raw, "cnames": []} if old_alias_schema else raw
         _object(raw, HOST_FIELDS, integer=("id", "site_id", "row", "column"),
-                boolean=("vpn", "public_export", "static"))
+                boolean=("vpn", "public_export", "static"), arrays=("cnames",))
         if raw["site_id"] not in site_map:
             _fail("Host references an unknown site.")
         host = Host(**raw)
@@ -194,13 +199,21 @@ def validate(data):
     records = []
     for raw in data["gandi_records"]:
         _object(raw, LEDGER_FIELDS, integer=("id", "ttl"), arrays=("values",))
-        if not 1 <= len(raw["values"]) <= 16 or any(type(value) is not str for value in raw["values"]):
-            _fail("Owned A records require 1–16 IPv4 values.")
-        try:
-            for value in raw["values"]:
-                ipaddress.IPv4Address(value)
-        except (ValueError, ipaddress.AddressValueError):
-            _fail("Owned A records require valid IPv4 addresses.")
+        if raw["record_type"] == "A":
+            if not 1 <= len(raw["values"]) <= 16 or any(type(value) is not str for value in raw["values"]):
+                _fail("Owned A records require 1–16 IPv4 values.")
+            try:
+                for value in raw["values"]:
+                    ipaddress.IPv4Address(value)
+            except (ValueError, ipaddress.AddressValueError):
+                _fail("Owned A records require valid IPv4 addresses.")
+        elif raw["record_type"] == "CNAME" and not old_alias_schema:
+            if (len(raw["values"]) != 1 or type(raw["values"][0]) is not str
+                    or not raw["values"][0].endswith(".")):
+                _fail("Owned CNAME records require one absolute DNS target ending in a dot.")
+            raw = {**raw, "values": [normalize_domain(raw["values"][0]) + "."]}
+        else:
+            _fail("Unsupported owned record type.")
         _unique(raw["values"], lambda value: value, "record value")
         record = GandiRecord(**raw)
         record.clean()
@@ -208,10 +221,12 @@ def validate(data):
         if record.zone != config.gandi_zone:
             _fail("Ownership zone must match the incoming configured Gandi zone.")
         fqdn = record.zone if record.name == "@" else f"{record.name}.{record.zone}"
-        # Only direct host labels within vpn_domain are controllable by exports.
-        suffix = "." + config.vpn_domain
-        if not fqdn.endswith(suffix) or "." in fqdn[:-len(suffix)] or len(fqdn) > 253:
-            _fail("Ownership record is outside the incoming VPN host control scope.")
+        domains = (config.vpn_domain, config.lan_domain)
+        if len(fqdn) > 253 or not any(
+            fqdn.endswith("." + domain) and "." not in fqdn[:-(len(domain) + 1)]
+            for domain in domains
+        ):
+            _fail("Ownership record is outside the incoming host control scope.")
         records.append(record)
     _unique(records, lambda record: record.pk, "ownership ID")
     _unique(records, lambda record: (record.zone, record.name, record.record_type), "owned record")

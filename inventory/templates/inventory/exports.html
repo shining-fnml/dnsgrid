@@ -11,7 +11,7 @@
 {% endif %}
 <form method="get" action="{% url 'archive-download' %}">
 <input type="hidden" name="revision" value="{{ revision }}">
-<button>Download complete application-data archive (JSON v2)</button>
+<button>Download complete application-data archive (JSON v3)</button>
 </form>
 <p><a href="{% url 'archive-upload' %}">Preview archive restore</a></p>
 <p>Archives include all hosts, sites, portable nonsecret settings (including SOA and zone NS fields), revision, and trusted Gandi ownership history; not users, sessions, tokens, deployment secrets, the host-specific BIND zone directory, or RNDC deployment paths. Restore preserves the destination's deployment paths. They are portable application data, not byte-for-byte backups. Stop the source Gandi writer before migration.</p>

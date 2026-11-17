@@ -225,7 +225,7 @@ class Configuration(models.Model):
             if pair_error:
                 errors["lan_domain"] = pair_error
         longest_name = max(
-            (len(host.name) for host in hosts),
+            (len(name) for host in hosts for name in (host.name, *host.cnames)),
             default=0,
         )
         if longest_name:
@@ -278,6 +278,7 @@ class Host(models.Model):
         UNCONFIRMED = "unconfirmed", "Unconfirmed"
 
     name = models.CharField(max_length=63, unique=True)
+    cnames = models.JSONField(default=list, blank=True)
     site = models.ForeignKey(Site, on_delete=models.PROTECT, related_name="hosts")
     row = models.PositiveSmallIntegerField(
         validators=[MinValueValidator(0), MaxValueValidator(15)]
@@ -328,14 +329,31 @@ class Host(models.Model):
 
     def clean_for_inventory(self, config, hosts):
         errors = {}
+        hosts = list(hosts)
         self.name = self.name.strip().lower() if isinstance(self.name, str) else ""
         if not DNS_LABEL.fullmatch(self.name):
             errors["name"] = "Enter a DNS label (letters, digits, and interior hyphens)."
+        if not isinstance(self.cnames, list) or any(not isinstance(value, str) for value in self.cnames):
+            errors["cnames"] = "Enter a list of DNS labels."
+            cnames = []
+        else:
+            cnames = [value.strip().lower() for value in self.cnames]
+            if any(not DNS_LABEL.fullmatch(value) for value in cnames):
+                errors["cnames"] = "Each CNAME must be a DNS label (letters, digits, and interior hyphens)."
+            elif len(cnames) != len(set(cnames)):
+                errors["cnames"] = "Each CNAME must be unique."
+            self.cnames = sorted(cnames)
+        used_names = {host.name for host in hosts} | {name for host in hosts for name in host.cnames}
+        if self.name in {name for host in hosts for name in host.cnames}:
+            errors["name"] = "This host name is already in use as a CNAME."
+        if self.name in cnames or any(name in used_names for name in cnames):
+            errors["cnames"] = "A CNAME cannot duplicate another CNAME or host name."
         if any(
-            len(self.name) + 1 + len(domain) > 253
+            len(name) + 1 + len(domain) > 253
+            for name in (self.name, *cnames)
             for domain in (config.lan_domain, config.vpn_domain)
         ):
-            errors["name"] = "The host's LAN and VPN DNS names must not exceed 253 characters."
+            errors["cnames" if cnames else "name"] = "LAN and VPN DNS names must not exceed 253 characters."
         try:
             self.mac = normalize_mac(self.mac)
         except ValidationError as error:
@@ -378,7 +396,7 @@ class Host(models.Model):
 class GandiRecord(models.Model):
     zone = models.CharField(max_length=253)
     name = models.CharField(max_length=253)
-    record_type = models.CharField(max_length=1, choices=[("A", "A")], default="A")
+    record_type = models.CharField(max_length=5, choices=[("A", "A"), ("CNAME", "CNAME")], default="A")
     values = models.JSONField(default=list)
     ttl = models.PositiveIntegerField(
         default=300, validators=[MinValueValidator(1), MaxValueValidator(MAX_SERIAL)]
@@ -389,7 +407,7 @@ class GandiRecord(models.Model):
             models.UniqueConstraint(
                 fields=["zone", "name", "record_type"], name="gandi_unique_owned_record"
             ),
-            models.CheckConstraint(condition=Q(record_type="A"), name="gandi_record_type"),
+            models.CheckConstraint(condition=Q(record_type__in=["A", "CNAME"]), name="gandi_record_type"),
             models.CheckConstraint(
                 condition=Q(ttl__gte=1, ttl__lte=MAX_SERIAL), name="gandi_ttl_bounds"
             ),
