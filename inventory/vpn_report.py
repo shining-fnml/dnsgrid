@@ -8,7 +8,7 @@ from pathlib import Path
 from django.conf import settings
 from django.db import transaction
 
-from .models import Configuration, Host
+from .models import DNS_LABEL, Configuration, Host, VPN_SHORT_SUFFIX
 
 DEFAULT_CCD_DIR = "/etc/openvpn/ccd"
 CCD_DEFAULT_FILE = "DEFAULT"
@@ -93,19 +93,28 @@ def parse_ccd(text):
     return pushes
 
 
-def _check_ccd(name, expected, text):
+def _check_ccd(name, expected, expected_name, text):
     pushes = parse_ccd(text)
     if not pushes:
-        return "", [f"CCD file {name} has no ifconfig-push directive."]
+        return "", [f"CCD file {name} has no ifconfig-push directive."], False
     if len(pushes) > 1:
-        return "", [f"CCD file {name} has {len(pushes)} ifconfig-push directives."]
+        return "", [f"CCD file {name} has {len(pushes)} ifconfig-push directives."], False
     arguments = pushes[0]
     shown = " ".join(arguments)
-    if len(arguments) != 2 or not all(_valid_ipv4(value) for value in arguments):
-        return shown, [f"CCD file {name} has a malformed ifconfig-push: {shown!r}."]
-    if arguments[0] != expected:
-        return shown, [f"CCD file {name} pushes {arguments[0]}, expected {expected}."]
-    return shown, []
+    if len(arguments) != 2 or not _valid_ipv4(arguments[1]):
+        return shown, [f"CCD file {name} has a malformed ifconfig-push: {shown!r}."], False
+    address = arguments[0]
+    if _valid_ipv4(address):
+        if address != expected:
+            return shown, [f"CCD file {name} pushes {address}, expected {expected}."], False
+        return shown, [], True
+    short_name = address.lower()
+    suffix = "." + VPN_SHORT_SUFFIX
+    if not short_name.endswith(suffix) or not DNS_LABEL.fullmatch(short_name[:-len(suffix)]):
+        return shown, [f"CCD file {name} has a malformed ifconfig-push: {shown!r}."], False
+    if short_name != expected_name:
+        return shown, [f"CCD file {name} pushes {address}, expected {expected_name}."], False
+    return shown, [], False
 
 
 @transaction.atomic
@@ -139,7 +148,7 @@ def build_vpn_report(config=None, hosts=None, ccd_dir=None):
             row = {
                 "name": name, "short_name": host.vpn_short_name,
                 "expected": expected[name], "ccd_value": "", "issues": [],
-                "checked": directory_error is None,
+                "checked": directory_error is None, "uses_ip": False,
             }
             if directory_error:
                 row["ccd_value"] = "(not checked)"
@@ -154,7 +163,9 @@ def build_vpn_report(config=None, hosts=None, ccd_dir=None):
                     row["issues"] = [f"CCD file {name} is {error}."]
                     inspection_errors += 1
                 else:
-                    row["ccd_value"], row["issues"] = _check_ccd(name, expected[name], text)
+                    row["ccd_value"], row["issues"], row["uses_ip"] = _check_ccd(
+                        name, expected[name], host.vpn_short_name, text,
+                    )
             rows.append(row)
     finally:
         if descriptor is not None:

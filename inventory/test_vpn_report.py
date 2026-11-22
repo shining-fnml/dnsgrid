@@ -49,12 +49,41 @@ class VpnReportTests(VpnReportFixture, TestCase):
         self.assertEqual(report["issue_count"], 0)
         self.assertEqual(report["ccd_orphans"], [])
         self.assertEqual(report["rows"][0]["ccd_value"], "172.28.1.50 255.255.0.0")
+        self.assertTrue(report["rows"][0]["uses_ip"])
+
+    def test_hostname_matches_without_resolving_dns(self):
+        for value in ("alpha.vpn", "ALPHA.VPN"):
+            with self.subTest(value=value):
+                (self.ccd / "alpha").write_text(f"ifconfig-push {value} 255.255.0.0\n")
+                with patch("socket.getaddrinfo", side_effect=AssertionError("DNS lookup")):
+                    report = self.report()
+                self.assertEqual(report["status"], "clean")
+                self.assertEqual(report["issue_count"], 0)
+                self.assertFalse(report["rows"][0]["uses_ip"])
+                self.assertEqual(report["rows"][0]["ccd_value"], f"{value} 255.255.0.0")
+
+    def test_hostname_follows_inventory_address_without_ccd_changes(self):
+        self.alpha.row = 3
+        self.alpha.save(update_fields=["row"])
+        self.assertEqual(self.report()["status"], "issues")
+        (self.ccd / "alpha").write_text("ifconfig-push alpha.vpn 255.255.0.0\n")
+        report = self.report()
+        self.assertTrue(report["aligned"])
+        self.assertEqual(report["rows"][0]["expected"], "172.28.1.51")
 
     def test_ccd_mismatch_missing_invalid_and_duplicate(self):
         cases = [
             ("ifconfig-push 172.28.9.9 255.255.0.0\n", "pushes 172.28.9.9, expected 172.28.1.50"),
             ("ifconfig-push 172.28.1.50\n", "malformed ifconfig-push"),
             ("ifconfig-push bad 255.255.0.0\n", "malformed ifconfig-push"),
+            ("ifconfig-push alpha 255.255.0.0\n", "malformed ifconfig-push"),
+            ("ifconfig-push alpha.example 255.255.0.0\n", "malformed ifconfig-push"),
+            ("ifconfig-push alpha.vpn. 255.255.0.0\n", "malformed ifconfig-push"),
+            ("ifconfig-push beta.vpn 255.255.0.0\n", "pushes beta.vpn, expected alpha.vpn"),
+            ("ifconfig-push alpha.vpn bad\n", "malformed ifconfig-push"),
+            ("ifconfig-push alpha.vpn\n", "malformed ifconfig-push"),
+            ("ifconfig-push alpha.vpn 255.255.0.0 extra\n", "malformed ifconfig-push"),
+            ("ifconfig-push alpha.vpn 255.255.0.0\n" * 2, "2 ifconfig-push directives"),
             ("ifconfig-push 172.28.1.50 bad\n", "malformed ifconfig-push"),
             ("ifconfig-push 172.28.1.50 255.255.0.0 extra\n", "malformed ifconfig-push"),
             ("ifconfig-push 172.28.1.50 255.255.0.0\n" * 2, "2 ifconfig-push directives"),
@@ -66,6 +95,7 @@ class VpnReportTests(VpnReportFixture, TestCase):
                 report = self.report()
                 self.assertEqual(report["status"], "issues")
                 self.assertIn(issue, report["rows"][0]["issues"][0])
+                self.assertFalse(report["rows"][0]["uses_ip"])
         (self.ccd / "alpha").unlink()
         self.assertEqual(self.report()["rows"][0]["issues"], ["CCD file alpha is missing."])
 
@@ -183,6 +213,28 @@ class VpnReportViewTests(VpnReportFixture, TestCase):
         overrides = override_settings(DNSGRID_VPN_CCD_DIR=str(self.ccd))
         overrides.enable()
         self.addCleanup(overrides.disable)
+
+    def test_issues_column_marks_only_matching_ipv4(self):
+        cases = (
+            ("172.28.1.50", "<td>OK (IP)</td>", "clean"),
+            ("alpha.vpn", "<td>OK</td>", "clean"),
+            ("beta.vpn", "pushes beta.vpn, expected alpha.vpn", "issues"),
+            ("172.28.9.9", "pushes 172.28.9.9, expected 172.28.1.50", "issues"),
+        )
+        for address, expected, status in cases:
+            with self.subTest(address=address):
+                (self.ccd / "alpha").write_text(f"ifconfig-push {address} 255.255.0.0\n")
+                response = self.client.get(reverse("vpn-report"))
+                self.assertEqual(response.context["report"]["status"], status)
+                self.assertContains(response, expected, html=expected.startswith("<td>"))
+                if address != "172.28.1.50":
+                    self.assertNotContains(response, "<td>OK (IP)</td>", html=True)
+
+    def test_export_preview_accepts_matching_hostname(self):
+        (self.ccd / "alpha").write_text("ifconfig-push alpha.vpn 255.255.0.0\n")
+        response = self.client.get(reverse("exports"))
+        self.assertEqual(response.context["vpn_report"]["status"], "clean")
+        self.assertContains(response, "VPN alignment check: no discrepancies found")
 
     def test_page_and_export_states_real_link_and_read_only_repeated_gets(self):
         forbidden = AssertionError("write, validator, or reload invoked")

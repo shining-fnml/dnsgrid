@@ -3,7 +3,7 @@
 {% block content %}
 <h1>VPN alignment report</h1>
 <p>Inventory revision {{ report.revision }}. This page is <strong>read-only</strong>: it compares dnsgrid's VPN members with the OpenVPN client-config directory and only reports discrepancies. It never writes, corrects, or deletes files and never reloads services. Fix any reported item manually, then reload this page.</p>
-<p>Checked for every VPN member: a CCD file named exactly after the host whose single <code>ifconfig-push</code> directive assigns the computed VPN address with a valid IPv4 netmask/peer. The netmask/peer value is shown but not compared, because dnsgrid does not model the VPN topology. The CCD <code>DEFAULT</code> file is ignored. Reads and directory listings are bounded; symlinks and special files are not inspected. This checks files only, not connected clients or DNS resolution.</p>
+<p>Checked for every VPN member: a CCD file named exactly after the host whose single <code>ifconfig-push</code> directive specifies the computed VPN address or its <code>hostname.vpn</code> name, with a valid IPv4 netmask/peer. An aligned IPv4 address is marked <code>OK (IP)</code>. The netmask/peer value is shown but not compared, because dnsgrid does not model the VPN topology. The CCD <code>DEFAULT</code> file is ignored. Reads and directory listings are bounded; symlinks and special files are not inspected. This checks files only, not connected clients or DNS resolution.</p>
 {% if report.aligned %}
 <p role="status" class="message">No discrepancies found.</p>
 {% elif report.inconclusive %}
@@ -27,7 +27,7 @@
 <tbody>
 {% for row in report.rows %}
 <tr><td>{{ row.short_name }}</td><td>{{ row.expected }}</td><td>{{ row.ccd_value }}</td>
-<td>{% if row.issues %}<ul>{% for issue in row.issues %}<li>{{ issue }}</li>{% endfor %}</ul>{% elif not row.checked %}Not checked{% else %}OK{% endif %}</td></tr>
+<td>{% if row.issues %}<ul>{% for issue in row.issues %}<li>{{ issue }}</li>{% endfor %}</ul>{% elif not row.checked %}Not checked{% elif row.uses_ip %}OK (IP){% else %}OK{% endif %}</td></tr>
 {% endfor %}
 </tbody>
 </table>

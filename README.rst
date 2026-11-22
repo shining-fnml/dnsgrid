@@ -728,10 +728,18 @@ export it. Fix report discrepancies manually.
 For every host with VPN membership (every status) it checks that:
 
 * ``/etc/openvpn/ccd/<name>`` exists, is readable, and contains exactly one
-  active ``ifconfig-push <ip> <netmask>`` directive whose IP is the computed
-  VPN address. Missing, multiple, or malformed directives (not two IPv4
-  arguments) are reported. The netmask/peer is shown but not compared,
-  because dnsgrid does not model the OpenVPN topology.
+  active ``ifconfig-push <address> <netmask>`` directive. The address must be
+  the computed VPN IPv4 address or the host's ``<name>.vpn``; a matching IPv4
+  is marked ``OK (IP)`` as a reminder to migrate it. DNS names are compared
+  case-insensitively. Missing, multiple, malformed, or mismatching directives
+  are reported. The netmask/peer must be an IPv4 address and is shown but not
+  compared, because dnsgrid does not model the OpenVPN topology.
+
+The report compares names only; it does not resolve them or verify the
+published DNS zone. OpenVPN resolves the name on the hub at client connection,
+so the hub's resolver and published ``vpn.`` zone must be available and current.
+Saving inventory changes does not publish DNS; publish the zones explicitly.
+Existing VPN sessions need to reconnect to receive a changed address.
 
 Orphan CCD entries that do not match a VPN member's name are also listed.
 OpenVPN's ``DEFAULT`` CCD file is
